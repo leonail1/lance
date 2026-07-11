@@ -446,15 +446,19 @@ impl PlaidVectorIndex {
             .saturating_mul(adaptive_factor)
             .min(probe_ceiling)
             .max(1);
-        let raw_candidates = requested_candidates
+        // The storage-independent core may residual-rerank a wider set than
+        // the database layer will raw-refine.  These are quantized residual
+        // candidates, not raw-vector fetches.
+        let core_residual_candidates = requested_candidates
             .max(PLAID_DEFAULT_DECOMPRESS_DOCUMENTS)
             .min(eligible.max(1));
         (
             PlaidSearchParams {
                 n_ivf_probe,
-                n_full_scores: PLAID_DEFAULT_N_FULL_SCORES.max(raw_candidates.saturating_mul(4)),
-                top_k: raw_candidates,
-                centroid_score_threshold: Some(0.4),
+                n_full_scores: PLAID_DEFAULT_N_FULL_SCORES
+                    .max(core_residual_candidates.saturating_mul(4)),
+                top_k: core_residual_candidates,
+                centroid_score_threshold: None,
             },
             eligible,
         )
@@ -957,6 +961,7 @@ mod tests {
             scanner.filter(filter).unwrap();
         }
         scanner.nearest("mv", &query(), k).unwrap();
+        scanner.refine(2);
         scanner.project(&["id"]).unwrap();
         scanner.try_into_batch().await.unwrap()
     }
@@ -982,10 +987,7 @@ mod tests {
         let directory = TempStrDir::default();
         let first = make_batch(
             vec![0, 1],
-            vec![
-                vec![[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]],
-                vec![[0.8, 0.0, 0.0, 0.0], [0.0, 0.8, 0.0, 0.0]],
-            ],
+            vec![vec![[1.0, 0.0, 0.0, 0.0]], vec![[0.0, 1.0, 0.0, 0.0]]],
         );
         let schema = first.schema();
         let reader = RecordBatchIterator::new(vec![Ok(first)], schema.clone());
@@ -1002,10 +1004,7 @@ mod tests {
         .unwrap();
         let second = make_batch(
             vec![2, 3],
-            vec![
-                vec![[0.7, 0.0, 0.0, 0.0], [0.0, 0.7, 0.0, 0.0]],
-                vec![[-1.0, 0.0, 0.0, 0.0], [0.0, -1.0, 0.0, 0.0]],
-            ],
+            vec![vec![[-1.0, 0.0, 0.0, 0.0]], vec![[0.0, -1.0, 0.0, 0.0]]],
         );
         dataset
             .append(RecordBatchIterator::new(vec![Ok(second)], schema), None)
@@ -1017,7 +1016,7 @@ mod tests {
                 IndexType::Vector,
                 Some("plaid_idx".to_string()),
                 &PlaidIndexParams {
-                    num_centroids: 2,
+                    num_centroids: 4,
                     nbits: 2,
                     max_iterations: 3,
                     sample_rate: 4,
@@ -1046,7 +1045,7 @@ mod tests {
         let filtered = filtered_scanner.try_into_batch().await.unwrap();
         assert_eq!(filtered.num_rows(), 4);
         let distances = filtered[DIST_COL].as_primitive::<Float32Type>();
-        for (actual, expected) in distances.values().iter().zip([0.0_f32, 0.2, 0.3, 1.0]) {
+        for (actual, expected) in distances.values().iter().zip([0.0_f32, 1.0, 1.0, 2.0]) {
             assert!((*actual - expected).abs() < 1.0e-5);
         }
         let mut filtered_ids = filtered["id"]
@@ -1073,6 +1072,136 @@ mod tests {
             analyzed.contains("plaid_filter_exact_documents=4"),
             "unexpected analyzed plan:\n{analyzed}"
         );
+        assert!(
+            analyzed.contains("plaid_index_only_queries=1"),
+            "unexpected analyzed plan:\n{analyzed}"
+        );
+        assert!(
+            analyzed.contains("plaid_raw_vector_rows=4"),
+            "unexpected analyzed plan:\n{analyzed}"
+        );
+
+        // A normal index-only query merges residual scores, keeps top-k, and
+        // resolves only those stable row IDs without reading the vector column.
+        let mut index_only_scanner = dataset.scan();
+        index_only_scanner
+            .nearest("mv", &single_token_query, 2)
+            .unwrap();
+        index_only_scanner.project(&["id"]).unwrap();
+        let index_only_plan = index_only_scanner.explain_plan(false).await.unwrap();
+        assert!(
+            index_only_plan.contains("mode=index_only"),
+            "unexpected index-only plan:\n{index_only_plan}"
+        );
+        assert!(
+            index_only_plan.contains("raw_refinement_budget=0"),
+            "unexpected index-only plan:\n{index_only_plan}"
+        );
+        let index_only_analyzed = index_only_scanner.analyze_plan().await.unwrap();
+        assert!(
+            index_only_analyzed.contains("plaid_index_only_queries=1"),
+            "unexpected analyzed plan:\n{index_only_analyzed}"
+        );
+        assert!(
+            index_only_analyzed.contains("plaid_row_id_only_rows=2"),
+            "unexpected analyzed plan:\n{index_only_analyzed}"
+        );
+        assert!(
+            index_only_analyzed.contains("plaid_raw_vector_rows=0"),
+            "unexpected analyzed plan:\n{index_only_analyzed}"
+        );
+        let index_only = index_only_scanner.try_into_batch().await.unwrap();
+        assert_eq!(index_only.num_rows(), 2);
+        assert_eq!(
+            index_only["id"]
+                .as_primitive::<arrow::datatypes::Int32Type>()
+                .values(),
+            &[0, 1]
+        );
+
+        let mut bounded_index_only = dataset.scan();
+        bounded_index_only
+            .nearest("mv", &single_token_query, 4)
+            .unwrap();
+        bounded_index_only.distance_range(Some(0.5), Some(1.5));
+        bounded_index_only.project(&["id"]).unwrap();
+        let bounded_analyzed = bounded_index_only.analyze_plan().await.unwrap();
+        assert!(
+            bounded_analyzed.contains("plaid_row_id_only_rows=2"),
+            "unexpected analyzed plan:\n{bounded_analyzed}"
+        );
+        assert!(
+            bounded_analyzed.contains("plaid_raw_vector_rows=0"),
+            "unexpected analyzed plan:\n{bounded_analyzed}"
+        );
+        let bounded_index_only = bounded_index_only.try_into_batch().await.unwrap();
+        assert_eq!(
+            bounded_index_only["id"]
+                .as_primitive::<arrow::datatypes::Int32Type>()
+                .values(),
+            &[1, 3]
+        );
+
+        // Explicit refinement reads no more than k * factor raw vectors; the
+        // core is still free to residual-rerank its wider candidate budget.
+        let mut exact_scanner = dataset.scan();
+        exact_scanner.nearest("mv", &single_token_query, 2).unwrap();
+        exact_scanner.refine(1);
+        exact_scanner.project(&["id"]).unwrap();
+        let exact_plan = exact_scanner.explain_plan(false).await.unwrap();
+        assert!(
+            exact_plan.contains("mode=exact"),
+            "unexpected exact plan:\n{exact_plan}"
+        );
+        assert!(
+            exact_plan.contains("raw_refinement_budget=2"),
+            "unexpected exact plan:\n{exact_plan}"
+        );
+        let exact_analyzed = exact_scanner.analyze_plan().await.unwrap();
+        assert!(
+            exact_analyzed.contains("plaid_exact_refinement_queries=1"),
+            "unexpected analyzed plan:\n{exact_analyzed}"
+        );
+        assert!(
+            exact_analyzed.contains("plaid_raw_refinement_budget=2"),
+            "unexpected analyzed plan:\n{exact_analyzed}"
+        );
+        assert!(
+            exact_analyzed.contains("plaid_core_residual_budget=4"),
+            "unexpected analyzed plan:\n{exact_analyzed}"
+        );
+        assert!(
+            exact_analyzed.contains("plaid_raw_vector_rows=2"),
+            "unexpected analyzed plan:\n{exact_analyzed}"
+        );
+
+        // F=4 is larger than the index-only requested budget k=2. One probe
+        // finds only the negative document, so true underfill exact-scores all
+        // four eligible rows and records the distinct fallback reason.
+        let negative_query = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![-1.0, 0.0, 0.0, 0.0]),
+            4,
+        )
+        .unwrap();
+        let mut underfilled_scanner = dataset.scan();
+        underfilled_scanner.prefilter(true);
+        underfilled_scanner.filter("id IN (0, 1, 2, 3)").unwrap();
+        underfilled_scanner
+            .nearest("mv", &negative_query, 2)
+            .unwrap();
+        underfilled_scanner.nprobes(1);
+        underfilled_scanner.project(&["id"]).unwrap();
+        let underfilled_analyzed = underfilled_scanner.analyze_plan().await.unwrap();
+        assert!(
+            underfilled_analyzed.contains("plaid_filter_exact_underfilled_fallbacks=1"),
+            "unexpected analyzed plan:\n{underfilled_analyzed}"
+        );
+        assert!(
+            underfilled_analyzed.contains("plaid_raw_vector_rows=4"),
+            "unexpected analyzed plan:\n{underfilled_analyzed}"
+        );
+        let underfilled = underfilled_scanner.try_into_batch().await.unwrap();
+        assert_eq!(underfilled.num_rows(), 2);
 
         let second_fragment = search_ids(&dataset, Some("id = 2"), 1).await;
         assert_eq!(
@@ -1099,6 +1228,29 @@ mod tests {
             .to_vec();
         filtered_ids.sort_unstable();
         assert_eq!(filtered_ids, &[0, 1, 3]);
+
+        let mut index_only_after_delete = dataset.scan();
+        index_only_after_delete
+            .nearest("mv", &single_token_query, 2)
+            .unwrap();
+        index_only_after_delete.project(&["id"]).unwrap();
+        let after_delete_analyzed = index_only_after_delete.analyze_plan().await.unwrap();
+        assert!(
+            after_delete_analyzed.contains("plaid_row_id_only_rows=2"),
+            "unexpected analyzed plan:\n{after_delete_analyzed}"
+        );
+        assert!(
+            after_delete_analyzed.contains("plaid_raw_vector_rows=0"),
+            "unexpected analyzed plan:\n{after_delete_analyzed}"
+        );
+        let index_only_after_delete = index_only_after_delete.try_into_batch().await.unwrap();
+        assert_eq!(index_only_after_delete.num_rows(), 2);
+        assert!(
+            !index_only_after_delete["id"]
+                .as_primitive::<arrow::datatypes::Int32Type>()
+                .values()
+                .contains(&2)
+        );
 
         let after_delete = search_ids(&dataset, None, 4).await;
         assert_eq!(after_delete.num_rows(), 3);
@@ -1263,11 +1415,29 @@ mod tests {
         plan_scanner.project(&["id"]).unwrap();
         let plan = plan_scanner.explain_plan(false).await.unwrap();
         assert!(plan.contains("PlaidSearch"), "unexpected plan:\n{plan}");
+        assert!(plan.contains("mode=index_only"), "unexpected plan:\n{plan}");
+        assert!(
+            plan.contains("raw_refinement_budget=0"),
+            "unexpected plan:\n{plan}"
+        );
         assert!(
             !plan.contains("MultivectorScoring"),
             "unexpected plan:\n{plan}"
         );
         assert!(!plan.contains("ANNSubIndex"), "unexpected plan:\n{plan}");
+        let index_only_analyzed = plan_scanner.analyze_plan().await.unwrap();
+        assert!(
+            index_only_analyzed.contains("plaid_index_only_queries=1"),
+            "unexpected analyzed plan:\n{index_only_analyzed}"
+        );
+        assert!(
+            index_only_analyzed.contains("plaid_row_id_only_rows=0"),
+            "unexpected analyzed plan:\n{index_only_analyzed}"
+        );
+        assert!(
+            index_only_analyzed.contains("plaid_raw_vector_rows=0"),
+            "unexpected analyzed plan:\n{index_only_analyzed}"
+        );
 
         let result = search_ids(&dataset, None, 3).await;
         assert_eq!(
@@ -1283,6 +1453,7 @@ mod tests {
 
         let mut bounded_scanner = dataset.scan();
         bounded_scanner.nearest("mv", &query(), 4).unwrap();
+        bounded_scanner.refine(1);
         bounded_scanner.distance_range(Some(-0.5), Some(0.5));
         bounded_scanner.project(&["id"]).unwrap();
         let bounded = bounded_scanner.try_into_batch().await.unwrap();

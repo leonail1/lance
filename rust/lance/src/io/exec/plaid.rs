@@ -52,20 +52,77 @@ const POSTINGS_TIME: &str = "plaid_postings_time";
 const CANDIDATE_TIME: &str = "plaid_candidate_total_time";
 const APPROXIMATE_TIME: &str = "plaid_approximate_time";
 const RESIDUAL_RERANK_TIME: &str = "plaid_residual_rerank_time";
-const RAW_FETCH_TIME: &str = "plaid_raw_fetch_time";
+const ROW_ID_FETCH_TIME: &str = "plaid_row_id_only_fetch_time";
+const RAW_VECTOR_FETCH_TIME: &str = "plaid_raw_vector_fetch_time";
 const EXACT_TIME: &str = "plaid_exact_maxsim_time";
 const SORT_TIME: &str = "plaid_sort_time";
 const TOTAL_TIME: &str = "plaid_total_time";
 const POSTINGS_COUNT: &str = "plaid_posting_entries";
+const CENTROIDS_PROBED_COUNT: &str = "plaid_centroids_probed";
+const POSTINGS_ELIGIBLE_COUNT: &str = "plaid_posting_entries_eligible";
 const CANDIDATE_COUNT: &str = "plaid_candidate_documents";
+const APPROXIMATE_DOCUMENTS_COUNT: &str = "plaid_approximate_documents";
+const RESIDUAL_DOCUMENTS_COUNT: &str = "plaid_residual_documents";
 const FILTER_EXACT_SMALL_COUNT: &str = "plaid_filter_exact_small_filter_fallbacks";
 const FILTER_EXACT_UNDERFILLED_COUNT: &str = "plaid_filter_exact_underfilled_fallbacks";
 const FILTER_EXACT_DOCUMENTS_COUNT: &str = "plaid_filter_exact_documents";
-const RAW_ROWS_COUNT: &str = "plaid_raw_rows";
+const ROW_ID_ROWS_COUNT: &str = "plaid_row_id_only_rows";
+const RAW_VECTOR_ROWS_COUNT: &str = "plaid_raw_vector_rows";
+const INDEX_ONLY_QUERY_COUNT: &str = "plaid_index_only_queries";
+const EXACT_QUERY_COUNT: &str = "plaid_exact_refinement_queries";
 const PROBE_RETRY_COUNT: &str = "plaid_probe_retries";
 const CONFIGURED_PROBES_COUNT: &str = "plaid_configured_probes";
-const N_FULL_BUDGET_COUNT: &str = "plaid_n_full_budget";
-const RAW_BUDGET_COUNT: &str = "plaid_raw_candidate_budget";
+const CORE_APPROXIMATE_BUDGET_COUNT: &str = "plaid_core_approximate_budget";
+const CORE_RESIDUAL_BUDGET_COUNT: &str = "plaid_core_residual_budget";
+const RAW_REFINEMENT_BUDGET_COUNT: &str = "plaid_raw_refinement_budget";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlaidExecutionMode {
+    IndexOnly,
+    Exact { raw_refinement_budget: usize },
+}
+
+impl PlaidExecutionMode {
+    fn try_from_query(query: &Query) -> Result<Self> {
+        match query.refine_factor {
+            None => Ok(Self::IndexOnly),
+            Some(0) => Err(Error::invalid_input(
+                "PLAID refine factor must be positive".to_string(),
+            )),
+            Some(factor) => {
+                let factor = usize::try_from(factor).map_err(|_| {
+                    Error::invalid_input("PLAID refine factor does not fit usize".to_string())
+                })?;
+                let raw_refinement_budget = query.k.checked_mul(factor).ok_or_else(|| {
+                    Error::invalid_input("PLAID raw refinement budget overflow".to_string())
+                })?;
+                Ok(Self::Exact {
+                    raw_refinement_budget,
+                })
+            }
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::IndexOnly => "index_only",
+            Self::Exact { .. } => "exact",
+        }
+    }
+
+    fn raw_refinement_budget(self) -> usize {
+        match self {
+            Self::IndexOnly => 0,
+            Self::Exact {
+                raw_refinement_budget,
+            } => raw_refinement_budget,
+        }
+    }
+
+    fn requested_candidates(self, top_k: usize) -> usize {
+        self.raw_refinement_budget().max(top_k)
+    }
+}
 
 /// One physical operator for the complete database-native PLAID query pipeline.
 #[derive(Debug)]
@@ -73,6 +130,7 @@ pub struct PlaidSearchExec {
     dataset: Arc<Dataset>,
     indices: Vec<IndexMetadata>,
     query: Query,
+    mode: PlaidExecutionMode,
     prefilter_source: PreFilterSource,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
@@ -95,6 +153,7 @@ impl PlaidSearchExec {
                 "PlaidSearchExec received a non-PLAID index segment".to_string(),
             ));
         }
+        let mode = PlaidExecutionMode::try_from_query(&query)?;
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(KNN_INDEX_SCHEMA.clone()),
             Partitioning::RoundRobinBatch(1),
@@ -105,6 +164,7 @@ impl PlaidSearchExec {
             dataset,
             indices,
             query,
+            mode,
             prefilter_source,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -121,17 +181,27 @@ impl DisplayAs for PlaidSearchExec {
         match format {
             DisplayFormatType::Default | DisplayFormatType::Verbose => write!(
                 formatter,
-                "PlaidSearch: name={}, k={}, segments={}, exact_refinement=true",
+                "PlaidSearch: name={}, k={}, segments={}, mode={}, core_residual_budget={}, raw_refinement_budget={}, filter_exact_fallback=enabled",
                 self.indices[0].name,
                 self.query.k,
-                self.indices.len()
+                self.indices.len(),
+                self.mode.name(),
+                self.mode
+                    .requested_candidates(self.query.k)
+                    .max(PLAID_DEFAULT_DECOMPRESS_DOCUMENTS),
+                self.mode.raw_refinement_budget(),
             ),
             DisplayFormatType::TreeRender => write!(
                 formatter,
-                "PlaidSearch\nname={}\nk={}\nsegments={}\nexact_refinement=true",
+                "PlaidSearch\nname={}\nk={}\nsegments={}\nmode={}\ncore_residual_budget={}\nraw_refinement_budget={}\nfilter_exact_fallback=enabled",
                 self.indices[0].name,
                 self.query.k,
-                self.indices.len()
+                self.indices.len(),
+                self.mode.name(),
+                self.mode
+                    .requested_candidates(self.query.k)
+                    .max(PLAID_DEFAULT_DECOMPRESS_DOCUMENTS),
+                self.mode.raw_refinement_budget(),
             ),
         }
     }
@@ -212,9 +282,10 @@ impl ExecutionPlan for PlaidSearchExec {
         let dataset = self.dataset.clone();
         let indices = self.indices.clone();
         let query = self.query.clone();
+        let mode = self.mode;
         let stream = stream::once(async move {
             let total_started = Instant::now();
-            let result = execute_search(dataset, indices, query, prefilter, metrics.clone())
+            let result = execute_search(dataset, indices, query, mode, prefilter, metrics.clone())
                 .await
                 .map_err(DataFusionError::from);
             metrics.total.add_duration(total_started.elapsed());
@@ -253,20 +324,29 @@ struct PlaidExecMetrics {
     candidate: Time,
     approximate: Time,
     residual_rerank: Time,
-    raw_fetch: Time,
+    row_id_fetch: Time,
+    raw_vector_fetch: Time,
     exact: Time,
     sort: Time,
     total: Time,
     postings_count: Count,
+    centroids_probed_count: Count,
+    postings_eligible_count: Count,
     candidate_count: Count,
+    approximate_documents_count: Count,
+    residual_documents_count: Count,
     filter_exact_small_count: Count,
     filter_exact_underfilled_count: Count,
     filter_exact_documents_count: Count,
-    raw_rows_count: Count,
+    row_id_rows_count: Count,
+    raw_vector_rows_count: Count,
+    index_only_query_count: Count,
+    exact_query_count: Count,
     probe_retry_count: Count,
     configured_probes_count: Count,
-    n_full_budget_count: Count,
-    raw_budget_count: Count,
+    core_approximate_budget_count: Count,
+    core_residual_budget_count: Count,
+    raw_refinement_budget_count: Count,
 }
 
 impl PlaidExecMetrics {
@@ -280,23 +360,42 @@ impl PlaidExecMetrics {
             candidate: metrics.new_time(CANDIDATE_TIME, partition),
             approximate: metrics.new_time(APPROXIMATE_TIME, partition),
             residual_rerank: metrics.new_time(RESIDUAL_RERANK_TIME, partition),
-            raw_fetch: metrics.new_time(RAW_FETCH_TIME, partition),
+            row_id_fetch: metrics.new_time(ROW_ID_FETCH_TIME, partition),
+            raw_vector_fetch: metrics.new_time(RAW_VECTOR_FETCH_TIME, partition),
             exact: metrics.new_time(EXACT_TIME, partition),
             sort: metrics.new_time(SORT_TIME, partition),
             total: metrics.new_time(TOTAL_TIME, partition),
             postings_count: metrics.new_count(POSTINGS_COUNT, partition),
+            centroids_probed_count: metrics.new_count(CENTROIDS_PROBED_COUNT, partition),
+            postings_eligible_count: metrics.new_count(POSTINGS_ELIGIBLE_COUNT, partition),
             candidate_count: metrics.new_count(CANDIDATE_COUNT, partition),
+            approximate_documents_count: metrics.new_count(APPROXIMATE_DOCUMENTS_COUNT, partition),
+            residual_documents_count: metrics.new_count(RESIDUAL_DOCUMENTS_COUNT, partition),
             filter_exact_small_count: metrics.new_count(FILTER_EXACT_SMALL_COUNT, partition),
             filter_exact_underfilled_count: metrics
                 .new_count(FILTER_EXACT_UNDERFILLED_COUNT, partition),
             filter_exact_documents_count: metrics
                 .new_count(FILTER_EXACT_DOCUMENTS_COUNT, partition),
-            raw_rows_count: metrics.new_count(RAW_ROWS_COUNT, partition),
+            row_id_rows_count: metrics.new_count(ROW_ID_ROWS_COUNT, partition),
+            raw_vector_rows_count: metrics.new_count(RAW_VECTOR_ROWS_COUNT, partition),
+            index_only_query_count: metrics.new_count(INDEX_ONLY_QUERY_COUNT, partition),
+            exact_query_count: metrics.new_count(EXACT_QUERY_COUNT, partition),
             probe_retry_count: metrics.new_count(PROBE_RETRY_COUNT, partition),
             configured_probes_count: metrics.new_count(CONFIGURED_PROBES_COUNT, partition),
-            n_full_budget_count: metrics.new_count(N_FULL_BUDGET_COUNT, partition),
-            raw_budget_count: metrics.new_count(RAW_BUDGET_COUNT, partition),
+            core_approximate_budget_count: metrics
+                .new_count(CORE_APPROXIMATE_BUDGET_COUNT, partition),
+            core_residual_budget_count: metrics.new_count(CORE_RESIDUAL_BUDGET_COUNT, partition),
+            raw_refinement_budget_count: metrics.new_count(RAW_REFINEMENT_BUDGET_COUNT, partition),
         }
+    }
+
+    fn record_mode(&self, mode: PlaidExecutionMode) {
+        match mode {
+            PlaidExecutionMode::IndexOnly => self.index_only_query_count.add(1),
+            PlaidExecutionMode::Exact { .. } => self.exact_query_count.add(1),
+        }
+        self.raw_refinement_budget_count
+            .add(mode.raw_refinement_budget());
     }
 
     fn record_core(&self, stats: &lance_plaid::PlaidSearchStats) {
@@ -312,8 +411,16 @@ impl PlaidExecMetrics {
             .add_duration(Duration::from_nanos(stats.sort_nanos));
         self.postings_count
             .add(usize::try_from(stats.posting_entries_read).unwrap_or(usize::MAX));
+        self.centroids_probed_count
+            .add(usize::try_from(stats.centroids_probed).unwrap_or(usize::MAX));
+        self.postings_eligible_count
+            .add(usize::try_from(stats.posting_entries_eligible).unwrap_or(usize::MAX));
         self.candidate_count
             .add(usize::try_from(stats.candidate_documents).unwrap_or(usize::MAX));
+        self.approximate_documents_count
+            .add(usize::try_from(stats.approximate_documents).unwrap_or(usize::MAX));
+        self.residual_documents_count
+            .add(usize::try_from(stats.exact_documents).unwrap_or(usize::MAX));
     }
 }
 
@@ -335,26 +442,21 @@ async fn execute_search(
     dataset: Arc<Dataset>,
     indices: Vec<IndexMetadata>,
     query: Query,
+    mode: PlaidExecutionMode,
     prefilter: Arc<crate::index::prefilter::DatasetPreFilter>,
     metrics: Arc<PlaidExecMetrics>,
 ) -> Result<RecordBatch> {
+    metrics.record_mode(mode);
     let filter_started = Instant::now();
     prefilter.wait_for_ready().await?;
     metrics.filter.add_duration(filter_started.elapsed());
 
     let dimension = crate::index::vector::utils::get_vector_dim(dataset.schema(), &query.column)?;
     let query_tokens = query_to_array(&query, dimension)?;
-    let default_refine = 4_usize;
-    let refine = query
-        .refine_factor
-        .map(|factor| factor as usize)
-        .unwrap_or(default_refine)
-        .max(1);
-    let requested_candidates = query.k.saturating_mul(refine).max(query.k);
-    let candidate_limit = requested_candidates.max(PLAID_DEFAULT_DECOMPRESS_DOCUMENTS);
+    let requested_candidates = mode.requested_candidates(query.k);
     let mask = plaid_address_mask(dataset.as_ref(), prefilter.mask()).await?;
     // Proactive exact scoring must stay within the work already requested for
-    // ANN refinement.  This captures very selective filters without turning a
+    // result refinement. This captures very selective filters without turning a
     // 1% or 10% predicate into an accidental full-filter scan.
     let small_filter_exact = small_filter_exact_fallback(mask.max_len(), requested_candidates);
     let filtered_query = !mask.is_select_all();
@@ -378,8 +480,10 @@ async fn execute_search(
         }
         let (mut params, segment_eligible) =
             plaid.candidate_params(&query, requested_candidates, mask.as_ref());
-        metrics.n_full_budget_count.add(params.n_full_scores);
-        metrics.raw_budget_count.add(params.top_k);
+        metrics
+            .core_approximate_budget_count
+            .add(params.n_full_scores);
+        metrics.core_residual_budget_count.add(params.top_k);
         let desired_candidates = segment_eligible
             .min(params.top_k)
             .min(plaid.num_documents());
@@ -413,10 +517,6 @@ async fn execute_search(
                 break hits;
             }
             if params.n_ivf_probe >= max_centroids {
-                if params.centroid_score_threshold.take().is_some() {
-                    metrics.probe_retry_count.add(1);
-                    continue;
-                }
                 break hits;
             }
             params.n_ivf_probe = params
@@ -424,7 +524,6 @@ async fn execute_search(
                 .saturating_mul(2)
                 .min(max_centroids)
                 .max(1);
-            params.centroid_score_threshold = None;
             metrics.probe_retry_count.add(1);
         };
         for hit in hits {
@@ -487,6 +586,45 @@ async fn execute_search(
     }
     metrics.candidate.add_duration(candidate_started.elapsed());
 
+    if candidates.is_empty() {
+        let batch = RecordBatch::new_empty(KNN_INDEX_SCHEMA.clone());
+        metrics.baseline.record_output(0);
+        return Ok(batch);
+    }
+
+    if mode == PlaidExecutionMode::IndexOnly && !exact_fallback {
+        let mut hits = candidates
+            .into_iter()
+            .map(|(row_address, score)| ExactHit {
+                row_address,
+                distance: maxsim_distance(score),
+            })
+            .collect::<Vec<_>>();
+        let sort_started = Instant::now();
+        // Physical row address makes HashMap iteration irrelevant and gives a
+        // deterministic cutoff before stable IDs are available. Equal-score
+        // rows at the top-k boundary are semantically interchangeable.
+        rank_hits(&mut hits, &query);
+        metrics.sort.add_duration(sort_started.elapsed());
+
+        let row_addresses = hits.iter().map(|hit| hit.row_address).collect::<Vec<_>>();
+        let result_row_ids =
+            index_only_result_row_ids(dataset.clone(), &row_addresses, metrics.as_ref()).await?;
+        for (hit, row_id) in hits.iter_mut().zip(result_row_ids) {
+            hit.row_address = row_id;
+        }
+        let sort_started = Instant::now();
+        hits.sort_unstable_by(|left, right| {
+            left.distance
+                .total_cmp(&right.distance)
+                .then_with(|| left.row_address.cmp(&right.row_address))
+        });
+        let batch = hits_to_batch(&hits)?;
+        metrics.sort.add_duration(sort_started.elapsed());
+        metrics.baseline.record_output(batch.num_rows());
+        return Ok(batch);
+    }
+
     let sort_started = Instant::now();
     let mut candidates = candidates.into_iter().collect::<Vec<_>>();
     if exact_fallback {
@@ -498,15 +636,9 @@ async fn execute_search(
                 .total_cmp(&left.1)
                 .then_with(|| left.0.cmp(&right.0))
         });
-        candidates.truncate(candidate_limit.min(candidates.len()));
+        candidates.truncate(requested_candidates.min(candidates.len()));
     }
     metrics.sort.add_duration(sort_started.elapsed());
-
-    if candidates.is_empty() {
-        let batch = RecordBatch::new_empty(KNN_INDEX_SCHEMA.clone());
-        metrics.baseline.record_output(0);
-        return Ok(batch);
-    }
 
     let row_addresses = candidates
         .iter()
@@ -516,16 +648,18 @@ async fn execute_search(
         ProjectionRequest::from_columns([query.column.as_str(), ROW_ID], dataset.schema())
             .into_projection_plan(dataset.clone())?,
     );
-    let raw_fetch_started = Instant::now();
+    let raw_vector_fetch_started = Instant::now();
     let batch =
         TakeBuilder::try_new_from_addresses(dataset.clone(), row_addresses.clone(), projection)?
             .execute()
             .await?;
-    metrics.raw_fetch.add_duration(raw_fetch_started.elapsed());
-    metrics.raw_rows_count.add(batch.num_rows());
+    metrics
+        .raw_vector_fetch
+        .add_duration(raw_vector_fetch_started.elapsed());
+    metrics.raw_vector_rows_count.add(batch.num_rows());
     if batch.num_rows() != row_addresses.len() {
         return Err(Error::internal(format!(
-            "PLAID raw take returned {} rows for {} candidates",
+            "PLAID raw-vector take returned {} rows for {} candidates",
             batch.num_rows(),
             row_addresses.len()
         )));
@@ -540,33 +674,81 @@ async fn execute_search(
     let exact_started = Instant::now();
     let column = query.column.clone();
     let query_for_cpu = query_tokens.clone();
-    let mut exact = spawn_cpu(move || exact_scores(&batch, &column, query_for_cpu.view())).await?;
+    let mut hits = spawn_cpu(move || exact_scores(&batch, &column, query_for_cpu.view())).await?;
     metrics.exact.add_duration(exact_started.elapsed());
-    for (hit, row_id) in exact.iter_mut().zip(result_row_ids) {
+    for (hit, row_id) in hits.iter_mut().zip(result_row_ids) {
         hit.row_address = row_id;
     }
 
     let sort_started = Instant::now();
-    exact.retain(|hit| {
+    let batch = finalize_hits(hits, &query)?;
+    metrics.sort.add_duration(sort_started.elapsed());
+    metrics.baseline.record_output(batch.num_rows());
+    Ok(batch)
+}
+
+async fn index_only_result_row_ids(
+    dataset: Arc<Dataset>,
+    row_addresses: &[u64],
+    metrics: &PlaidExecMetrics,
+) -> Result<Vec<u64>> {
+    if !dataset.manifest().uses_stable_row_ids() {
+        // In legacy row-address mode the physical address is the public row ID.
+        return Ok(row_addresses.to_vec());
+    }
+
+    let projection = Arc::new(
+        ProjectionRequest::from_columns([ROW_ID], dataset.schema())
+            .into_projection_plan(dataset.clone())?,
+    );
+    let row_id_fetch_started = Instant::now();
+    let batch = TakeBuilder::try_new_from_addresses(dataset, row_addresses.to_vec(), projection)?
+        .execute()
+        .await?;
+    metrics
+        .row_id_fetch
+        .add_duration(row_id_fetch_started.elapsed());
+    metrics.row_id_rows_count.add(batch.num_rows());
+    if batch.num_rows() != row_addresses.len() {
+        return Err(Error::internal(format!(
+            "PLAID row-id-only take returned {} rows for {} candidates",
+            batch.num_rows(),
+            row_addresses.len()
+        )));
+    }
+    Ok(batch
+        .column_by_name(ROW_ID)
+        .ok_or_else(|| Error::internal("PLAID row-id-only take omitted _rowid".to_string()))?
+        .as_primitive::<UInt64Type>()
+        .values()
+        .to_vec())
+}
+
+fn rank_hits(hits: &mut Vec<ExactHit>, query: &Query) {
+    hits.retain(|hit| {
         query.lower_bound.is_none_or(|lower| hit.distance >= lower)
             && query.upper_bound.is_none_or(|upper| hit.distance < upper)
     });
-    exact.sort_unstable_by(|left, right| {
+    hits.sort_unstable_by(|left, right| {
         left.distance
             .total_cmp(&right.distance)
             .then_with(|| left.row_address.cmp(&right.row_address))
     });
-    exact.truncate(query.k.min(exact.len()));
-    metrics.sort.add_duration(sort_started.elapsed());
+    hits.truncate(query.k.min(hits.len()));
+}
 
-    let distances = Float32Array::from(exact.iter().map(|hit| hit.distance).collect::<Vec<_>>());
-    let rows = UInt64Array::from(exact.iter().map(|hit| hit.row_address).collect::<Vec<_>>());
-    let batch = RecordBatch::try_new(
+fn hits_to_batch(hits: &[ExactHit]) -> Result<RecordBatch> {
+    let distances = Float32Array::from(hits.iter().map(|hit| hit.distance).collect::<Vec<_>>());
+    let rows = UInt64Array::from(hits.iter().map(|hit| hit.row_address).collect::<Vec<_>>());
+    Ok(RecordBatch::try_new(
         KNN_INDEX_SCHEMA.clone(),
         vec![Arc::new(distances), Arc::new(rows)],
-    )?;
-    metrics.baseline.record_output(batch.num_rows());
-    Ok(batch)
+    )?)
+}
+
+fn finalize_hits(mut hits: Vec<ExactHit>, query: &Query) -> Result<RecordBatch> {
+    rank_hits(&mut hits, query);
+    hits_to_batch(&hits)
 }
 
 async fn plaid_address_mask(dataset: &Dataset, mask: Arc<RowAddrMask>) -> Result<Arc<RowAddrMask>> {
@@ -689,6 +871,14 @@ mod tests {
 
     #[test]
     fn exact_filter_fallback_policy_tracks_budget_and_true_underfill() {
+        assert_eq!(PlaidExecutionMode::IndexOnly.requested_candidates(10), 10);
+        assert_eq!(PlaidExecutionMode::IndexOnly.raw_refinement_budget(), 0);
+        let exact = PlaidExecutionMode::Exact {
+            raw_refinement_budget: 50,
+        };
+        assert_eq!(exact.requested_candidates(10), 50);
+        assert_eq!(exact.raw_refinement_budget(), 50);
+
         assert!(small_filter_exact_fallback(Some(10), 50));
         assert!(small_filter_exact_fallback(Some(50), 50));
         assert!(!small_filter_exact_fallback(Some(51), 50));
