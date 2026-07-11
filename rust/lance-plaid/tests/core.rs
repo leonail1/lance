@@ -114,7 +114,13 @@ fn versioned_file_round_trips_both_quantizers() {
         let path = directory.path().join(format!("plaid-{nbits}.bin"));
         original.write_to_path(&path).unwrap();
         let restored = PlaidIndex::read_from_path(&path).unwrap();
+        let bytes = original.to_bytes().unwrap();
+        let restored_from_bytes = PlaidIndex::read_from_bytes(&bytes).unwrap();
         assert_eq!(restored.dimension(), original.dimension());
+        assert_eq!(
+            restored_from_bytes.row_addresses(),
+            original.row_addresses()
+        );
         assert_eq!(restored.num_documents(), original.num_documents());
         assert_eq!(restored.num_tokens(), original.num_tokens());
         assert_eq!(restored.quantizer(), original.quantizer());
@@ -128,4 +134,13 @@ fn versioned_file_round_trips_both_quantizers() {
             .unwrap();
         assert_eq!(actual, expected);
     }
+}
+
+#[test]
+fn versioned_bytes_reject_unknown_version() {
+    let index = test_index(2);
+    let mut bytes = index.to_bytes().unwrap();
+    bytes[8..10].copy_from_slice(&2_u16.to_le_bytes());
+    let error = PlaidIndex::read_from_bytes(&bytes).unwrap_err();
+    assert!(error.to_string().contains("unsupported format version 2"));
 }

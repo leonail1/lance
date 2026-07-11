@@ -41,6 +41,8 @@ pub struct PlaidSearchStats {
     pub centroid_probe_nanos: u64,
     /// Number of distinct coarse centroids probed.
     pub centroids_probed: u64,
+    /// Nanoseconds spent expanding postings and applying eligibility.
+    pub postings_nanos: u64,
     /// Posting entries visited before eligibility filtering.
     pub posting_entries_read: u64,
     /// Posting entries that survived eligibility filtering.
@@ -95,6 +97,7 @@ impl PlaidIndex {
         stats.centroid_probe_nanos = duration_nanos(probe_started.elapsed());
         stats.centroids_probed = selected_centroids.len();
 
+        let postings_started = Instant::now();
         let mut candidate_documents = RoaringBitmap::new();
         for centroid in selected_centroids {
             let posting_range = self.posting_range(centroid)?;
@@ -111,6 +114,7 @@ impl PlaidIndex {
             }
         }
         stats.candidate_documents = candidate_documents.len();
+        stats.postings_nanos = duration_nanos(postings_started.elapsed());
 
         let approximate_started = Instant::now();
         let candidates = candidate_documents.iter().collect::<Vec<_>>();

@@ -75,6 +75,7 @@ pub(crate) mod append;
 mod create;
 pub mod frag_reuse;
 pub mod mem_wal;
+pub mod plaid;
 pub mod prefilter;
 pub mod scalar;
 pub(crate) mod scalar_logical;
@@ -89,6 +90,7 @@ use crate::dataset::transaction::{Operation, Transaction, TransactionBuilder};
 pub use crate::index::api::{DatasetIndexExt, IndexSegment, IntoIndexSegment};
 use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
 use crate::index::mem_wal::open_mem_wal_index;
+pub use crate::index::plaid::PlaidIndexParams;
 pub use crate::index::prefilter::{FilterLoader, PreFilter};
 use crate::index::scalar::{IndexDetails, fetch_index_details, load_training_data};
 pub use crate::index::vector::{LogicalIvfView, LogicalVectorIndex};
@@ -2171,6 +2173,18 @@ impl DatasetIndexInternalExt for Dataset {
         let cache_key = LegacyVectorIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
         if let Some(cached) = self.index_cache.get_with_key(&cache_key).await {
             return Ok(cached.0.clone());
+        }
+
+        // PLAID persists its discriminator in VectorIndexDetails and owns a
+        // versioned binary format, so it must be opened before LanceFile tail
+        // and version parsing.
+        if plaid::is_plaid_index_metadata(&index_meta) {
+            let index = plaid::open_plaid_index(self, &index_meta).await?;
+            metrics.record_index_load();
+            self.index_cache
+                .insert_with_key(&cache_key, Arc::new(CachedLegacyVectorIndex(index.clone())))
+                .await;
+            return Ok(index);
         }
 
         let frag_reuse_index = self.open_frag_reuse_index(metrics).await?;

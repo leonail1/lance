@@ -104,6 +104,24 @@ impl PlaidIndex {
         &self.quantizer
     }
 
+    /// Database row addresses in dense document-ordinal order.
+    pub fn row_addresses(&self) -> &[u64] {
+        &self.row_addresses
+    }
+
+    /// Estimated in-memory bytes owned by the index's dense arrays.
+    pub fn estimated_size_bytes(&self) -> usize {
+        self.centroids.len() * std::mem::size_of::<f32>()
+            + std::mem::size_of_val(self.quantizer.bucket_cutoffs())
+            + std::mem::size_of_val(self.quantizer.bucket_weights())
+            + self.row_addresses.len() * std::mem::size_of::<u64>()
+            + self.document_offsets.len() * std::mem::size_of::<u64>()
+            + self.token_codes.len() * std::mem::size_of::<u32>()
+            + self.packed_residuals.len()
+            + self.posting_offsets.len() * std::mem::size_of::<u64>()
+            + self.postings.len() * std::mem::size_of::<u32>()
+    }
+
     /// Resolves a dense document ordinal to its database row address.
     pub fn row_address(&self, document_ordinal: u32) -> Option<u64> {
         self.row_addresses.get(document_ordinal as usize).copied()

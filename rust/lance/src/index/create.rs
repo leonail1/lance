@@ -10,6 +10,7 @@ use crate::{
     index::{
         DatasetIndexExt, DatasetIndexInternalExt, IntoIndexSegment,
         build_index_metadata_from_segments,
+        plaid::{LANCE_PLAID_INDEX, PlaidIndexParams, build_plaid_index, plaid_index_details},
         scalar::{build_bitmap_index_segment, build_scalar_index},
         vector::{
             LANCE_VECTOR_INDEX, VectorIndexParams, build_distributed_vector_index,
@@ -345,6 +346,38 @@ impl<'a> CreateIndexBuilder<'a> {
                     self.progress.clone(),
                 )
                 .await?
+            }
+            (IndexType::Vector, LANCE_PLAID_INDEX) => {
+                let plaid_params = self
+                    .params
+                    .as_any()
+                    .downcast_ref::<PlaidIndexParams>()
+                    .ok_or_else(|| {
+                        Error::index("PLAID index type must take PlaidIndexParams".to_string())
+                    })?;
+                if !train {
+                    return Err(Error::not_supported(
+                        "creating an empty PLAID index is not supported".to_string(),
+                    ));
+                }
+                if self.fragments.is_some() {
+                    return Err(Error::not_supported(
+                        "distributed PLAID segment build is not implemented yet".to_string(),
+                    ));
+                }
+                let files = build_plaid_index(
+                    self.dataset,
+                    column,
+                    index_id,
+                    plaid_params,
+                    self.progress.clone(),
+                )
+                .await?;
+                CreatedIndex {
+                    index_details: plaid_index_details(plaid_params)?,
+                    index_version: IndexType::Vector.version() as u32,
+                    files,
+                }
             }
             (
                 IndexType::Vector
@@ -803,6 +836,13 @@ fn ensure_index_uuid_allowed(
 
 fn uses_segment_commit_path(index_type: IndexType, params: &dyn IndexParams) -> bool {
     let params_family = params.index_name();
+
+    if index_type == IndexType::Vector
+        && params_family == LANCE_PLAID_INDEX
+        && params.as_any().is::<PlaidIndexParams>()
+    {
+        return true;
+    }
 
     if params_family == LANCE_VECTOR_INDEX
         && matches!(

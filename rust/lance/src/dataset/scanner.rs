@@ -86,6 +86,7 @@ use super::Dataset;
 use crate::dataset::row_offsets_to_row_addresses;
 use crate::dataset::utils::SchemaAdapter;
 use crate::index::DatasetIndexInternalExt;
+use crate::index::plaid::is_plaid_index_metadata;
 use crate::index::scalar::inverted::{load_segment_details, load_segments};
 use crate::index::scalar_logical::scalar_index_fragment_bitmap;
 use crate::index::vector::utils::{
@@ -96,6 +97,7 @@ use crate::io::exec::fts::{
     BoostQueryExec, FlatMatchFilterExec, FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec,
 };
 use crate::io::exec::knn::MultivectorScoringExec;
+use crate::io::exec::plaid::PlaidSearchExec;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
 use crate::io::exec::{
     AddRowAddrExec, FilterPlan as ExprFilterPlan, KNNVectorDistanceExec, LancePushdownScanExec,
@@ -3823,7 +3825,11 @@ impl Scanner {
                 _ => unreachable!(),
             };
 
-            let mut knn_node = if q.refine_factor.is_some() {
+            // PLAID already performs one batched raw multi-vector refinement
+            // inside PlaidSearchExec. Preserve the stock external refinement for
+            // IVF indices only.
+            let is_plaid = index_segments.iter().all(is_plaid_index_metadata);
+            let mut knn_node = if q.refine_factor.is_some() && !is_plaid {
                 let vector_projection = self
                     .dataset
                     .empty_projection()
@@ -4709,6 +4715,18 @@ impl Scanner {
         index: &[IndexMetadata],
         filter_plan: &ExprFilterPlan,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        if index.iter().all(is_plaid_index_metadata) {
+            let prefilter_source = self
+                .prefilter_source(filter_plan, self.get_indexed_frags(index))
+                .await?;
+            return Ok(Arc::new(PlaidSearchExec::try_new(
+                self.dataset.clone(),
+                index.to_vec(),
+                q.clone(),
+                prefilter_source,
+            )?));
+        }
+
         // we split the query procedure into two steps:
         // 1. collect the candidates by vector searching on each query vector
         // 2. scoring the candidates

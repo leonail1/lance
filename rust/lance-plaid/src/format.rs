@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Cursor, Read, Write};
 use std::path::Path;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -39,6 +39,19 @@ impl PlaidIndex {
     pub fn write_to_path(&self, path: impl AsRef<Path>) -> Result<()> {
         let file = File::create(path)?;
         let mut writer = BufWriter::new(file);
+        self.write_to(&mut writer)?;
+        writer.flush()?;
+        Ok(())
+    }
+
+    /// Serializes the index into the versioned PLAID format.
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        self.write_to(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    fn write_to(&self, writer: &mut impl Write) -> Result<()> {
         writer.write_all(&MAGIC)?;
         writer.write_u16::<LittleEndian>(PlaidFormatVersion::V1 as u16)?;
         writer.write_u8(self.quantizer.nbits())?;
@@ -51,20 +64,19 @@ impl PlaidIndex {
         writer.write_u64::<LittleEndian>(self.postings.len() as u64)?;
 
         write_f32s(
-            &mut writer,
+            writer,
             self.centroids.as_slice().ok_or_else(|| {
                 Error::InvalidInput("centroid matrix must be contiguous".to_string())
             })?,
         )?;
-        write_f32s(&mut writer, self.quantizer.bucket_cutoffs())?;
-        write_f32s(&mut writer, self.quantizer.bucket_weights())?;
-        write_u64s(&mut writer, &self.row_addresses)?;
-        write_u64s(&mut writer, &self.document_offsets)?;
-        write_u32s(&mut writer, &self.token_codes)?;
+        write_f32s(writer, self.quantizer.bucket_cutoffs())?;
+        write_f32s(writer, self.quantizer.bucket_weights())?;
+        write_u64s(writer, &self.row_addresses)?;
+        write_u64s(writer, &self.document_offsets)?;
+        write_u32s(writer, &self.token_codes)?;
         writer.write_all(&self.packed_residuals)?;
-        write_u64s(&mut writer, &self.posting_offsets)?;
-        write_u32s(&mut writer, &self.postings)?;
-        writer.flush()?;
+        write_u64s(writer, &self.posting_offsets)?;
+        write_u32s(writer, &self.postings)?;
         Ok(())
     }
 
@@ -72,6 +84,15 @@ impl PlaidIndex {
     pub fn read_from_path(path: impl AsRef<Path>) -> Result<Self> {
         let file = File::open(path)?;
         let mut reader = BufReader::new(file);
+        Self::read_from(&mut reader)
+    }
+
+    /// Loads and validates an index from in-memory versioned PLAID bytes.
+    pub fn read_from_bytes(bytes: &[u8]) -> Result<Self> {
+        Self::read_from(&mut Cursor::new(bytes))
+    }
+
+    fn read_from(reader: &mut impl Read) -> Result<Self> {
         let mut magic = [0_u8; 8];
         reader.read_exact(&mut magic)?;
         if magic != MAGIC {
@@ -109,26 +130,26 @@ impl PlaidIndex {
             .ok_or_else(|| Error::CorruptFile(format!("invalid nbits value {nbits}")))?;
 
         let centroid_values = read_f32s(
-            &mut reader,
+            reader,
             num_centroids
                 .checked_mul(dimension)
                 .ok_or_else(|| Error::CorruptFile("centroid size overflow".to_string()))?,
         )?;
         let bucket_cutoffs = read_f32s(
-            &mut reader,
+            reader,
             num_buckets
                 .checked_sub(1)
                 .ok_or_else(|| Error::CorruptFile("bucket count underflow".to_string()))?,
         )?;
-        let bucket_weights = read_f32s(&mut reader, num_buckets)?;
-        let row_addresses = read_u64s(&mut reader, num_documents)?;
+        let bucket_weights = read_f32s(reader, num_buckets)?;
+        let row_addresses = read_u64s(reader, num_documents)?;
         let document_offsets = read_u64s(
-            &mut reader,
+            reader,
             num_documents
                 .checked_add(1)
                 .ok_or_else(|| Error::CorruptFile("document offset count overflow".to_string()))?,
         )?;
-        let token_codes = read_u32s(&mut reader, num_tokens)?;
+        let token_codes = read_u32s(reader, num_tokens)?;
         let quantizer = ResidualQuantizer::try_new(nbits, bucket_cutoffs, bucket_weights)
             .map_err(|error| Error::CorruptFile(error.to_string()))?;
         let packed_len = quantizer
@@ -140,12 +161,12 @@ impl PlaidIndex {
         let mut packed_residuals = vec![0_u8; residual_len];
         reader.read_exact(&mut packed_residuals)?;
         let posting_offsets = read_u64s(
-            &mut reader,
+            reader,
             num_centroids
                 .checked_add(1)
                 .ok_or_else(|| Error::CorruptFile("posting offset count overflow".to_string()))?,
         )?;
-        let postings = read_u32s(&mut reader, num_postings)?;
+        let postings = read_u32s(reader, num_postings)?;
         let mut trailing = [0_u8; 1];
         if reader.read(&mut trailing)? != 0 {
             return Err(Error::CorruptFile(

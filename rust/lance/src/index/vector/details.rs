@@ -420,6 +420,12 @@ pub fn derive_vector_index_type(details: &prost_types::Any) -> String {
     let Ok(d) = details.to_msg::<VectorIndexDetails>() else {
         return "Vector".to_string();
     };
+    if d.runtime_hints
+        .get("lance.plaid")
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+    {
+        return "PLAID".to_string();
+    }
     let mut index_type = "IVF_".to_string();
     if d.hnsw_index_config.is_some() {
         index_type.push_str("HNSW_");

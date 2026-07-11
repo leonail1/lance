@@ -16,6 +16,7 @@ pub mod filtered_read_proto;
 pub mod fts;
 pub(crate) mod knn;
 mod optimizer;
+pub(crate) mod plaid;
 mod projection;
 mod pushdown_scan;
 mod rowids;

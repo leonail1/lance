@@ -27,6 +27,7 @@ lance-encoding = { workspace = true }
 lance-file = { workspace = true }
 lance-io = { workspace = true }
 lance-linalg = { workspace = true }
+lance-plaid = { workspace = true }
 lance-index = { workspace = true }
 lance-namespace = { workspace = true }
 lance-select = { workspace = true }
@@ -64,6 +65,7 @@ rustc-hash = "2.1"
 fst = "0.4"
 itertools.workspace = true
 moka.workspace = true
+ndarray.workspace = true
 object_store = { workspace = true }
 aws-credential-types.workspace = true
 aws-credential-types.optional = true
