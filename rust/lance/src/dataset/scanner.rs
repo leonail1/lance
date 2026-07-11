@@ -11462,6 +11462,72 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         assert_eq!(fast_batch.num_rows(), 5);
     }
 
+    async fn scan_i_values(dataset: &Dataset, filter: &str, use_scalar_index: bool) -> Vec<i32> {
+        let mut scanner = dataset.scan();
+        scanner
+            .use_scalar_index(use_scalar_index)
+            .filter(filter)
+            .unwrap()
+            .project(&["i"])
+            .unwrap();
+        let batch = scanner.try_into_batch().await.unwrap();
+        batch
+            .column_by_name("i")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .iter()
+            .flatten()
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_coalesce_false_exact_scalar_index_preserves_delete_and_version_visibility() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
+            .await
+            .unwrap();
+        test_ds.make_scalar_index().await.unwrap();
+        let indexed_version = test_ds.dataset.version().version;
+        let coalesced = "COALESCE((i >= 395), FALSE)";
+        let plain = "i >= 395";
+
+        let mut scanner = test_ds.dataset.scan();
+        scanner.filter(coalesced).unwrap().project(&["i"]).unwrap();
+        let plan = scanner.explain_plan(true).await.unwrap();
+        assert!(
+            plan.contains("ScalarIndexQuery"),
+            "coalesced exact predicate did not use the scalar index: {plan}"
+        );
+
+        let before_delete = scan_i_values(&test_ds.dataset, coalesced, true).await;
+        assert_eq!(before_delete, vec![395, 396, 397, 398, 399]);
+        assert_eq!(
+            before_delete,
+            scan_i_values(&test_ds.dataset, plain, false).await
+        );
+
+        test_ds.dataset.delete("i = 397").await.unwrap();
+        let after_delete = scan_i_values(&test_ds.dataset, coalesced, true).await;
+        assert_eq!(after_delete, vec![395, 396, 398, 399]);
+        assert_eq!(
+            after_delete,
+            scan_i_values(&test_ds.dataset, plain, false).await
+        );
+
+        let old_dataset = test_ds
+            .dataset
+            .checkout_version(indexed_version)
+            .await
+            .unwrap();
+        let old_snapshot = scan_i_values(&old_dataset, coalesced, true).await;
+        assert_eq!(old_snapshot, vec![395, 396, 397, 398, 399]);
+        assert_eq!(
+            old_snapshot,
+            scan_i_values(&old_dataset, plain, false).await
+        );
+    }
+
     fn make_scalar_filter_test_batch(schema: SchemaRef, start: i32, end: i32) -> RecordBatch {
         RecordBatch::try_new(
             schema,

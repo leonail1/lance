@@ -1985,12 +1985,34 @@ fn visit_is_null(
     }
 }
 
+/// Whether an expression contributes positively or negatively to the rows accepted by a filter.
+///
+/// In a positive context, replacing `COALESCE(predicate, FALSE)` with `predicate` preserves the
+/// set of rows accepted by the filter. It is not safe in a negative context: for example,
+/// `NOT COALESCE(predicate, FALSE)` accepts rows where `predicate` is NULL, while `NOT predicate`
+/// does not. AND and OR preserve polarity and NOT flips it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FilterPolarity {
+    Positive,
+    Negative,
+}
+
+impl FilterPolarity {
+    fn negated(self) -> Self {
+        match self {
+            Self::Positive => Self::Negative,
+            Self::Negative => Self::Positive,
+        }
+    }
+}
+
 fn visit_not(
     expr: &Expr,
     index_info: &dyn IndexInformationProvider,
     depth: usize,
+    polarity: FilterPolarity,
 ) -> Result<Option<IndexedExpression>> {
-    let node = visit_node(expr, index_info, depth + 1)?;
+    let node = visit_node(expr, index_info, depth + 1, polarity.negated())?;
     Ok(node.and_then(|node| node.maybe_not()))
 }
 
@@ -2067,11 +2089,53 @@ fn maybe_range(
     parser.visit_between(&left_col, &low, &high)
 }
 
+/// Recognize DataFusion's canonical filter-context expansion of
+/// `COALESCE(predicate, FALSE)`: `predicate IS NOT NULL AND predicate`.
+///
+/// An exact scalar-index lookup for `predicate` returns precisely the rows where `predicate` is
+/// TRUE. Those rows necessarily satisfy `predicate IS NOT NULL`, so the guard is redundant. We
+/// intentionally require a structurally identical predicate, no residual refinement, and an index
+/// contract that does not require rechecking. This keeps approximate indexes and merely similar
+/// expressions on the conservative path.
+fn visit_exact_null_to_false_guard(
+    expr: &BinaryExpr,
+    index_info: &dyn IndexInformationProvider,
+    depth: usize,
+    polarity: FilterPolarity,
+) -> Result<Option<IndexedExpression>> {
+    if polarity != FilterPolarity::Positive {
+        return Ok(None);
+    }
+
+    let guarded = match (expr.left.as_ref(), expr.right.as_ref()) {
+        (Expr::IsNotNull(inner), other) if inner.as_ref() == other => Some(other),
+        (other, Expr::IsNotNull(inner)) if inner.as_ref() == other => Some(other),
+        _ => None,
+    };
+    let Some(guarded) = guarded else {
+        return Ok(None);
+    };
+
+    let Some(indexed) = visit_node(guarded, index_info, depth + 1, polarity)? else {
+        return Ok(None);
+    };
+    let is_exact_index_only = indexed.refine_expr.is_none()
+        && indexed
+            .scalar_query
+            .as_ref()
+            .is_some_and(|query| !query.needs_recheck());
+    Ok(is_exact_index_only.then_some(indexed))
+}
+
 fn visit_and(
     expr: &BinaryExpr,
     index_info: &dyn IndexInformationProvider,
     depth: usize,
+    polarity: FilterPolarity,
 ) -> Result<Option<IndexedExpression>> {
+    if let Some(indexed) = visit_exact_null_to_false_guard(expr, index_info, depth, polarity)? {
+        return Ok(Some(indexed));
+    }
     // Many scalar indices can efficiently handle a BETWEEN query as a single search and this
     // can be much more efficient than two separate range queries.  As an optimization we check
     // to see if this is a between query and, if so, we handle it as a single query
@@ -2083,8 +2147,8 @@ fn visit_and(
         return Ok(Some(range_expr));
     }
 
-    let left = visit_node(&expr.left, index_info, depth + 1)?;
-    let right = visit_node(&expr.right, index_info, depth + 1)?;
+    let left = visit_node(&expr.left, index_info, depth + 1, polarity)?;
+    let right = visit_node(&expr.right, index_info, depth + 1, polarity)?;
     Ok(match (left, right) {
         (Some(left), Some(right)) => Some(left.and(right)),
         (Some(left), None) => Some(left.refine((*expr.right).clone())),
@@ -2097,9 +2161,10 @@ fn visit_or(
     expr: &BinaryExpr,
     index_info: &dyn IndexInformationProvider,
     depth: usize,
+    polarity: FilterPolarity,
 ) -> Result<Option<IndexedExpression>> {
-    let left = visit_node(&expr.left, index_info, depth + 1)?;
-    let right = visit_node(&expr.right, index_info, depth + 1)?;
+    let left = visit_node(&expr.left, index_info, depth + 1, polarity)?;
+    let right = visit_node(&expr.right, index_info, depth + 1, polarity)?;
     Ok(match (left, right) {
         (Some(left), Some(right)) => left.maybe_or(right),
         // If one side can use an index and the other side cannot then
@@ -2117,6 +2182,7 @@ fn visit_binary_expr(
     expr: &BinaryExpr,
     index_info: &dyn IndexInformationProvider,
     depth: usize,
+    polarity: FilterPolarity,
 ) -> Result<Option<IndexedExpression>> {
     match &expr.op {
         Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq | Operator::Eq => {
@@ -2124,8 +2190,8 @@ fn visit_binary_expr(
         }
         // visit_comparison will maybe create an Eq query which we negate
         Operator::NotEq => Ok(visit_comparison(expr, index_info).and_then(|node| node.maybe_not())),
-        Operator::And => visit_and(expr, index_info, depth),
-        Operator::Or => visit_or(expr, index_info, depth),
+        Operator::And => visit_and(expr, index_info, depth, polarity),
+        Operator::Or => visit_or(expr, index_info, depth, polarity),
         _ => Ok(None),
     }
 }
@@ -2160,6 +2226,7 @@ fn visit_node(
     expr: &Expr,
     index_info: &dyn IndexInformationProvider,
     depth: usize,
+    polarity: FilterPolarity,
 ) -> Result<Option<IndexedExpression>> {
     if depth >= MAX_DEPTH {
         return Err(Error::invalid_input(format!(
@@ -2169,7 +2236,7 @@ fn visit_node(
     }
     match expr {
         Expr::Between(between) => Ok(visit_between(between, index_info)),
-        Expr::Alias(alias) => visit_node(alias.expr.as_ref(), index_info, depth),
+        Expr::Alias(alias) => visit_node(alias.expr.as_ref(), index_info, depth, polarity),
         Expr::Column(_) => Ok(visit_column(expr, index_info)),
         Expr::InList(in_list) => Ok(visit_in_list(in_list, index_info)),
         Expr::IsFalse(expr) => Ok(visit_is_bool(expr.as_ref(), index_info, false)),
@@ -2187,8 +2254,10 @@ fn visit_node(
             }
             Ok(visit_is_null(expr.as_ref(), index_info, true))
         }
-        Expr::Not(expr) => visit_not(expr.as_ref(), index_info, depth),
-        Expr::BinaryExpr(binary_expr) => visit_binary_expr(binary_expr, index_info, depth),
+        Expr::Not(expr) => visit_not(expr.as_ref(), index_info, depth, polarity),
+        Expr::BinaryExpr(binary_expr) => {
+            visit_binary_expr(binary_expr, index_info, depth, polarity)
+        }
         Expr::ScalarFunction(scalar_fn) => Ok(visit_scalar_fn(scalar_fn, index_info)),
         Expr::Like(like) => {
             if like.negated {
@@ -2225,8 +2294,8 @@ pub fn apply_scalar_indices(
     expr: Expr,
     index_info: &dyn IndexInformationProvider,
 ) -> Result<IndexedExpression> {
-    let mut result =
-        visit_node(&expr, index_info, 0)?.unwrap_or(IndexedExpression::refine_only(expr));
+    let mut result = visit_node(&expr, index_info, 0, FilterPolarity::Positive)?
+        .unwrap_or(IndexedExpression::refine_only(expr));
     if let Some(query) = result.scalar_query.as_mut() {
         populate_fragment_bitmaps(query, index_info);
     }
@@ -2928,6 +2997,149 @@ mod tests {
         check_no_index(&index_info, "aisle = NULL");
         check_no_index(&index_info, "aisle BETWEEN 5 AND NULL");
         check_no_index(&index_info, "aisle BETWEEN NULL AND 10");
+    }
+
+    fn coalesced_filter_plan(
+        sql: &str,
+        nullable: bool,
+        index_type: &str,
+        needs_recheck: bool,
+    ) -> FilterPlan {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "x",
+            DataType::Int64,
+            nullable,
+        )]));
+        let planner = Planner::new(schema);
+        let index_info = MockIndexInfoProvider::new(vec![(
+            "x",
+            ColInfo::new(
+                DataType::Int64,
+                Box::new(SargableQueryParser::new(
+                    "x_idx".to_string(),
+                    index_type.to_string(),
+                    needs_recheck,
+                )),
+            ),
+        )]);
+        let parsed = planner.parse_filter(sql).unwrap();
+        planner
+            .create_filter_plan(parsed, &index_info, true)
+            .unwrap()
+    }
+
+    #[test]
+    fn test_exact_index_elides_coalesce_false_refine() {
+        let predicates = [
+            "COALESCE((x = 5), FALSE)",
+            "COALESCE((x > 5), FALSE)",
+            "COALESCE((x IN (5, 6, 7, 8)), FALSE)",
+            "COALESCE((x >= 5), FALSE) AND COALESCE((x <= 10), FALSE)",
+        ];
+
+        for index_type in ["BTree", "Bitmap"] {
+            for nullable in [false, true] {
+                for sql in predicates {
+                    let plan = coalesced_filter_plan(sql, nullable, index_type, false);
+                    assert!(plan.index_query.is_some(), "missing index query for {sql}");
+                    assert!(
+                        plan.refine_expr.is_none(),
+                        "exact {index_type} query retained redundant refine for {sql}: {:?}",
+                        plan.refine_expr
+                    );
+                    assert!(plan.skip_recheck, "exact query unexpectedly needs recheck");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_coalesce_false_composes_in_positive_boolean_context() {
+        for sql in [
+            "COALESCE((x = 5), FALSE) OR COALESCE((x = 6), FALSE)",
+            "COALESCE(((x = 5) OR (x = 6)), FALSE)",
+            "COALESCE((NOT (x = 5)), FALSE)",
+        ] {
+            let plan = coalesced_filter_plan(sql, true, "BTree", false);
+            assert!(plan.index_query.is_some(), "missing index query for {sql}");
+            assert!(
+                plan.refine_expr.is_none(),
+                "positive boolean composition retained a refine for {sql}: {:?}",
+                plan.refine_expr
+            );
+            assert!(plan.skip_recheck);
+        }
+    }
+
+    #[test]
+    fn test_coalesce_false_guard_is_not_elided_under_not() {
+        let index_info = MockIndexInfoProvider::new(vec![(
+            "x",
+            ColInfo::new(
+                DataType::Int64,
+                Box::new(SargableQueryParser::new(
+                    "x_idx".to_string(),
+                    "BTree".to_string(),
+                    false,
+                )),
+            ),
+        )]);
+        let predicate = Expr::Column(Column::new_unqualified("x")).eq(datafusion_expr::lit(5_i64));
+        let guarded = Expr::IsNotNull(Box::new(predicate.clone())).and(predicate.clone());
+
+        let positive = apply_scalar_indices(guarded.clone(), &index_info).unwrap();
+        assert!(positive.scalar_query.is_some());
+        assert!(positive.refine_expr.is_none());
+
+        let reversed = apply_scalar_indices(
+            predicate.clone().and(Expr::IsNotNull(Box::new(predicate))),
+            &index_info,
+        )
+        .unwrap();
+        assert!(reversed.scalar_query.is_some());
+        assert!(reversed.refine_expr.is_none());
+
+        let negative = apply_scalar_indices(Expr::Not(Box::new(guarded)), &index_info).unwrap();
+        assert!(
+            negative.scalar_query.is_none(),
+            "NOT must not turn NULL rows into an exact NOT(predicate) lookup"
+        );
+        assert!(negative.refine_expr.is_some());
+    }
+
+    #[test]
+    fn test_coalesce_false_guard_requires_exact_identical_query() {
+        let inexact = coalesced_filter_plan("COALESCE((x = 5), FALSE)", true, "ZoneMap", true);
+        assert!(inexact.index_query.is_some());
+        assert!(!inexact.skip_recheck);
+        assert!(
+            inexact.refine_expr.is_some(),
+            "an inexact query must retain the null guard"
+        );
+
+        let index_info = MockIndexInfoProvider::new(vec![(
+            "x",
+            ColInfo::new(
+                DataType::Int64,
+                Box::new(SargableQueryParser::new(
+                    "x_idx".to_string(),
+                    "BTree".to_string(),
+                    false,
+                )),
+            ),
+        )]);
+        let guarded = Expr::Column(Column::new_unqualified("x")).eq(datafusion_expr::lit(5_i64));
+        let different = Expr::Column(Column::new_unqualified("x")).eq(datafusion_expr::lit(6_i64));
+        let result = apply_scalar_indices(
+            Expr::IsNotNull(Box::new(guarded)).and(different),
+            &index_info,
+        )
+        .unwrap();
+        assert!(result.scalar_query.is_some());
+        assert!(
+            result.refine_expr.is_some(),
+            "a merely similar predicate must not discharge the null guard"
+        );
     }
 
     #[tokio::test]
