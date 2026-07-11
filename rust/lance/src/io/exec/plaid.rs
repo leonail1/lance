@@ -31,7 +31,7 @@ use lance_core::utils::tokio::spawn_cpu;
 use lance_datafusion::utils::ExecutionPlanMetricsSetExt;
 use lance_index::prefilter::PreFilter;
 use lance_index::vector::Query;
-use lance_plaid::{EligibleCentroidDecision, EligibleCentroidPlan};
+use lance_plaid::EligibleCentroidDecision;
 use lance_select::{RowAddrMask, RowAddrTreeMap};
 use lance_table::format::IndexMetadata;
 use ndarray::{ArrayView1, ArrayView2};
@@ -42,14 +42,15 @@ use crate::dataset::rowids::get_row_id_index;
 use crate::dataset::{Dataset, ProjectionRequest, TakeBuilder};
 use crate::index::DatasetIndexInternalExt;
 use crate::index::plaid::{
-    PLAID_DEFAULT_DECOMPRESS_DOCUMENTS, PlaidVectorIndex, is_plaid_index_metadata, maxsim_distance,
-    query_to_array,
+    PLAID_DEFAULT_DECOMPRESS_DOCUMENTS, PlaidCandidatePlan, PlaidVectorIndex,
+    is_plaid_index_metadata, maxsim_distance, query_to_array,
 };
 use crate::{Error, Result};
 
 const FILTER_TIME: &str = "plaid_filter_materialization_time";
-const ELIGIBLE_CENTROID_BUILD_TIME: &str = "plaid_eligible_centroid_build_time";
-const ELIGIBLE_CENTROID_SELECTION_TIME: &str = "plaid_eligible_centroid_selection_time";
+const ELIGIBLE_CENTROID_PLAN_TOTAL_TIME: &str = "plaid_eligible_centroid_plan_total_time";
+const ELIGIBLE_CENTROID_CORE_BUILD_SUB_TIME: &str = "plaid_eligible_centroid_core_build_sub_time";
+const ELIGIBLE_CENTROID_SELECTION_SUB_TIME: &str = "plaid_eligible_centroid_selection_sub_time";
 const CENTROID_TIME: &str = "plaid_centroid_probe_time";
 const POSTINGS_TIME: &str = "plaid_postings_time";
 const CANDIDATE_TIME: &str = "plaid_candidate_total_time";
@@ -73,6 +74,8 @@ const ROW_ID_ROWS_COUNT: &str = "plaid_row_id_only_rows";
 const RAW_VECTOR_ROWS_COUNT: &str = "plaid_raw_vector_rows";
 const INDEX_ONLY_QUERY_COUNT: &str = "plaid_index_only_queries";
 const EXACT_QUERY_COUNT: &str = "plaid_exact_refinement_queries";
+const EMPTY_FILTER_QUERY_COUNT: &str = "plaid_empty_filter_queries";
+const SEGMENTS_SEARCHED_COUNT: &str = "plaid_segments_searched";
 const PROBE_RETRY_COUNT: &str = "plaid_probe_retries";
 const PROBE_ROUND_COUNT: &str = "plaid_probe_rounds";
 const CONFIGURED_PROBES_COUNT: &str = "plaid_configured_probes";
@@ -338,8 +341,9 @@ struct PlaidExecMetrics {
     baseline: BaselineMetrics,
     index: IndexMetrics,
     filter: Time,
-    eligible_centroid_build: Time,
-    eligible_centroid_selection: Time,
+    eligible_centroid_plan_total: Time,
+    eligible_centroid_core_build_sub: Time,
+    eligible_centroid_selection_sub: Time,
     centroid: Time,
     postings: Time,
     candidate: Time,
@@ -363,6 +367,8 @@ struct PlaidExecMetrics {
     raw_vector_rows_count: Count,
     index_only_query_count: Count,
     exact_query_count: Count,
+    empty_filter_query_count: Count,
+    segments_searched_count: Count,
     probe_retry_count: Count,
     probe_round_count: Count,
     configured_probes_count: Count,
@@ -390,9 +396,12 @@ impl PlaidExecMetrics {
             baseline: BaselineMetrics::new(metrics, partition),
             index: IndexMetrics::new(metrics, partition),
             filter: metrics.new_time(FILTER_TIME, partition),
-            eligible_centroid_build: metrics.new_time(ELIGIBLE_CENTROID_BUILD_TIME, partition),
-            eligible_centroid_selection: metrics
-                .new_time(ELIGIBLE_CENTROID_SELECTION_TIME, partition),
+            eligible_centroid_plan_total: metrics
+                .new_time(ELIGIBLE_CENTROID_PLAN_TOTAL_TIME, partition),
+            eligible_centroid_core_build_sub: metrics
+                .new_time(ELIGIBLE_CENTROID_CORE_BUILD_SUB_TIME, partition),
+            eligible_centroid_selection_sub: metrics
+                .new_time(ELIGIBLE_CENTROID_SELECTION_SUB_TIME, partition),
             centroid: metrics.new_time(CENTROID_TIME, partition),
             postings: metrics.new_time(POSTINGS_TIME, partition),
             candidate: metrics.new_time(CANDIDATE_TIME, partition),
@@ -418,6 +427,8 @@ impl PlaidExecMetrics {
             raw_vector_rows_count: metrics.new_count(RAW_VECTOR_ROWS_COUNT, partition),
             index_only_query_count: metrics.new_count(INDEX_ONLY_QUERY_COUNT, partition),
             exact_query_count: metrics.new_count(EXACT_QUERY_COUNT, partition),
+            empty_filter_query_count: metrics.new_count(EMPTY_FILTER_QUERY_COUNT, partition),
+            segments_searched_count: metrics.new_count(SEGMENTS_SEARCHED_COUNT, partition),
             probe_retry_count: metrics.new_count(PROBE_RETRY_COUNT, partition),
             probe_round_count: metrics.new_count(PROBE_ROUND_COUNT, partition),
             configured_probes_count: metrics.new_count(CONFIGURED_PROBES_COUNT, partition),
@@ -459,9 +470,12 @@ impl PlaidExecMetrics {
             .add(mode.raw_refinement_budget());
     }
 
-    fn record_eligible_centroid_plan(&self, plan: &EligibleCentroidPlan) {
-        self.eligible_centroid_build
-            .add_duration(Duration::from_nanos(plan.build_nanos()));
+    fn record_eligible_centroid_plan(&self, candidate_plan: &PlaidCandidatePlan) {
+        let plan = &candidate_plan.eligible_centroids;
+        self.eligible_centroid_plan_total
+            .add_duration(Duration::from_nanos(candidate_plan.total_plan_nanos));
+        self.eligible_centroid_core_build_sub
+            .add_duration(Duration::from_nanos(plan.core_build_nanos()));
         self.eligible_documents_count
             .add(usize::try_from(plan.eligible_documents()).unwrap_or(usize::MAX));
         self.eligible_tokens_count
@@ -487,7 +501,7 @@ impl PlaidExecMetrics {
     fn record_core(&self, stats: &lance_plaid::PlaidSearchStats) {
         self.centroid
             .add_duration(Duration::from_nanos(stats.centroid_probe_nanos));
-        self.eligible_centroid_selection
+        self.eligible_centroid_selection_sub
             .add_duration(Duration::from_nanos(
                 stats.eligible_centroid_selection_nanos,
             ));
@@ -525,8 +539,9 @@ impl PlaidExecMetrics {
 }
 
 fn small_filter_exact_fallback(filter_max_len: Option<u64>, requested_candidates: usize) -> bool {
-    filter_max_len
-        .is_some_and(|count| count <= u64::try_from(requested_candidates).unwrap_or(u64::MAX))
+    filter_max_len.is_some_and(|count| {
+        count > 0 && count <= u64::try_from(requested_candidates).unwrap_or(u64::MAX)
+    })
 }
 
 fn underfilled_filter_exact_fallback(
@@ -555,16 +570,27 @@ async fn execute_search(
     let query_tokens = query_to_array(&query, dimension)?;
     let requested_candidates = mode.requested_candidates(query.k);
     let mask = plaid_address_mask(dataset.as_ref(), prefilter.mask()).await?;
+    let candidate_started = Instant::now();
+    if mask.max_len() == Some(0) {
+        // Record one logical Empty decision per immutable segment without
+        // opening an index or entering the Q x C kernel.
+        metrics.empty_filter_query_count.add(1);
+        metrics.eligible_centroid_empty_count.add(indices.len());
+        metrics.candidate.add_duration(candidate_started.elapsed());
+        let batch = RecordBatch::new_empty(KNN_INDEX_SCHEMA.clone());
+        metrics.baseline.record_output(0);
+        return Ok(batch);
+    }
     // Proactive exact scoring must stay within the work already requested for
     // result refinement. This captures very selective filters without turning a
     // 1% or 10% predicate into an accidental full-filter scan.
     let small_filter_exact = small_filter_exact_fallback(mask.max_len(), requested_candidates);
     let filtered_query = !mask.is_select_all();
-    let candidate_started = Instant::now();
     let mut candidates = HashMap::<u64, f32>::new();
     let mut opened_indices = Vec::with_capacity(indices.len());
 
     for metadata in &indices {
+        metrics.segments_searched_count.add(1);
         let raw_index = dataset
             .open_vector_index(&query.column, &metadata.uuid, &metrics.index)
             .await?;
@@ -612,7 +638,7 @@ async fn execute_search(
             .core_approximate_budget_count
             .add(plan.params.n_full_scores);
         metrics.core_residual_budget_count.add(plan.params.top_k);
-        metrics.record_eligible_centroid_plan(&plan.eligible_centroids);
+        metrics.record_eligible_centroid_plan(&plan);
         metrics.record_core(&stats);
         for hit in hits {
             candidates
@@ -846,17 +872,9 @@ async fn plaid_address_mask(dataset: &Dataset, mask: Arc<RowAddrMask>) -> Result
     let row_id_index = get_row_id_index(dataset)
         .await?
         .ok_or_else(|| Error::internal("stable-row-id dataset has no row-id index".to_string()))?;
-    let translate = |row_ids: &RowAddrTreeMap| -> Result<RowAddrTreeMap> {
-        let row_ids = row_ids
-            .row_addrs()
-            .ok_or_else(|| {
-                Error::not_supported(
-                    "PLAID cannot translate a full-fragment stable-row-id mask".to_string(),
-                )
-            })?
-            .map(u64::from)
-            .collect::<Vec<_>>();
-        Ok(RowAddrTreeMap::from_iter(
+    let translate_enumerable = |row_ids: &RowAddrTreeMap| -> Option<RowAddrTreeMap> {
+        let row_ids = row_ids.row_addrs()?.map(u64::from).collect::<Vec<_>>();
+        Some(RowAddrTreeMap::from_iter(
             row_id_index
                 .get_many(&row_ids)
                 .into_iter()
@@ -864,9 +882,30 @@ async fn plaid_address_mask(dataset: &Dataset, mask: Arc<RowAddrMask>) -> Result
                 .map(u64::from),
         ))
     };
+    // Full-prefix stable-ID markers cannot be enumerated from the mask alone.
+    // Evaluate them over the finite live RowIdIndex instead. Returning a
+    // physical allow-list for this fallback also ensures tombstoned rows stay
+    // invisible. An explicit block list uses the same live fallback whenever
+    // the dataset has deletion files; otherwise translating only its blocked
+    // IDs is the cheaper equivalent representation.
+    let translate_live_selection = || {
+        RowAddrTreeMap::from_iter(row_id_index.iter().filter_map(|(row_id, row_address)| {
+            mask.selected(row_id).then_some(u64::from(row_address))
+        }))
+    };
+    let has_deletions = dataset
+        .manifest()
+        .fragments
+        .iter()
+        .any(|fragment| fragment.deletion_file.is_some());
     let translated = match mask.as_ref() {
-        RowAddrMask::AllowList(row_ids) => RowAddrMask::from_allowed(translate(row_ids)?),
-        RowAddrMask::BlockList(row_ids) => RowAddrMask::from_block(translate(row_ids)?),
+        RowAddrMask::AllowList(row_ids) => translate_enumerable(row_ids)
+            .map(RowAddrMask::from_allowed)
+            .unwrap_or_else(|| RowAddrMask::from_allowed(translate_live_selection())),
+        RowAddrMask::BlockList(row_ids) if !has_deletions => translate_enumerable(row_ids)
+            .map(RowAddrMask::from_block)
+            .unwrap_or_else(|| RowAddrMask::from_allowed(translate_live_selection())),
+        RowAddrMask::BlockList(_) => RowAddrMask::from_allowed(translate_live_selection()),
     };
     Ok(Arc::new(translated))
 }
@@ -950,12 +989,17 @@ fn raw_dot(query: ArrayView1<'_, f32>, document: &[f32]) -> Result<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array, ListArray};
+    use arrow_array::{
+        ArrayRef, FixedSizeListArray, Float32Array, Int32Array, ListArray, RecordBatchIterator,
+    };
     use arrow_buffer::OffsetBuffer;
     use arrow_schema::Field;
     use lance_arrow::FixedSizeListArrayExt;
+    use lance_core::utils::address::RowAddress;
     use lance_linalg::distance::{DistanceType, multivec_distance};
     use ndarray::array;
+
+    use crate::dataset::WriteParams;
 
     #[test]
     fn exact_filter_fallback_policy_tracks_budget_and_true_underfill() {
@@ -969,6 +1013,7 @@ mod tests {
 
         assert!(small_filter_exact_fallback(Some(10), 50));
         assert!(small_filter_exact_fallback(Some(50), 50));
+        assert!(!small_filter_exact_fallback(Some(0), 50));
         assert!(!small_filter_exact_fallback(Some(51), 50));
         assert!(!small_filter_exact_fallback(Some(1_000), 50));
         assert!(!small_filter_exact_fallback(None, 50));
@@ -978,6 +1023,83 @@ mod tests {
         assert!(!underfilled_filter_exact_fallback(true, 5, 10, 5));
         assert!(!underfilled_filter_exact_fallback(true, 10, 10, 100));
         assert!(!underfilled_filter_exact_fallback(false, 3, 10, 10));
+    }
+
+    #[tokio::test]
+    async fn stable_full_prefix_masks_translate_across_fragments_and_deletions() {
+        let directory = lance_core::utils::tempfile::TempStrDir::default();
+        let first = RecordBatch::try_from_iter([(
+            "id",
+            Arc::new(Int32Array::from(vec![0, 1])) as ArrayRef,
+        )])
+        .unwrap();
+        let schema = first.schema();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(first)], schema.clone()),
+            directory.as_ref(),
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let second = RecordBatch::try_from_iter([(
+            "id",
+            Arc::new(Int32Array::from(vec![2, 3])) as ArrayRef,
+        )])
+        .unwrap();
+        dataset
+            .append(RecordBatchIterator::new(vec![Ok(second)], schema), None)
+            .await
+            .unwrap();
+        dataset.delete("id = 1").await.unwrap();
+
+        let addresses = [
+            RowAddress::new_from_parts(0, 0),
+            RowAddress::new_from_parts(0, 1),
+            RowAddress::new_from_parts(1, 0),
+            RowAddress::new_from_parts(1, 1),
+        ];
+        // All generated stable IDs are in high-32-bit prefix zero even though
+        // their current physical homes span two fragments.
+        let mut full_zero = RowAddrTreeMap::new();
+        full_zero.insert_fragment(0);
+        let allowed = plaid_address_mask(
+            &dataset,
+            Arc::new(RowAddrMask::from_allowed(full_zero.clone())),
+        )
+        .await
+        .unwrap();
+        assert!(allowed.iter_addrs().is_some());
+        assert!(allowed.selected(addresses[0].into()));
+        assert!(!allowed.selected(addresses[1].into()));
+        assert!(allowed.selected(addresses[2].into()));
+        assert!(allowed.selected(addresses[3].into()));
+
+        let blocked = plaid_address_mask(&dataset, Arc::new(RowAddrMask::from_block(full_zero)))
+            .await
+            .unwrap();
+        assert!(
+            addresses
+                .iter()
+                .all(|address| !blocked.selected((*address).into()))
+        );
+
+        // Prefix one contains no stable IDs. A full-prefix block therefore
+        // leaves every live row selected while the deleted physical row stays
+        // invisible.
+        let mut absent_prefix = RowAddrTreeMap::new();
+        absent_prefix.insert_fragment(1);
+        let block_absent =
+            plaid_address_mask(&dataset, Arc::new(RowAddrMask::from_block(absent_prefix)))
+                .await
+                .unwrap();
+        assert!(block_absent.selected(addresses[0].into()));
+        assert!(!block_absent.selected(addresses[1].into()));
+        assert!(block_absent.selected(addresses[2].into()));
+        assert!(block_absent.selected(addresses[3].into()));
     }
 
     #[test]

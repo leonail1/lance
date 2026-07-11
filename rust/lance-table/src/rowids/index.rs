@@ -109,6 +109,24 @@ impl RowIdIndex {
         }
         out
     }
+
+    /// Iterates every live stable-row-id to physical-address mapping.
+    ///
+    /// Deletion vectors are applied when the index is built, so tombstoned
+    /// rows are not yielded. This is intended for correctness fallbacks that
+    /// must evaluate a non-enumerable stable-row-id mask (for example one with
+    /// full-prefix markers) against the finite set of rows that actually
+    /// exists.
+    pub fn iter(&self) -> impl Iterator<Item = (u64, RowAddress)> + '_ {
+        self.0
+            .iter()
+            .flat_map(|(_, (row_ids, row_addresses))| {
+                (0..row_ids.len()).filter_map(move |position| {
+                    row_ids.get(position).zip(row_addresses.get(position))
+                })
+            })
+            .map(|(row_id, row_address)| (row_id, RowAddress::from(row_address)))
+    }
 }
 
 impl DeepSizeOf for RowIdIndex {
@@ -578,6 +596,15 @@ mod tests {
 
         assert_eq!(index.get(2), None);
         assert_eq!(index.get(3), None);
+        assert_eq!(
+            index.iter().collect::<Vec<_>>(),
+            vec![
+                (0, RowAddress::new_from_parts(10, 0)),
+                (1, RowAddress::new_from_parts(10, 1)),
+                (4, RowAddress::new_from_parts(10, 4)),
+                (5, RowAddress::new_from_parts(10, 5)),
+            ]
+        );
     }
 
     #[test]

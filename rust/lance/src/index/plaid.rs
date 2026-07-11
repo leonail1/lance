@@ -6,6 +6,7 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use arrow::array::AsArray;
 use arrow::datatypes::{Float32Type, UInt64Type};
@@ -413,6 +414,9 @@ pub(crate) struct PlaidCandidatePlan {
     pub(crate) eligible_documents: usize,
     pub(crate) maximum_nprobes: usize,
     pub(crate) eligible_centroids: EligibleCentroidPlan,
+    /// End-to-end plan time, including both mask/address passes and the nested
+    /// storage-independent core build phase.
+    pub(crate) total_plan_nanos: u64,
 }
 
 impl PlaidVectorIndex {
@@ -434,6 +438,7 @@ impl PlaidVectorIndex {
         query_tokens: usize,
         mask: &RowAddrMask,
     ) -> Result<PlaidCandidatePlan> {
+        let plan_started = Instant::now();
         let probe_ceiling = query
             .maximum_nprobes
             .unwrap_or(self.core.num_centroids())
@@ -508,6 +513,7 @@ impl PlaidVectorIndex {
             eligible_documents: eligible,
             maximum_nprobes: probe_ceiling,
             eligible_centroids,
+            total_plan_nanos: u64::try_from(plan_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
         })
     }
 
@@ -981,6 +987,7 @@ mod tests {
     use arrow_array::{ArrayRef, Int32Array, RecordBatchIterator};
     use lance_core::utils::tempfile::TempStrDir;
     use lance_index::metrics::NoOpMetricsCollector;
+    use lance_index::optimize::OptimizeOptions;
 
     use crate::DatasetBuilder;
     use crate::dataset::WriteParams;
@@ -1395,6 +1402,18 @@ mod tests {
             "unexpected analyzed plan:\n{analyzed}"
         );
         assert!(
+            analyzed.contains("plaid_eligible_centroid_plan_total_time"),
+            "unexpected analyzed plan:\n{analyzed}"
+        );
+        assert!(
+            analyzed.contains("plaid_eligible_centroid_core_build_sub_time"),
+            "unexpected analyzed plan:\n{analyzed}"
+        );
+        assert!(
+            analyzed.contains("plaid_eligible_centroid_selection_sub_time"),
+            "unexpected analyzed plan:\n{analyzed}"
+        );
+        assert!(
             analyzed.contains("plaid_probe_rounds=1"),
             "unexpected analyzed plan:\n{analyzed}"
         );
@@ -1517,6 +1536,107 @@ mod tests {
                 .values()
                 .contains(&0)
         );
+    }
+
+    #[tokio::test]
+    async fn empty_filter_short_circuits_every_plaid_segment() {
+        let directory = TempStrDir::default();
+        let first = make_batch(
+            (0..16).collect(),
+            (0..16)
+                .map(|_| vec![[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]])
+                .collect(),
+        );
+        let schema = first.schema();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(first)], schema.clone()),
+            directory.as_ref(),
+            None,
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["mv"],
+                IndexType::Vector,
+                Some("plaid_idx".to_string()),
+                &PlaidIndexParams {
+                    num_centroids: 2,
+                    nbits: 2,
+                    max_iterations: 3,
+                    sample_rate: 4,
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        let second = make_batch(
+            (16..32).collect(),
+            (0..16)
+                .map(|_| vec![[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]])
+                .collect(),
+        );
+        dataset
+            .append(RecordBatchIterator::new(vec![Ok(second)], schema), None)
+            .await
+            .unwrap();
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+        assert_eq!(
+            dataset
+                .load_indices_by_name("plaid_idx")
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let mut scanner = dataset.scan();
+        scanner.prefilter(true);
+        scanner.filter("id < 0").unwrap();
+        scanner.nearest("mv", &query(), 10).unwrap();
+        scanner.project(&["id"]).unwrap();
+        let analyzed = scanner.analyze_plan().await.unwrap();
+        assert!(
+            analyzed.contains("plaid_empty_filter_queries=1"),
+            "unexpected analyzed plan:\n{analyzed}"
+        );
+        assert!(
+            analyzed.contains("plaid_segments_searched=0"),
+            "unexpected analyzed plan:\n{analyzed}"
+        );
+        assert!(
+            analyzed.contains("plaid_eligible_centroid_empty_segments=2"),
+            "unexpected analyzed plan:\n{analyzed}"
+        );
+        assert!(
+            analyzed.contains("plaid_centroids_probed=0"),
+            "unexpected analyzed plan:\n{analyzed}"
+        );
+        assert!(
+            analyzed.contains("plaid_probe_rounds=0"),
+            "unexpected analyzed plan:\n{analyzed}"
+        );
+        assert!(
+            analyzed.contains("plaid_posting_entries=0"),
+            "unexpected analyzed plan:\n{analyzed}"
+        );
+        assert!(
+            analyzed.contains("plaid_raw_vector_rows=0"),
+            "unexpected analyzed plan:\n{analyzed}"
+        );
+        assert!(
+            analyzed.contains("plaid_eligible_centroid_plan_total_time"),
+            "unexpected analyzed plan:\n{analyzed}"
+        );
+        assert!(
+            analyzed.contains("plaid_eligible_centroid_core_build_sub_time"),
+            "unexpected analyzed plan:\n{analyzed}"
+        );
+        let result = scanner.try_into_batch().await.unwrap();
+        assert_eq!(result.num_rows(), 0);
     }
 
     #[tokio::test]

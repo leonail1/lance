@@ -1,13 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use ndarray::{Array2, ArrayView2};
 
 use crate::{Error, ResidualQuantizer, Result, maxsim_naive};
 
+// Runtime identity for exact eligible-centroid plan ownership checks.
+static NEXT_PLAID_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_plaid_instance_id() -> u64 {
+    NEXT_PLAID_INSTANCE_ID.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Immutable PLAID data owned by one database index segment.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct PlaidIndex {
+    instance_id: u64,
     pub(crate) dimension: usize,
     pub(crate) centroids: Array2<f32>,
     pub(crate) quantizer: ResidualQuantizer,
@@ -17,6 +27,23 @@ pub struct PlaidIndex {
     pub(crate) packed_residuals: Vec<u8>,
     pub(crate) posting_offsets: Vec<u64>,
     pub(crate) postings: Vec<u32>,
+}
+
+impl Clone for PlaidIndex {
+    fn clone(&self) -> Self {
+        Self {
+            instance_id: next_plaid_instance_id(),
+            dimension: self.dimension,
+            centroids: self.centroids.clone(),
+            quantizer: self.quantizer.clone(),
+            row_addresses: self.row_addresses.clone(),
+            document_offsets: self.document_offsets.clone(),
+            token_codes: self.token_codes.clone(),
+            packed_residuals: self.packed_residuals.clone(),
+            posting_offsets: self.posting_offsets.clone(),
+            postings: self.postings.clone(),
+        }
+    }
 }
 
 impl PlaidIndex {
@@ -60,6 +87,7 @@ impl PlaidIndex {
     ) -> Result<Self> {
         let dimension = centroids.ncols();
         let index = Self {
+            instance_id: next_plaid_instance_id(),
             dimension,
             centroids,
             quantizer,
@@ -77,6 +105,10 @@ impl PlaidIndex {
     /// Vector dimension shared by centroids, query tokens, and document tokens.
     pub fn dimension(&self) -> usize {
         self.dimension
+    }
+
+    pub(crate) fn instance_id(&self) -> u64 {
+        self.instance_id
     }
 
     /// Number of indexed documents.

@@ -65,13 +65,14 @@ pub enum EligibleCentroidDecision {
 /// incremental underfill probe rounds.
 #[derive(Clone, Debug)]
 pub struct EligibleCentroidPlan {
+    index_instance_id: u64,
     decision: EligibleCentroidDecision,
     eligible_documents: u64,
     eligible_tokens: u64,
     eligible_token_codes_scanned: u64,
     eligible_centroids: RoaringBitmap,
     estimated_global_postings: u64,
-    build_nanos: u64,
+    core_build_nanos: u64,
 }
 
 impl EligibleCentroidPlan {
@@ -113,9 +114,13 @@ impl EligibleCentroidPlan {
         self.estimated_global_postings
     }
 
-    /// CPU wall time spent validating the filter and building this plan.
-    pub fn build_nanos(&self) -> u64 {
-        self.build_nanos
+    /// Core CPU wall time spent validating ordinals and scanning token codes.
+    ///
+    /// Database adapters may expose a wider total-plan metric that also
+    /// includes address-to-ordinal materialization. This value is its nested
+    /// core sub-phase.
+    pub fn core_build_nanos(&self) -> u64 {
+        self.core_build_nanos
     }
 
     fn selection_universe(&self) -> Option<&RoaringBitmap> {
@@ -192,6 +197,7 @@ impl PlaidIndex {
     ) -> Result<EligibleCentroidPlan> {
         let started = Instant::now();
         let mut plan = EligibleCentroidPlan {
+            index_instance_id: self.instance_id(),
             decision: if filtered {
                 EligibleCentroidDecision::NonEnumerable
             } else {
@@ -202,11 +208,11 @@ impl PlaidIndex {
             eligible_token_codes_scanned: 0,
             eligible_centroids: RoaringBitmap::new(),
             estimated_global_postings: 0,
-            build_nanos: 0,
+            core_build_nanos: 0,
         };
 
         if !filtered {
-            plan.build_nanos = duration_nanos(started.elapsed());
+            plan.core_build_nanos = duration_nanos(started.elapsed());
             return Ok(plan);
         }
         if query_tokens == 0 || initial_nprobe == 0 {
@@ -230,7 +236,7 @@ impl PlaidIndex {
             }) {
                 plan.decision = EligibleCentroidDecision::TooWide;
             }
-            plan.build_nanos = duration_nanos(started.elapsed());
+            plan.core_build_nanos = duration_nanos(started.elapsed());
             return Ok(plan);
         };
 
@@ -246,7 +252,7 @@ impl PlaidIndex {
         plan.eligible_documents = document_ordinals.len() as u64;
         if document_ordinals.is_empty() {
             plan.decision = EligibleCentroidDecision::Empty;
-            plan.build_nanos = duration_nanos(started.elapsed());
+            plan.core_build_nanos = duration_nanos(started.elapsed());
             return Ok(plan);
         }
 
@@ -256,7 +262,7 @@ impl PlaidIndex {
             > self.num_documents()
         {
             plan.decision = EligibleCentroidDecision::TooWide;
-            plan.build_nanos = duration_nanos(started.elapsed());
+            plan.core_build_nanos = duration_nanos(started.elapsed());
             return Ok(plan);
         }
 
@@ -279,7 +285,7 @@ impl PlaidIndex {
             > plan.estimated_global_postings
         {
             plan.decision = EligibleCentroidDecision::ScanCostTooHigh;
-            plan.build_nanos = duration_nanos(started.elapsed());
+            plan.core_build_nanos = duration_nanos(started.elapsed());
             return Ok(plan);
         }
 
@@ -292,7 +298,7 @@ impl PlaidIndex {
             }
         }
         plan.decision = EligibleCentroidDecision::Enabled;
-        plan.build_nanos = duration_nanos(started.elapsed());
+        plan.core_build_nanos = duration_nanos(started.elapsed());
         Ok(plan)
     }
 
@@ -327,19 +333,19 @@ impl PlaidIndex {
                 "maximum_n_ivf_probe must be positive".to_string(),
             ));
         }
-        if eligible_centroid_plan.is_some_and(|plan| {
-            plan.is_enabled()
-                && plan
-                    .eligible_centroids
-                    .iter()
-                    .any(|centroid| centroid as usize >= self.num_centroids())
-        }) {
+        if eligible_centroid_plan.is_some_and(|plan| plan.index_instance_id != self.instance_id()) {
             return Err(Error::InvalidInput(
                 "eligible-centroid plan does not belong to this index".to_string(),
             ));
         }
         let total_started = Instant::now();
         let mut stats = PlaidSearchStats::default();
+        if eligible_centroid_plan
+            .is_some_and(|plan| plan.decision == EligibleCentroidDecision::Empty)
+        {
+            stats.total_nanos = duration_nanos(total_started.elapsed());
+            return Ok((Vec::new(), stats));
+        }
 
         let probe_started = Instant::now();
         let query_centroid_scores = query.dot(&self.centroids.t());

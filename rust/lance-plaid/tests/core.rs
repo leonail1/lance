@@ -72,6 +72,55 @@ fn filter_cost_index(tokens_per_document: usize) -> PlaidIndex {
     .unwrap()
 }
 
+fn tie_index() -> PlaidIndex {
+    let quantizer = ResidualQuantizer::try_new(2, vec![-0.1, 0.0, 0.1], vec![0.0; 4]).unwrap();
+    let centroids = array![
+        [1.0, 0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0]
+    ];
+    let residuals = Array2::<f32>::zeros((4, 4));
+    let packed_residuals = quantizer.quantize(residuals.view()).unwrap();
+    PlaidIndex::try_new(
+        centroids,
+        quantizer,
+        vec![100, 101, 102, 103],
+        vec![0, 1, 2, 3, 4],
+        vec![0, 1, 2, 3],
+        packed_residuals,
+    )
+    .unwrap()
+}
+
+fn retry_ceiling_index() -> PlaidIndex {
+    const DOCUMENTS: usize = 128;
+    const CENTROIDS: usize = 8;
+    let quantizer = ResidualQuantizer::try_new(2, vec![-0.1, 0.0, 0.1], vec![0.0; 4]).unwrap();
+    let centroids = Array2::from_shape_fn((CENTROIDS, 4), |(row, column)| {
+        if column == 0 {
+            (CENTROIDS - row) as f32
+        } else {
+            0.0
+        }
+    });
+    let residuals = Array2::<f32>::zeros((DOCUMENTS, 4));
+    let packed_residuals = quantizer.quantize(residuals.view()).unwrap();
+    PlaidIndex::try_new(
+        centroids,
+        quantizer,
+        (0..DOCUMENTS)
+            .map(|ordinal| 2_000 + ordinal as u64)
+            .collect(),
+        (0..=DOCUMENTS as u64).collect(),
+        (0..DOCUMENTS)
+            .map(|ordinal| (ordinal % CENTROIDS) as u32)
+            .collect(),
+        packed_residuals,
+    )
+    .unwrap()
+}
+
 #[test]
 fn naive_and_quantized_maxsim_agree_for_exact_centroids() {
     let index = test_index(2);
@@ -237,6 +286,111 @@ fn eligible_centroid_retry_expands_postings_incrementally() {
         expected_stats.posting_entries_read
     );
     assert!(stats.eligible_centroid_selection_nanos > 0);
+}
+
+#[test]
+fn empty_plan_skips_gemm_and_plan_identity_is_exact() {
+    let index = filter_cost_index(1);
+    let query = array![[1.0, 0.0, 0.0, 0.0]];
+    let params = PlaidSearchParams {
+        n_ivf_probe: 1,
+        n_full_scores: 16,
+        top_k: 2,
+        centroid_score_threshold: None,
+    };
+    let empty_plan = index
+        .plan_eligible_centroids(Some(&[]), Some(0), true, 1, 1)
+        .unwrap();
+    let (hits, stats) = index
+        .search_adaptive(query.view(), &params, 2, 2, &AllEligible, Some(&empty_plan))
+        .unwrap();
+    assert!(hits.is_empty());
+    assert_eq!(stats.centroid_probe_nanos, 0);
+    assert_eq!(stats.probe_rounds, 0);
+    assert_eq!(stats.posting_entries_read, 0);
+    assert_eq!(stats.approximate_documents, 0);
+    assert_eq!(stats.exact_documents, 0);
+
+    let other_index = filter_cost_index(1);
+    let error = other_index
+        .search_adaptive(query.view(), &params, 2, 2, &AllEligible, Some(&empty_plan))
+        .unwrap_err();
+    assert!(error.to_string().contains("does not belong"));
+
+    let cloned_index = index.clone();
+    let error = cloned_index
+        .search_adaptive(query.view(), &params, 2, 2, &AllEligible, Some(&empty_plan))
+        .unwrap_err();
+    assert!(error.to_string().contains("does not belong"));
+    let (original_hits, _) = index
+        .search_adaptive(query.view(), &params, 2, 2, &AllEligible, Some(&empty_plan))
+        .unwrap();
+    assert!(original_hits.is_empty());
+}
+
+#[test]
+fn multi_token_ties_are_deterministic_and_thresholded() {
+    let index = tie_index();
+    let query = array![[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]];
+    let params = PlaidSearchParams {
+        n_ivf_probe: 1,
+        n_full_scores: 4,
+        top_k: 2,
+        centroid_score_threshold: Some(0.5),
+    };
+    let (hits, stats) = index.search(query.view(), &params, &AllEligible).unwrap();
+    assert_eq!(
+        hits.iter().map(|hit| hit.row_address).collect::<Vec<_>>(),
+        vec![100, 102]
+    );
+    assert_eq!(stats.centroids_probed, 2);
+    let (again, _) = index.search(query.view(), &params, &AllEligible).unwrap();
+    assert_eq!(again, hits);
+
+    let mut above_ties = params;
+    above_ties.centroid_score_threshold = Some(1.1);
+    let (none, stats) = index
+        .search(query.view(), &above_ties, &AllEligible)
+        .unwrap();
+    assert!(none.is_empty());
+    assert_eq!(stats.centroids_probed, 0);
+}
+
+#[test]
+fn maximum_probe_ceiling_stops_incremental_multi_round_retry() {
+    let index = retry_ceiling_index();
+    let query = array![[1.0, 0.0, 0.0, 0.0]];
+    let plan = index
+        .plan_eligible_centroids(Some(&[0, 1, 2, 3]), Some(4), true, 1, 1)
+        .unwrap();
+    assert_eq!(plan.decision(), EligibleCentroidDecision::Enabled);
+    let eligibility = AddressEligibility::allow([2_000, 2_001, 2_002, 2_003]);
+    let params = PlaidSearchParams {
+        n_ivf_probe: 1,
+        n_full_scores: 128,
+        top_k: 4,
+        centroid_score_threshold: None,
+    };
+    let (ceiling_hits, ceiling_stats) = index
+        .search_adaptive(query.view(), &params, 3, 4, &eligibility, Some(&plan))
+        .unwrap();
+    assert_eq!(ceiling_hits.len(), 3);
+    assert_eq!(ceiling_stats.probe_rounds, 3);
+    assert_eq!(ceiling_stats.probe_retries, 2);
+    assert_eq!(ceiling_stats.configured_probes, 6);
+    assert_eq!(ceiling_stats.final_nprobe, 3);
+    assert_eq!(ceiling_stats.centroids_probed, 3);
+    assert_eq!(ceiling_stats.incremental_centroids_reused, 3);
+    assert_eq!(ceiling_stats.posting_entries_read, 48);
+
+    let (complete_hits, complete_stats) = index
+        .search_adaptive(query.view(), &params, 4, 4, &eligibility, Some(&plan))
+        .unwrap();
+    assert_eq!(complete_hits.len(), 4);
+    assert_eq!(complete_stats.probe_rounds, 3);
+    assert_eq!(complete_stats.probe_retries, 2);
+    assert_eq!(complete_stats.final_nprobe, 4);
+    assert_eq!(complete_stats.posting_entries_read, 64);
 }
 
 #[test]
