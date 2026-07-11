@@ -5027,6 +5027,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "lance-plaid"
+version = "9.0.0-beta.19"
+dependencies = [
+ "approx",
+ "byteorder",
+ "ndarray",
+ "rayon",
+ "roaring",
+ "tempfile",
+]
+
+[[package]]
 name = "lance-select"
 version = "9.0.0-beta.19"
 dependencies = [

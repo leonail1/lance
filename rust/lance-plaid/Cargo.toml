@@ -1,0 +1,25 @@
+[package]
+name = "lance-plaid"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "CPU PLAID search primitives for Lance"
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
+
+[dependencies]
+byteorder = { workspace = true }
+ndarray = { workspace = true }
+rayon = { workspace = true }
+roaring = { workspace = true }
+
+[dev-dependencies]
+approx = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
