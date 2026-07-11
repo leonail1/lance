@@ -899,6 +899,9 @@ fn direct_residual_plan(
     index: &PlaidVectorIndex,
     mask: &RowAddrMask,
 ) -> DirectResidualPlan {
+    if index.num_documents() == 0 {
+        return DirectResidualPlan::Empty;
+    }
     if let Some(decision) = direct_residual_precheck(config, query.maximum_nprobes, filtered_query)
     {
         return DirectResidualPlan::Legacy(decision);
@@ -1010,12 +1013,17 @@ async fn execute_search(
         let raw_index = dataset
             .open_vector_index(&query.column, &metadata.uuid, &metrics.index)
             .await?;
-        raw_index
+        let plaid = raw_index
             .as_any()
             .downcast_ref::<PlaidVectorIndex>()
             .ok_or_else(|| {
                 Error::internal("persisted PLAID segment opened as another index type".to_string())
             })?;
+        if plaid.num_documents() == 0 {
+            residual_usage.observe(ResidualSegmentPath::Empty);
+            metrics.record_direct_residual_decision(DirectResidualDecision::EmptySegment);
+            continue;
+        }
         opened_indices.push(raw_index.clone());
         if small_filter_exact {
             continue;
@@ -1489,6 +1497,7 @@ mod tests {
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::utils::address::RowAddress;
     use lance_linalg::distance::{DistanceType, multivec_distance};
+    use lance_plaid::{PlaidIndex, ResidualQuantizer};
     use ndarray::array;
 
     use crate::dataset::WriteParams;
@@ -1549,6 +1558,70 @@ mod tests {
                     .contains("invalid LANCE_PLAID_DIRECT_RESIDUAL")
             );
         }
+    }
+
+    #[test]
+    fn zero_document_segment_precedes_disabled_and_other_direct_gates() {
+        let quantizer = ResidualQuantizer::try_new(2, vec![-0.1, 0.0, 0.1], vec![0.0; 4]).unwrap();
+        let core = PlaidIndex::try_new(
+            array![[1.0_f32, 0.0, 0.0, 0.0]],
+            quantizer,
+            Vec::new(),
+            vec![0],
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let index = PlaidVectorIndex::try_new(core).unwrap();
+        let mut query = Query {
+            column: "mv".to_string(),
+            key: Arc::new(Float32Array::from(vec![1.0_f32, 0.0, 0.0, 0.0])) as ArrayRef,
+            k: 1,
+            lower_bound: None,
+            upper_bound: None,
+            minimum_nprobes: 1,
+            maximum_nprobes: None,
+            ef: None,
+            refine_factor: None,
+            metric_type: Some(DistanceType::Dot),
+            use_index: true,
+            query_parallelism: 1,
+            dist_q_c: 0.0,
+            approx_mode: Default::default(),
+        };
+        let mask = RowAddrMask::from_block(lance_select::RowAddrTreeMap::new());
+
+        let disabled = DirectResidualConfig {
+            enabled: false,
+            max_documents: 0,
+        };
+        assert!(matches!(
+            direct_residual_plan(disabled, &query, 1, true, &index, &mask),
+            DirectResidualPlan::Empty
+        ));
+        assert!(matches!(
+            direct_residual_plan(
+                DirectResidualConfig::default(),
+                &query,
+                1,
+                false,
+                &index,
+                &mask,
+            ),
+            DirectResidualPlan::Empty
+        ));
+        query.maximum_nprobes = Some(1);
+        assert!(matches!(
+            direct_residual_plan(
+                DirectResidualConfig::default(),
+                &query,
+                1,
+                true,
+                &index,
+                &mask,
+            ),
+            DirectResidualPlan::Empty
+        ));
     }
 
     #[test]

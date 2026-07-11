@@ -21,6 +21,9 @@ use roaring::RoaringBitmap;
 use uuid::Uuid;
 
 use super::DatasetIndexInternalExt;
+use super::plaid::{
+    PlaidTrainedModel, build_plaid_delta_index, index_group_is_plaid, load_compatible_plaid_models,
+};
 use super::vector::LogicalVectorIndex;
 use super::vector::ivf::{optimize_vector_indices, select_segment_for_single_rebalance};
 use crate::dataset::Dataset;
@@ -414,44 +417,138 @@ async fn metadata_is_vector_index(dataset: &Dataset, index: &IndexMetadata) -> R
     object_store.exists(&index_file).await
 }
 
-/// Merge in-inflight unindexed data, with a specific number of previous indices
-/// into a new index, to improve the query performance.
-///
-/// The merge behavior is controlled by [`OptimizeOptions::num_indices_to_merge].
-///
-/// Returns
-/// -------
-/// - the UUID of the new index
-/// - merged indices,
-/// - Bitmap of the fragments that covered in the newly created index.
-pub async fn merge_indices<'a>(
+/// Builds a new immutable PLAID segment over unindexed fragments without
+/// entering the generic IVF optimizer. No existing segment is rewritten or
+/// removed in append-only mode.
+async fn append_plaid_delta<'a>(
+    dataset: Arc<Dataset>,
+    old_indices: &[&'a IndexMetadata],
+    unindexed: &[Fragment],
+    field_path: &str,
+    options: &OptimizeOptions,
+    prepared_models: Option<Vec<PlaidTrainedModel>>,
+) -> Result<Option<IndexMergeResults<'a>>> {
+    if options.retrain || options.num_indices_to_merge != Some(0) {
+        return Err(Error::not_supported(format!(
+            "PLAID index '{}' currently supports only append optimization (retrain=false, num_indices_to_merge=Some(0)); merge, retrain, and automatic optimization are not implemented",
+            old_indices[0].name
+        )));
+    }
+    if unindexed.is_empty() {
+        return Ok(None);
+    }
+
+    // Reference selection must not depend on the manifest/vector iteration
+    // order. Prefer the oldest segment and break equal timestamps by UUID.
+    let (reference_position, reference) = old_indices
+        .iter()
+        .copied()
+        .enumerate()
+        .min_by(|(_, left), (_, right)| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.uuid.as_bytes().cmp(right.uuid.as_bytes()))
+        })
+        .expect("old_indices was checked non-empty");
+
+    // The dataset-level optimizer supplies a globally preflighted model set.
+    // Direct low-level callers still receive the same fail-closed validation.
+    let models = match prepared_models {
+        Some(models) => models,
+        None => load_compatible_plaid_models(dataset.as_ref(), old_indices).await?,
+    };
+    if models.len() != old_indices.len() {
+        return Err(Error::internal(format!(
+            "prepared PLAID model count {} differs from segment count {}",
+            models.len(),
+            old_indices.len()
+        )));
+    }
+    let reference_model = models.into_iter().nth(reference_position).ok_or_else(|| {
+        Error::internal("failed to load the selected PLAID reference model".to_string())
+    })?;
+    let index_details = reference
+        .index_details
+        .as_ref()
+        .ok_or_else(|| Error::index("PLAID reference segment has no index details".to_string()))?
+        .as_ref()
+        .clone();
+
+    let new_fragment_bitmap = unindexed
+        .iter()
+        .map(|fragment| fragment.id as u32)
+        .collect::<RoaringBitmap>();
+    let new_uuid = Uuid::new_v4();
+    let files = build_plaid_delta_index(
+        dataset.as_ref(),
+        field_path,
+        new_uuid,
+        reference_model,
+        unindexed.to_vec(),
+        options.progress.clone(),
+    )
+    .await?;
+
+    Ok(Some(IndexMergeResults {
+        new_uuid,
+        removed_indices: Vec::new(),
+        new_fragment_bitmap,
+        new_index_version: reference.index_version,
+        new_index_details: index_details,
+        files,
+    }))
+}
+
+/// Executes a group after the dataset-level PLAID preflight. Models are
+/// consumed only by PLAID groups; generic index groups always pass None.
+pub async fn merge_indices_with_prepared_plaid_models<'a>(
     dataset: Arc<Dataset>,
     old_indices: &[&'a IndexMetadata],
     options: &OptimizeOptions,
+    prepared_plaid_models: Option<Vec<PlaidTrainedModel>>,
 ) -> Result<Option<IndexMergeResults<'a>>> {
     if old_indices.is_empty() {
         return Err(Error::index(
             "Append index: no previous index found".to_string(),
         ));
-    };
+    }
 
     let unindexed = dataset.unindexed_fragments(&old_indices[0].name).await?;
-    Box::pin(merge_indices_with_unindexed_frags(
+    Box::pin(merge_indices_with_unindexed_frags_impl(
         dataset,
         old_indices,
         &unindexed,
         options,
+        prepared_plaid_models,
     ))
     .await
 }
 
 /// Merge a list of provided unindexed data, with a specific number of previous indices
 /// into a new index, to improve the query performance.
+#[cfg(test)]
 pub async fn merge_indices_with_unindexed_frags<'a>(
     dataset: Arc<Dataset>,
     old_indices: &[&'a IndexMetadata],
     unindexed: &[Fragment],
     options: &OptimizeOptions,
+) -> Result<Option<IndexMergeResults<'a>>> {
+    Box::pin(merge_indices_with_unindexed_frags_impl(
+        dataset,
+        old_indices,
+        unindexed,
+        options,
+        None,
+    ))
+    .await
+}
+
+async fn merge_indices_with_unindexed_frags_impl<'a>(
+    dataset: Arc<Dataset>,
+    old_indices: &[&'a IndexMetadata],
+    unindexed: &[Fragment],
+    options: &OptimizeOptions,
+    prepared_plaid_models: Option<Vec<PlaidTrainedModel>>,
 ) -> Result<Option<IndexMergeResults<'a>>> {
     if old_indices.is_empty() {
         return Err(Error::index(
@@ -468,6 +565,18 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
         )))?;
 
     let field_path = dataset.schema().field_path(old_indices[0].fields[0])?;
+    if index_group_is_plaid(old_indices)? {
+        return append_plaid_delta(
+            dataset,
+            old_indices,
+            unindexed,
+            &field_path,
+            options,
+            prepared_plaid_models,
+        )
+        .await;
+    }
+
     let first_is_vector_index = metadata_is_vector_index(dataset.as_ref(), old_indices[0]).await?;
     for idx in old_indices.iter().skip(1) {
         let is_vector_index = metadata_is_vector_index(dataset.as_ref(), idx).await?;

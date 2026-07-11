@@ -81,7 +81,7 @@ pub mod scalar;
 pub(crate) mod scalar_logical;
 pub mod vector;
 
-use self::append::merge_indices;
+use self::append::merge_indices_with_prepared_plaid_models;
 use self::vector::remap_vector_index;
 use crate::dataset::index::LanceIndexStoreExt;
 use crate::dataset::optimize::RemappedIndex;
@@ -1625,7 +1625,7 @@ impl DatasetIndexExt for Dataset {
             .index_names
             .as_ref()
             .map(|names| names.iter().collect::<HashSet<_>>());
-        let name_to_indices = indices
+        let mut index_groups = indices
             .iter()
             .filter(|idx| {
                 indices_to_optimize
@@ -1634,11 +1634,43 @@ impl DatasetIndexExt for Dataset {
                     && !is_system_index(idx)
             })
             .map(|idx| (idx.name.clone(), idx))
-            .into_group_map();
+            .into_group_map()
+            .into_values()
+            .collect::<Vec<_>>();
+        // Stable order makes maintenance behavior and fail-before-write tests
+        // deterministic without changing the global preflight boundary.
+        index_groups.sort_by(|left, right| left[0].name.cmp(&right[0].name));
+
+        // Stage 1: classify every selected logical index and reject mixed
+        // families or unsupported PLAID modes before any object can be written.
+        for deltas in &index_groups {
+            if plaid::index_group_is_plaid(deltas)?
+                && (options.retrain || options.num_indices_to_merge != Some(0))
+            {
+                return Err(Error::not_supported(format!(
+                    "PLAID index '{}' currently supports only OptimizeOptions::append(); merge, retrain, and automatic optimization are not implemented",
+                    deltas[0].name
+                )));
+            }
+        }
+
+        // Stage 2: fully decode and cross-validate every PLAID group that will
+        // append data. This plan is prepared globally, so a corrupt later group
+        // cannot be discovered after an earlier scalar/vector writer has run.
+        // A steady-state append remains a strict no-op and performs no reads.
+        let mut prepared_plaid_models = HashMap::new();
+        for deltas in &index_groups {
+            if plaid::index_group_is_plaid(deltas)? && !index_group_has_no_unindexed(self, deltas) {
+                prepared_plaid_models.insert(
+                    deltas[0].name.clone(),
+                    plaid::load_compatible_plaid_models(self, deltas).await?,
+                );
+            }
+        }
 
         let mut new_indices = vec![];
         let mut removed_indices = vec![];
-        for deltas in name_to_indices.values() {
+        for deltas in &index_groups {
             // Scalar indices have no rebalance concept, so skip them entirely
             // when every fragment is already covered and the caller hasn't
             // asked for retrain or an explicit delta merge. Vector indices
@@ -1652,7 +1684,14 @@ impl DatasetIndexExt for Dataset {
                 continue;
             }
 
-            let Some(res) = merge_indices(dataset.clone(), deltas.as_slice(), options).await?
+            let prepared_plaid_models = prepared_plaid_models.remove(&deltas[0].name);
+            let Some(res) = merge_indices_with_prepared_plaid_models(
+                dataset.clone(),
+                deltas.as_slice(),
+                options,
+                prepared_plaid_models,
+            )
+            .await?
             else {
                 continue;
             };

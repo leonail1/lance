@@ -38,7 +38,7 @@ use lance_plaid::{
     PlaidSearchStats, ResidualQuantizer,
 };
 use lance_select::RowAddrMask;
-use lance_table::format::{IndexFile, IndexMetadata};
+use lance_table::format::{Fragment, IndexFile, IndexMetadata};
 use ndarray::{Array2, ArrayView2};
 use prost_types::Any as ProstAny;
 use rand::rngs::SmallRng;
@@ -173,6 +173,327 @@ pub(crate) fn is_plaid_index_metadata(metadata: &IndexMetadata) -> bool {
         .is_some_and(|value| value.eq_ignore_ascii_case("true"))
 }
 
+/// Classifies one logical index group before any maintenance writer is opened.
+/// A PLAID discriminator on only some segments is a hard metadata-family error;
+/// allowing that group into either maintenance implementation could reproduce
+/// the format/details mismatch this gate is intended to prevent.
+pub(crate) fn index_group_is_plaid(indices: &[&IndexMetadata]) -> Result<bool> {
+    let plaid_segments = indices
+        .iter()
+        .filter(|metadata| is_plaid_index_metadata(metadata))
+        .count();
+    if plaid_segments > 0 && plaid_segments != indices.len() {
+        return Err(Error::index(format!(
+            "logical index '{}' mixes {plaid_segments} PLAID segment(s) with {} non-PLAID segment(s)",
+            indices
+                .first()
+                .map(|metadata| metadata.name.as_str())
+                .unwrap_or("<empty>"),
+            indices.len() - plaid_segments
+        )));
+    }
+    Ok(!indices.is_empty() && plaid_segments == indices.len())
+}
+
+/// Trained PLAID state that can be reused to encode immutable delta segments.
+///
+/// Append optimization intentionally reuses this state instead of training on
+/// a small delta. This keeps quantized MaxSim scores comparable across all
+/// physical segments of one logical index.
+pub(crate) struct PlaidTrainedModel {
+    centroids: Array2<f32>,
+    quantizer: ResidualQuantizer,
+}
+
+/// Exact canonical identity of every trained value that affects PLAID encoding
+/// and quantized MaxSim. Using IEEE-754 bits avoids tolerance-based acceptance
+/// of subtly incompatible segment models.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PlaidModelFingerprint {
+    dimension: usize,
+    num_centroids: usize,
+    nbits: u8,
+    centroid_bits: Vec<u32>,
+    cutoff_bits: Vec<u32>,
+    weight_bits: Vec<u32>,
+}
+
+impl PlaidTrainedModel {
+    pub(crate) fn fingerprint(&self) -> PlaidModelFingerprint {
+        PlaidModelFingerprint {
+            dimension: self.centroids.ncols(),
+            num_centroids: self.centroids.nrows(),
+            nbits: self.quantizer.nbits(),
+            centroid_bits: self.centroids.iter().map(|value| value.to_bits()).collect(),
+            cutoff_bits: self
+                .quantizer
+                .bucket_cutoffs()
+                .iter()
+                .map(|value| value.to_bits())
+                .collect(),
+            weight_bits: self
+                .quantizer
+                .bucket_weights()
+                .iter()
+                .map(|value| value.to_bits())
+                .collect(),
+        }
+    }
+}
+
+/// Opens and fully validates one persisted PLAID segment, then clones only its
+/// trained state. Calling this for every existing segment before an append also
+/// prevents a previously mislabeled generic vector file from being propagated.
+pub(crate) async fn load_plaid_trained_model(
+    dataset: &Dataset,
+    metadata: &IndexMetadata,
+) -> Result<PlaidTrainedModel> {
+    if metadata.fields.len() != 1 {
+        return Err(Error::index(format!(
+            "PLAID segment {} must reference exactly one field, got {:?}",
+            metadata.uuid, metadata.fields
+        )));
+    }
+    let details = metadata
+        .index_details
+        .as_ref()
+        .ok_or_else(|| {
+            Error::index(format!(
+                "PLAID segment {} is missing VectorIndexDetails",
+                metadata.uuid
+            ))
+        })?
+        .to_msg::<VectorIndexDetails>()
+        .map_err(|error| {
+            Error::index(format!(
+                "PLAID segment {} has invalid VectorIndexDetails: {error}",
+                metadata.uuid
+            ))
+        })?;
+    if !details
+        .runtime_hints
+        .get(PLAID_RUNTIME_HINT)
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+    {
+        return Err(Error::index(format!(
+            "PLAID segment {} is missing the PLAID runtime discriminator",
+            metadata.uuid
+        )));
+    }
+    if details
+        .runtime_hints
+        .get(PLAID_FORMAT_HINT)
+        .map(String::as_str)
+        != Some("1")
+    {
+        return Err(Error::index(format!(
+            "PLAID segment {} must use format version 1",
+            metadata.uuid
+        )));
+    }
+    let hinted_nbits = details
+        .runtime_hints
+        .get(PLAID_NBITS_HINT)
+        .ok_or_else(|| {
+            Error::index(format!(
+                "PLAID segment {} is missing the persisted nbits hint",
+                metadata.uuid
+            ))
+        })?
+        .parse::<u8>()
+        .map_err(|error| {
+            Error::index(format!(
+                "PLAID segment {} has an invalid nbits hint: {error}",
+                metadata.uuid
+            ))
+        })?;
+    if VectorMetricType::try_from(details.metric_type).ok() != Some(VectorMetricType::Dot)
+        || !matches!(details.compression.as_ref(), Some(Compression::Flat(_)))
+    {
+        return Err(Error::index(format!(
+            "PLAID segment {} must use Dot distance with Flat compression",
+            metadata.uuid
+        )));
+    }
+
+    let files = metadata.files.as_deref().ok_or_else(|| {
+        Error::index(format!(
+            "PLAID segment {} is missing its persisted file manifest",
+            metadata.uuid
+        ))
+    })?;
+    if files.len() != 1 || files[0].path != INDEX_FILE_NAME {
+        return Err(Error::index(format!(
+            "PLAID segment {} must declare exactly one '{}' file, got {:?}",
+            metadata.uuid,
+            INDEX_FILE_NAME,
+            files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>()
+        )));
+    }
+    let fragment_bitmap = metadata.fragment_bitmap.as_ref().ok_or_else(|| {
+        Error::index(format!(
+            "PLAID segment {} is missing fragment coverage",
+            metadata.uuid
+        ))
+    })?;
+    let store = dataset.object_store_for_index(metadata).await?;
+    let path = dataset
+        .indice_files_dir(metadata)?
+        .join(metadata.uuid.to_string())
+        .join(INDEX_FILE_NAME);
+    let actual_size = store.size(&path).await?;
+    if actual_size != files[0].size_bytes {
+        return Err(Error::index(format!(
+            "PLAID segment {} declares file size {}, actual size is {}",
+            metadata.uuid, files[0].size_bytes, actual_size
+        )));
+    }
+    let bytes = store.read_one_all(&path).await?;
+    if u64::try_from(bytes.len()).ok() != Some(files[0].size_bytes) {
+        return Err(Error::index(format!(
+            "PLAID segment {} read length does not match its declared file size",
+            metadata.uuid
+        )));
+    }
+    const PLAID_MAGIC: &[u8; 8] = b"LPLDIDX\0";
+    if !bytes.as_ref().starts_with(PLAID_MAGIC) {
+        return Err(Error::index(format!(
+            "PLAID segment {} has invalid magic bytes {:?}",
+            metadata.uuid,
+            bytes.as_ref().get(..8).unwrap_or(bytes.as_ref())
+        )));
+    }
+    let index =
+        spawn_cpu(move || PlaidIndex::read_from_bytes(bytes.as_ref()).map_err(plaid_error)).await?;
+    if index.quantizer().nbits() != hinted_nbits {
+        return Err(Error::index(format!(
+            "PLAID segment {} persists nbits={}, but its core uses nbits={}",
+            metadata.uuid,
+            hinted_nbits,
+            index.quantizer().nbits()
+        )));
+    }
+    if let Some(row_address) =
+        index.row_addresses().iter().copied().find(|row_address| {
+            !fragment_bitmap.contains(RowAddress::from(*row_address).fragment_id())
+        })
+    {
+        return Err(Error::index(format!(
+            "PLAID segment {} contains row address {} outside its fragment bitmap",
+            metadata.uuid, row_address
+        )));
+    }
+
+    let field_path = dataset.schema().field_path(metadata.fields[0])?;
+    let (vector_type, element_type) = get_vector_type(dataset.schema(), &field_path)?;
+    let schema_dimension = match vector_type {
+        DataType::List(ref item) => match item.data_type() {
+            DataType::FixedSizeList(_, dimension) if element_type == DataType::Float32 => {
+                usize::try_from(*dimension).map_err(|_| {
+                    Error::invalid_input("PLAID vector dimension does not fit usize".to_string())
+                })?
+            }
+            _ => {
+                return Err(Error::index(format!(
+                    "PLAID segment {} field '{}' is not List<FixedSizeList<Float32>>",
+                    metadata.uuid, field_path
+                )));
+            }
+        },
+        _ => {
+            return Err(Error::index(format!(
+                "PLAID segment {} field '{}' is not a multi-vector List column",
+                metadata.uuid, field_path
+            )));
+        }
+    };
+    if index.dimension() != schema_dimension {
+        return Err(Error::index(format!(
+            "PLAID segment {} dimension {} differs from field '{}' dimension {}",
+            metadata.uuid,
+            index.dimension(),
+            field_path,
+            schema_dimension
+        )));
+    }
+
+    Ok(PlaidTrainedModel {
+        centroids: index.centroids().to_owned(),
+        quantizer: index.quantizer().clone(),
+    })
+}
+
+/// Validates every immutable segment in one logical PLAID index before a new
+/// object is written, and returns models in the same order as indices.
+pub(crate) async fn load_compatible_plaid_models(
+    dataset: &Dataset,
+    indices: &[&IndexMetadata],
+) -> Result<Vec<PlaidTrainedModel>> {
+    let Some(reference) = indices.first() else {
+        return Err(Error::index(
+            "cannot validate an empty PLAID index group".to_string(),
+        ));
+    };
+    let mut models = Vec::with_capacity(indices.len());
+    let mut expected_fingerprint = None;
+    for metadata in indices {
+        if metadata.name != reference.name
+            || metadata.fields != reference.fields
+            || metadata.index_version != reference.index_version
+        {
+            return Err(Error::index(format!(
+                "PLAID logical index '{}' has inconsistent segment metadata at {}",
+                reference.name, metadata.uuid
+            )));
+        }
+        let model = load_plaid_trained_model(dataset, metadata).await?;
+        let fingerprint = model.fingerprint();
+        match expected_fingerprint.as_ref() {
+            Some(expected) if expected != &fingerprint => {
+                return Err(Error::index(format!(
+                    "PLAID logical index '{}' contains incompatible trained models; segment {} differs from the other segments",
+                    reference.name, metadata.uuid
+                )));
+            }
+            Some(_) => {}
+            None => expected_fingerprint = Some(fingerprint),
+        }
+        models.push(model);
+    }
+    Ok(models)
+}
+
+/// Builds one append-only PLAID delta over exactly `fragments` using an existing
+/// trained model. The scanner still reads physical row addresses when stable
+/// row IDs are enabled; deletion vectors are applied by the dataset scan.
+pub(crate) async fn build_plaid_delta_index(
+    dataset: &Dataset,
+    column: &str,
+    uuid: Uuid,
+    model: PlaidTrainedModel,
+    fragments: Vec<Fragment>,
+    progress: Arc<dyn IndexBuildProgress>,
+) -> Result<Vec<IndexFile>> {
+    let fragment_bitmap = fragments
+        .iter()
+        .map(|fragment| fragment.id as u32)
+        .collect();
+    encode_plaid_segment(
+        dataset,
+        column,
+        uuid,
+        model.centroids,
+        model.quantizer,
+        Some(fragments),
+        Some(fragment_bitmap),
+        progress,
+    )
+    .await
+}
+
 /// Builds one immutable PLAID segment by streaming the source multi-vector column.
 pub(crate) async fn build_plaid_index(
     dataset: &Dataset,
@@ -286,11 +607,32 @@ pub(crate) async fn build_plaid_index(
         ResidualQuantizer::try_new(params.nbits, cutoffs, weights).map_err(plaid_error)?;
     progress.stage_complete("plaid_train").await?;
 
+    encode_plaid_segment(
+        dataset, column, uuid, centroids, quantizer, None, None, progress,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn encode_plaid_segment(
+    dataset: &Dataset,
+    column: &str,
+    uuid: Uuid,
+    centroids: Array2<f32>,
+    quantizer: ResidualQuantizer,
+    fragments: Option<Vec<Fragment>>,
+    expected_fragment_bitmap: Option<RoaringBitmap>,
+    progress: Arc<dyn IndexBuildProgress>,
+) -> Result<Vec<IndexFile>> {
+    let dimension = centroids.ncols();
     progress
         .stage_start("plaid_encode", None, "record batches")
         .await?;
     let mut scanner = dataset.scan();
     scanner.project(&[column])?.with_row_address();
+    if let Some(fragments) = fragments {
+        scanner.with_fragments(fragments);
+    }
     let mut stream = scanner.try_into_stream().await?;
     let mut row_addresses = Vec::new();
     let mut document_offsets = vec![0_u64];
@@ -371,11 +713,6 @@ pub(crate) async fn build_plaid_index(
     }
     progress.stage_complete("plaid_encode").await?;
 
-    if row_addresses.is_empty() {
-        return Err(Error::invalid_input(
-            "PLAID cannot build an index without non-null documents".to_string(),
-        ));
-    }
     let index = PlaidIndex::try_new(
         centroids,
         quantizer,
@@ -385,15 +722,59 @@ pub(crate) async fn build_plaid_index(
         packed_residuals,
     )
     .map_err(plaid_error)?;
+    let expected_row_addresses = index.row_addresses().to_vec();
     let bytes = index.to_bytes().map_err(plaid_error)?;
     let path = dataset
         .indices_dir()
         .join(uuid.to_string())
         .join(INDEX_FILE_NAME);
     dataset.object_store.put(&path, &bytes).await?;
+
+    // Do not allow metadata to be committed until the object store returns the
+    // exact PLAID object we just wrote and the complete decoder accepts it.
+    let readback = dataset.object_store.read_one_all(&path).await?;
+    if readback.as_ref() != bytes.as_slice() {
+        return Err(Error::index(format!(
+            "PLAID readback bytes differ from the object written for {uuid}"
+        )));
+    }
+    let readback_size = readback.len();
+    const PLAID_MAGIC: &[u8; 8] = b"LPLDIDX\0";
+    if !readback.as_ref().starts_with(PLAID_MAGIC) {
+        return Err(Error::index(format!(
+            "PLAID readback for {uuid} has invalid magic bytes {:?}",
+            readback.as_ref().get(..8).unwrap_or(readback.as_ref())
+        )));
+    }
+    let decoded =
+        spawn_cpu(move || PlaidIndex::read_from_bytes(readback.as_ref()).map_err(plaid_error))
+            .await?;
+    if decoded.row_addresses() != expected_row_addresses {
+        return Err(Error::index(format!(
+            "PLAID readback row-address mismatch for {uuid}: expected {} rows, decoded {}",
+            expected_row_addresses.len(),
+            decoded.row_addresses().len()
+        )));
+    }
+    if let Some(expected_fragment_bitmap) = expected_fragment_bitmap.as_ref()
+        && let Some(unexpected_address) = decoded.row_addresses().iter().copied().find(|address| {
+            !expected_fragment_bitmap.contains(RowAddress::from(*address).fragment_id())
+        })
+    {
+        return Err(Error::index(format!(
+            "PLAID delta {uuid} contains row address {unexpected_address} outside its fragment bitmap"
+        )));
+    }
+    let size_bytes = u64::try_from(readback_size)
+        .map_err(|_| Error::index("PLAID file size does not fit u64".to_string()))?;
+    if size_bytes != dataset.object_store.size(&path).await? {
+        return Err(Error::index(format!(
+            "PLAID readback file-size mismatch for {uuid}"
+        )));
+    }
     Ok(vec![IndexFile {
         path: INDEX_FILE_NAME.to_string(),
-        size_bytes: bytes.len() as u64,
+        size_bytes,
     }])
 }
 
@@ -474,7 +855,7 @@ fn collect_bounded_document_ordinals(
 }
 
 impl PlaidVectorIndex {
-    fn try_new(core: PlaidIndex) -> Result<Self> {
+    pub(crate) fn try_new(core: PlaidIndex) -> Result<Self> {
         let dimension = core.dimension();
         let values = Float32Array::from(core.centroids().iter().copied().collect::<Vec<_>>());
         let centroids = FixedSizeListArray::try_new_from_values(values, dimension as i32)?;
@@ -1089,6 +1470,27 @@ mod tests {
         .unwrap()
     }
 
+    fn make_nullable_batch(ids: Vec<i32>, documents: Vec<Option<Vec<[f32; 4]>>>) -> RecordBatch {
+        let token_builder = FixedSizeListBuilder::new(Float32Builder::new(), 4);
+        let mut document_builder = ListBuilder::new(token_builder);
+        for document in documents {
+            if let Some(document) = document {
+                for token in document {
+                    document_builder.values().values().append_slice(&token);
+                    document_builder.values().append(true);
+                }
+                document_builder.append(true);
+            } else {
+                document_builder.append(false);
+            }
+        }
+        RecordBatch::try_from_iter([
+            ("id", Arc::new(Int32Array::from(ids)) as ArrayRef),
+            ("mv", Arc::new(document_builder.finish()) as ArrayRef),
+        ])
+        .unwrap()
+    }
+
     fn query() -> FixedSizeListArray {
         FixedSizeListArray::try_new_from_values(
             Float32Array::from(vec![1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0]),
@@ -1107,6 +1509,15 @@ mod tests {
         scanner.refine(2);
         scanner.project(&["id"]).unwrap();
         scanner.try_into_batch().await.unwrap()
+    }
+
+    fn sorted_ids(batch: &RecordBatch) -> Vec<i32> {
+        let mut ids = batch["id"]
+            .as_primitive::<arrow::datatypes::Int32Type>()
+            .values()
+            .to_vec();
+        ids.sort_unstable();
+        ids
     }
 
     #[test]
@@ -1903,6 +2314,850 @@ mod tests {
                 .as_primitive::<arrow::datatypes::Int32Type>()
                 .values()
                 .contains(&0)
+        );
+    }
+
+    #[tokio::test]
+    async fn plaid_append_delta_roundtrips_for_physical_and_stable_row_ids() {
+        for stable_row_ids in [false, true] {
+            let directory = TempStrDir::default();
+            let first = make_batch(
+                vec![0, 1, 2, 3],
+                vec![
+                    vec![[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]],
+                    vec![[1.0, 0.0, 0.0, 0.0]],
+                    vec![[0.0, 1.0, 0.0, 0.0]],
+                    vec![[-1.0, 0.0, 0.0, 0.0]],
+                ],
+            );
+            let schema = first.schema();
+            let mut dataset = Dataset::write(
+                RecordBatchIterator::new(vec![Ok(first)], schema.clone()),
+                directory.as_ref(),
+                Some(WriteParams {
+                    max_rows_per_file: 4,
+                    enable_stable_row_ids: stable_row_ids,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+            dataset
+                .create_index(
+                    &["mv"],
+                    IndexType::Vector,
+                    Some("plaid_idx".to_string()),
+                    &PlaidIndexParams {
+                        num_centroids: 2,
+                        nbits: 2,
+                        max_iterations: 3,
+                        sample_rate: 4,
+                    },
+                    false,
+                )
+                .await
+                .unwrap();
+
+            let second = make_batch(
+                vec![4, 5, 6, 7],
+                vec![
+                    vec![[0.9, 0.0, 0.0, 0.0], [0.0, 0.9, 0.0, 0.0]],
+                    vec![[0.8, 0.0, 0.0, 0.0], [0.0, 0.8, 0.0, 0.0]],
+                    vec![[1.0, 0.0, 0.0, 0.0]],
+                    vec![[0.0, 1.0, 0.0, 0.0]],
+                ],
+            );
+            dataset
+                .append(
+                    RecordBatchIterator::new(vec![Ok(second)], schema.clone()),
+                    None,
+                )
+                .await
+                .unwrap();
+            // The delta scanner must apply this deletion vector and never
+            // persist physical row offset 1 from fragment 1.
+            dataset.delete("id = 5").await.unwrap();
+            dataset
+                .optimize_indices(&OptimizeOptions::append())
+                .await
+                .unwrap();
+
+            let mut metadata = dataset.load_indices_by_name("plaid_idx").await.unwrap();
+            metadata.sort_by_key(|segment| {
+                segment
+                    .fragment_bitmap
+                    .as_ref()
+                    .and_then(|bitmap| bitmap.iter().next())
+                    .unwrap_or(u32::MAX)
+            });
+            assert_eq!(metadata.len(), 2);
+            assert_eq!(
+                metadata[0].fragment_bitmap,
+                Some(RoaringBitmap::from_iter([0]))
+            );
+            assert_eq!(
+                metadata[1].fragment_bitmap,
+                Some(RoaringBitmap::from_iter([1]))
+            );
+
+            for segment in &metadata {
+                assert!(is_plaid_index_metadata(segment));
+                let files = segment.files.as_ref().unwrap();
+                assert_eq!(files.len(), 1);
+                assert_eq!(files[0].path, INDEX_FILE_NAME);
+                let store = dataset.object_store_for_index(segment).await.unwrap();
+                let path = dataset
+                    .indice_files_dir(segment)
+                    .unwrap()
+                    .join(segment.uuid.to_string())
+                    .join(INDEX_FILE_NAME);
+                let bytes = store.read_one_all(&path).await.unwrap();
+                assert!(bytes.as_ref().starts_with(b"LPLDIDX\0"));
+                assert_eq!(files[0].size_bytes, bytes.len() as u64);
+                PlaidIndex::read_from_bytes(bytes.as_ref()).unwrap();
+            }
+
+            let old_opened = open_plaid_index(&dataset, &metadata[0]).await.unwrap();
+            let new_opened = open_plaid_index(&dataset, &metadata[1]).await.unwrap();
+            let old_plaid = old_opened
+                .as_any()
+                .downcast_ref::<PlaidVectorIndex>()
+                .unwrap();
+            let new_plaid = new_opened
+                .as_any()
+                .downcast_ref::<PlaidVectorIndex>()
+                .unwrap();
+            assert_eq!(old_plaid.core.centroids(), new_plaid.core.centroids());
+            assert_eq!(
+                old_plaid.core.quantizer().bucket_cutoffs(),
+                new_plaid.core.quantizer().bucket_cutoffs()
+            );
+            assert_eq!(
+                old_plaid.core.quantizer().bucket_weights(),
+                new_plaid.core.quantizer().bucket_weights()
+            );
+            assert_eq!(new_plaid.core.num_documents(), 3);
+            let new_addresses = new_plaid
+                .core
+                .row_addresses()
+                .iter()
+                .copied()
+                .map(RowAddress::from)
+                .collect::<Vec<_>>();
+            assert!(
+                new_addresses
+                    .iter()
+                    .all(|address| address.fragment_id() == 1)
+            );
+            assert_eq!(
+                new_addresses
+                    .iter()
+                    .map(RowAddress::row_offset)
+                    .collect::<Vec<_>>(),
+                vec![0, 2, 3]
+            );
+
+            // Index-only search must open and merge both true PLAID segments.
+            let mut index_only = dataset.scan();
+            index_only.nearest("mv", &query(), 7).unwrap();
+            index_only.project(&["id"]).unwrap();
+            let index_only = index_only.try_into_batch().await.unwrap();
+            assert_eq!(sorted_ids(&index_only), vec![0, 1, 2, 3, 4, 6, 7]);
+
+            // Filtered exact refinement exercises the database prefilter and
+            // raw-vector tail over only the appended segment.
+            let filtered = search_ids(&dataset, Some("id >= 4"), 4).await;
+            assert_eq!(sorted_ids(&filtered), vec![4, 6, 7]);
+
+            drop(old_opened);
+            drop(new_opened);
+            drop(metadata);
+            drop(dataset);
+
+            let session = Arc::new(Session::default());
+            let mut dataset = DatasetBuilder::from_uri(directory.as_ref())
+                .with_session(session)
+                .load()
+                .await
+                .unwrap();
+            let reopened = search_ids(&dataset, None, 7).await;
+            assert_eq!(sorted_ids(&reopened), vec![0, 1, 2, 3, 4, 6, 7]);
+            let reopened_filtered = search_ids(&dataset, Some("id >= 4"), 4).await;
+            assert_eq!(sorted_ids(&reopened_filtered), vec![4, 6, 7]);
+
+            // A second append creates a third immutable segment, while a
+            // repeated append optimize at steady state is a strict no-op.
+            let third = make_batch(
+                vec![8, 9],
+                vec![
+                    vec![[0.95, 0.0, 0.0, 0.0], [0.0, 0.95, 0.0, 0.0]],
+                    vec![[-1.0, 0.0, 0.0, 0.0]],
+                ],
+            );
+            dataset
+                .append(
+                    RecordBatchIterator::new(vec![Ok(third)], schema.clone()),
+                    None,
+                )
+                .await
+                .unwrap();
+            dataset
+                .optimize_indices(&OptimizeOptions::append())
+                .await
+                .unwrap();
+            let before_noop_version = dataset.version().version;
+            let before_noop_metadata = dataset.load_indices_by_name("plaid_idx").await.unwrap();
+            let mut expected_fingerprint = None;
+            for segment in &before_noop_metadata {
+                let fingerprint = load_plaid_trained_model(&dataset, segment)
+                    .await
+                    .unwrap()
+                    .fingerprint();
+                if let Some(expected_fingerprint) = expected_fingerprint.as_ref() {
+                    assert_eq!(&fingerprint, expected_fingerprint);
+                } else {
+                    expected_fingerprint = Some(fingerprint);
+                }
+            }
+            let mut before_noop_uuids = before_noop_metadata
+                .iter()
+                .map(|segment| segment.uuid)
+                .collect::<Vec<_>>();
+            before_noop_uuids.sort_unstable();
+            assert_eq!(before_noop_uuids.len(), 3);
+            dataset
+                .optimize_indices(&OptimizeOptions::append())
+                .await
+                .unwrap();
+            assert_eq!(dataset.version().version, before_noop_version);
+            let mut after_noop_uuids = dataset
+                .load_indices_by_name("plaid_idx")
+                .await
+                .unwrap()
+                .iter()
+                .map(|segment| segment.uuid)
+                .collect::<Vec<_>>();
+            after_noop_uuids.sort_unstable();
+            assert_eq!(after_noop_uuids, before_noop_uuids);
+            let after_second_append = search_ids(&dataset, None, 9).await;
+            assert_eq!(
+                sorted_ids(&after_second_append),
+                vec![0, 1, 2, 3, 4, 6, 7, 8, 9]
+            );
+            drop(dataset);
+            let dataset = DatasetBuilder::from_uri(directory.as_ref())
+                .with_session(Arc::new(Session::default()))
+                .load()
+                .await
+                .unwrap();
+            assert_eq!(
+                sorted_ids(&search_ids(&dataset, None, 9).await),
+                vec![0, 1, 2, 3, 4, 6, 7, 8, 9]
+            );
+            assert_eq!(
+                sorted_ids(&search_ids(&dataset, Some("id >= 8"), 2).await),
+                vec![8, 9]
+            );
+            // Prove the strict no-op does not even read trained model files:
+            // remove every persisted core, reopen with a fresh session (no
+            // index cache), and optimize the fully covered logical index.
+            for segment in &before_noop_metadata {
+                let store = dataset.object_store_for_index(segment).await.unwrap();
+                let path = dataset
+                    .indice_files_dir(segment)
+                    .unwrap()
+                    .join(segment.uuid.to_string())
+                    .join(INDEX_FILE_NAME);
+                store.delete(&path).await.unwrap();
+            }
+            drop(before_noop_metadata);
+            drop(dataset);
+            let mut no_read_dataset = DatasetBuilder::from_uri(directory.as_ref())
+                .with_session(Arc::new(Session::default()))
+                .load()
+                .await
+                .unwrap();
+            let no_read_version = no_read_dataset.version().version;
+            no_read_dataset
+                .optimize_indices(&OptimizeOptions::append())
+                .await
+                .unwrap();
+            assert_eq!(no_read_dataset.version().version, no_read_version);
+            let mut no_read_uuids = no_read_dataset
+                .load_indices_by_name("plaid_idx")
+                .await
+                .unwrap()
+                .iter()
+                .map(|segment| segment.uuid)
+                .collect::<Vec<_>>();
+            no_read_uuids.sort_unstable();
+            assert_eq!(no_read_uuids, before_noop_uuids);
+        }
+    }
+
+    #[tokio::test]
+    async fn plaid_append_delta_indexes_only_live_non_null_documents() {
+        let directory = TempStrDir::default();
+        let first = make_nullable_batch(
+            vec![0, 1, 99],
+            vec![
+                Some(vec![[1.0, 0.0, 0.0, 0.0]]),
+                Some(vec![[0.0, 1.0, 0.0, 0.0]]),
+                None,
+            ],
+        );
+        let schema = first.schema();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(first)], schema),
+            directory.as_ref(),
+            None,
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["mv"],
+                IndexType::Vector,
+                Some("plaid_idx".to_string()),
+                &PlaidIndexParams {
+                    num_centroids: 2,
+                    nbits: 2,
+                    max_iterations: 3,
+                    sample_rate: 4,
+                },
+                false,
+            )
+            .await
+            .unwrap();
+
+        // A fragment containing only null documents is still covered by a
+        // valid empty PLAID segment, so future append calls do not retry it.
+        let all_null = make_nullable_batch(vec![2, 3], vec![None, None]);
+        let all_null_schema = all_null.schema();
+        dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(all_null)], all_null_schema),
+                None,
+            )
+            .await
+            .unwrap();
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+        let metadata = dataset.load_indices_by_name("plaid_idx").await.unwrap();
+        let empty_segment = metadata
+            .iter()
+            .find(|segment| {
+                segment
+                    .fragment_bitmap
+                    .as_ref()
+                    .is_some_and(|bitmap| bitmap.contains(1))
+            })
+            .unwrap();
+        let empty_opened = open_plaid_index(&dataset, empty_segment).await.unwrap();
+        let empty_plaid = empty_opened
+            .as_any()
+            .downcast_ref::<PlaidVectorIndex>()
+            .unwrap();
+        assert_eq!(empty_plaid.core.num_documents(), 0);
+        assert_eq!(sorted_ids(&search_ids(&dataset, None, 2).await), vec![0, 1]);
+        // Empty physical segments have one stable residual decision regardless
+        // of the query gate that the non-empty segment takes.
+        let mut unfiltered = dataset.scan();
+        unfiltered.nearest("mv", &query(), 1).unwrap();
+        unfiltered.project(&["id"]).unwrap();
+        let unfiltered_analyzed = unfiltered.analyze_plan().await.unwrap();
+        for expected in [
+            "plaid_direct_residual_skipped_empty_segments=1",
+            "plaid_legacy_residual_segments=1",
+            "plaid_direct_residual_skipped_unfiltered_segments=1",
+        ] {
+            assert!(
+                unfiltered_analyzed.contains(expected),
+                "missing {expected} in unfiltered empty-segment plan:\n{unfiltered_analyzed}"
+            );
+        }
+
+        let mut explicit_ceiling = dataset.scan();
+        explicit_ceiling.prefilter(true);
+        explicit_ceiling.filter("id >= 0").unwrap();
+        explicit_ceiling.nearest("mv", &query(), 1).unwrap();
+        explicit_ceiling.maximum_nprobes(1);
+        explicit_ceiling.project(&["id"]).unwrap();
+        let explicit_ceiling_analyzed = explicit_ceiling.analyze_plan().await.unwrap();
+        for expected in [
+            "plaid_direct_residual_skipped_empty_segments=1",
+            "plaid_legacy_residual_segments=1",
+            "plaid_direct_residual_skipped_explicit_ceiling_segments=1",
+        ] {
+            assert!(
+                explicit_ceiling_analyzed.contains(expected),
+                "missing {expected} in explicit-ceiling empty-segment plan:\n{explicit_ceiling_analyzed}"
+            );
+        }
+
+        let mut small_exact = dataset.scan();
+        small_exact.prefilter(true);
+        small_exact.filter("id = 0").unwrap();
+        small_exact.nearest("mv", &query(), 2).unwrap();
+        small_exact.project(&["id"]).unwrap();
+        let small_exact_analyzed = small_exact.analyze_plan().await.unwrap();
+        for expected in [
+            "plaid_direct_residual_skipped_empty_segments=1",
+            "plaid_legacy_residual_segments=0",
+            "plaid_direct_residual_small_exact_precedence_queries=1",
+        ] {
+            assert!(
+                small_exact_analyzed.contains(expected),
+                "missing {expected} in small-exact empty-segment plan:\n{small_exact_analyzed}"
+            );
+        }
+
+        // A mixed fragment persists only its non-null document and retains its
+        // physical fragment/offset identity.
+        let mixed = make_nullable_batch(vec![4, 5], vec![Some(vec![[0.9, 0.0, 0.0, 0.0]]), None]);
+        let mixed_schema = mixed.schema();
+        dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(mixed)], mixed_schema),
+                None,
+            )
+            .await
+            .unwrap();
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+        let metadata = dataset.load_indices_by_name("plaid_idx").await.unwrap();
+        let mixed_segment = metadata
+            .iter()
+            .find(|segment| {
+                segment
+                    .fragment_bitmap
+                    .as_ref()
+                    .is_some_and(|bitmap| bitmap.contains(2))
+            })
+            .unwrap();
+        let mixed_opened = open_plaid_index(&dataset, mixed_segment).await.unwrap();
+        let mixed_plaid = mixed_opened
+            .as_any()
+            .downcast_ref::<PlaidVectorIndex>()
+            .unwrap();
+        assert_eq!(mixed_plaid.core.num_documents(), 1);
+        let address = RowAddress::from(mixed_plaid.core.row_addresses()[0]);
+        assert_eq!(address.fragment_id(), 2);
+        assert_eq!(address.row_offset(), 0);
+        assert_eq!(
+            sorted_ids(&search_ids(&dataset, None, 3).await),
+            vec![0, 1, 4]
+        );
+    }
+
+    #[tokio::test]
+    async fn plaid_unsupported_optimize_modes_and_mixed_families_fail_before_mutation() {
+        let directory = TempStrDir::default();
+        let first = make_batch(
+            vec![0, 1, 2, 3],
+            vec![
+                vec![[1.0, 0.0, 0.0, 0.0]],
+                vec![[0.0, 1.0, 0.0, 0.0]],
+                vec![[-1.0, 0.0, 0.0, 0.0]],
+                vec![[0.0, -1.0, 0.0, 0.0]],
+            ],
+        );
+        let schema = first.schema();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(first)], schema.clone()),
+            directory.as_ref(),
+            None,
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["mv"],
+                IndexType::Vector,
+                Some("plaid_idx".to_string()),
+                &PlaidIndexParams {
+                    num_centroids: 2,
+                    nbits: 2,
+                    max_iterations: 3,
+                    sample_rate: 4,
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        let second = make_batch(
+            vec![4, 5],
+            vec![vec![[0.9, 0.0, 0.0, 0.0]], vec![[0.0, 0.9, 0.0, 0.0]]],
+        );
+        dataset
+            .append(RecordBatchIterator::new(vec![Ok(second)], schema), None)
+            .await
+            .unwrap();
+
+        let before_version = dataset.version().version;
+        let before_metadata = dataset.load_indices_by_name("plaid_idx").await.unwrap();
+        assert_eq!(before_metadata.len(), 1);
+        let before_segment = before_metadata[0].clone();
+        let store = dataset
+            .object_store_for_index(&before_segment)
+            .await
+            .unwrap();
+        let path = dataset
+            .indice_files_dir(&before_segment)
+            .unwrap()
+            .join(before_segment.uuid.to_string())
+            .join(INDEX_FILE_NAME);
+        let before_bytes = store.read_one_all(&path).await.unwrap();
+        // Reusable models are accepted only after the persisted metadata and
+        // object are cross-validated as one coherent segment.
+        let mut wrong_bitmap = before_segment.clone();
+        wrong_bitmap.fragment_bitmap = Some(RoaringBitmap::new());
+        let error = load_plaid_trained_model(&dataset, &wrong_bitmap)
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("outside its fragment bitmap"));
+
+        let mut wrong_size = before_segment.clone();
+        wrong_size.files.as_mut().unwrap()[0].size_bytes += 1;
+        let error = load_plaid_trained_model(&dataset, &wrong_size)
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("declares file size"));
+
+        let mut wrong_nbits = before_segment.clone();
+        let mut wrong_nbits_details = wrong_nbits
+            .index_details
+            .as_ref()
+            .unwrap()
+            .to_msg::<VectorIndexDetails>()
+            .unwrap();
+        wrong_nbits_details
+            .runtime_hints
+            .insert(PLAID_NBITS_HINT.to_string(), "4".to_string());
+        wrong_nbits.index_details =
+            Some(Arc::new(ProstAny::from_msg(&wrong_nbits_details).unwrap()));
+        let error = load_plaid_trained_model(&dataset, &wrong_nbits)
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("core uses nbits=2"));
+
+        let mut wrong_fields = before_segment.clone();
+        wrong_fields.fields.clear();
+        let wrong_field_group = vec![&before_segment, &wrong_fields];
+        let error = load_compatible_plaid_models(&dataset, &wrong_field_group)
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("inconsistent segment metadata"));
+        let wrong_dimension_uuid = Uuid::new_v4();
+        let wrong_dimension_quantizer =
+            ResidualQuantizer::try_new(2, vec![-0.1, 0.0, 0.1], vec![0.0; 4]).unwrap();
+        let wrong_dimension_core = PlaidIndex::try_new(
+            Array2::zeros((1, 8)),
+            wrong_dimension_quantizer,
+            Vec::new(),
+            vec![0],
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let wrong_dimension_bytes = wrong_dimension_core.to_bytes().unwrap();
+        let wrong_dimension_path = dataset
+            .indices_dir()
+            .join(wrong_dimension_uuid.to_string())
+            .join(INDEX_FILE_NAME);
+        dataset
+            .object_store
+            .put(&wrong_dimension_path, &wrong_dimension_bytes)
+            .await
+            .unwrap();
+        let mut wrong_dimension = before_segment.clone();
+        wrong_dimension.uuid = wrong_dimension_uuid;
+        wrong_dimension.fragment_bitmap = Some(RoaringBitmap::new());
+        wrong_dimension.files = Some(vec![IndexFile {
+            path: INDEX_FILE_NAME.to_string(),
+            size_bytes: wrong_dimension_bytes.len() as u64,
+        }]);
+        let error = load_plaid_trained_model(&dataset, &wrong_dimension)
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("dimension 8"));
+
+        for (mode, options) in [
+            ("default", OptimizeOptions::default()),
+            ("merge", OptimizeOptions::merge(1)),
+            ("retrain", OptimizeOptions::retrain()),
+        ] {
+            let error = dataset.optimize_indices(&options).await.unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("supports only OptimizeOptions::append"),
+                "unexpected {mode} error: {error}"
+            );
+            assert_eq!(dataset.version().version, before_version, "mode={mode}");
+            let after_metadata = dataset.load_indices_by_name("plaid_idx").await.unwrap();
+            assert_eq!(after_metadata.len(), 1, "mode={mode}");
+            assert_eq!(after_metadata[0].uuid, before_segment.uuid, "mode={mode}");
+            assert_eq!(
+                after_metadata[0].fragment_bitmap, before_segment.fragment_bitmap,
+                "mode={mode}"
+            );
+            let after_bytes = store.read_one_all(&path).await.unwrap();
+            assert_eq!(after_bytes, before_bytes, "mode={mode}");
+        }
+        assert_eq!(
+            dataset
+                .unindexed_fragments("plaid_idx")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // The lower-level maintenance API has the same guard and cannot bypass
+        // Dataset::optimize_indices preflight.
+        let unindexed = dataset.unindexed_fragments("plaid_idx").await.unwrap();
+        let references = vec![&before_segment];
+        let error = crate::index::append::merge_indices_with_unindexed_frags(
+            Arc::new(dataset.clone()),
+            &references,
+            &unindexed,
+            &OptimizeOptions::merge(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("supports only append optimization")
+        );
+
+        let mut generic = before_segment.clone();
+        generic.uuid = Uuid::new_v4();
+        generic.index_details = Some(Arc::new(crate::index::vector_index_details_default()));
+        let mixed = vec![&before_segment, &generic];
+        let error = index_group_is_plaid(&mixed).unwrap_err();
+        assert!(error.to_string().contains("mixes 1 PLAID segment"));
+        let error = crate::index::append::merge_indices_with_unindexed_frags(
+            Arc::new(dataset.clone()),
+            &mixed,
+            &unindexed,
+            &OptimizeOptions::append(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("mixes 1 PLAID segment"));
+        assert_eq!(dataset.version().version, before_version);
+
+        // Even when every metadata entry says PLAID and every file has valid
+        // PLAID magic, independently trained models must not be combined by an
+        // append. Build a valid one-centroid object outside the manifest and
+        // verify model compatibility fails before the append writer is opened.
+        let incompatible_uuid = Uuid::new_v4();
+        let incompatible_params = PlaidIndexParams {
+            num_centroids: 1,
+            nbits: 2,
+            max_iterations: 3,
+            sample_rate: 4,
+        };
+        let incompatible_files = build_plaid_index(
+            &dataset,
+            "mv",
+            incompatible_uuid,
+            &incompatible_params,
+            Arc::new(lance_index::progress::NoopIndexBuildProgress),
+        )
+        .await
+        .unwrap();
+        let mut incompatible = before_segment.clone();
+        incompatible.uuid = incompatible_uuid;
+        incompatible.fragment_bitmap = Some(dataset.fragment_bitmap.as_ref().clone());
+        incompatible.index_details =
+            Some(Arc::new(plaid_index_details(&incompatible_params).unwrap()));
+        incompatible.files = Some(incompatible_files);
+        let incompatible_references = vec![&before_segment, &incompatible];
+        let error = crate::index::append::merge_indices_with_unindexed_frags(
+            Arc::new(dataset.clone()),
+            &incompatible_references,
+            &unindexed,
+            &OptimizeOptions::append(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("incompatible trained models"));
+        assert_eq!(dataset.version().version, before_version);
+        assert_eq!(
+            dataset.load_indices_by_name("plaid_idx").await.unwrap()[0].uuid,
+            before_segment.uuid
+        );
+
+        // A segment whose details claim PLAID but whose object has different
+        // magic is rejected during the pre-write validation pass.
+        let corrupt_uuid = Uuid::new_v4();
+        let corrupt_path = dataset
+            .indices_dir()
+            .join(corrupt_uuid.to_string())
+            .join(INDEX_FILE_NAME);
+        let corrupt_bytes = vec![0_u8; 48];
+        dataset
+            .object_store
+            .put(&corrupt_path, &corrupt_bytes)
+            .await
+            .unwrap();
+        let mut corrupt = before_segment.clone();
+        corrupt.uuid = corrupt_uuid;
+        corrupt.fragment_bitmap = Some(RoaringBitmap::new());
+        corrupt.files = Some(vec![IndexFile {
+            path: INDEX_FILE_NAME.to_string(),
+            size_bytes: corrupt_bytes.len() as u64,
+        }]);
+        let corrupt_references = vec![&before_segment, &corrupt];
+        let error = crate::index::append::merge_indices_with_unindexed_frags(
+            Arc::new(dataset.clone()),
+            &corrupt_references,
+            &unindexed,
+            &OptimizeOptions::append(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("invalid magic bytes"));
+        assert_eq!(dataset.version().version, before_version);
+    }
+
+    #[tokio::test]
+    async fn plaid_decode_preflight_runs_before_any_other_index_writer() {
+        let directory = TempStrDir::default();
+        let first = make_batch(
+            vec![0, 1, 2, 3],
+            vec![
+                vec![[1.0, 0.0, 0.0, 0.0]],
+                vec![[0.0, 1.0, 0.0, 0.0]],
+                vec![[-1.0, 0.0, 0.0, 0.0]],
+                vec![[0.0, -1.0, 0.0, 0.0]],
+            ],
+        );
+        let schema = first.schema();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(first)], schema.clone()),
+            directory.as_ref(),
+            None,
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["mv"],
+                IndexType::Vector,
+                Some("plaid_idx".to_string()),
+                &PlaidIndexParams {
+                    num_centroids: 2,
+                    nbits: 2,
+                    max_iterations: 3,
+                    sample_rate: 4,
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        let scalar_params = lance_index::scalar::ScalarIndexParams::for_builtin(
+            lance_index::scalar::BuiltinIndexType::BTree,
+        );
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_idx".to_string()),
+                &scalar_params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let second = make_batch(
+            vec![4, 5],
+            vec![vec![[0.9, 0.0, 0.0, 0.0]], vec![[0.0, 0.9, 0.0, 0.0]]],
+        );
+        dataset
+            .append(RecordBatchIterator::new(vec![Ok(second)], schema), None)
+            .await
+            .unwrap();
+
+        // Commit a manifest-visible PLAID-labeled segment with invalid bytes.
+        // The scalar index also has unindexed data and would open a writer if
+        // execution started before every PLAID group was decoded.
+        let valid_plaid = dataset.load_indices_by_name("plaid_idx").await.unwrap()[0].clone();
+        let corrupt_uuid = Uuid::new_v4();
+        let corrupt_bytes = vec![0_u8; 48];
+        let corrupt_path = dataset
+            .indices_dir()
+            .join(corrupt_uuid.to_string())
+            .join(INDEX_FILE_NAME);
+        dataset
+            .object_store
+            .put(&corrupt_path, &corrupt_bytes)
+            .await
+            .unwrap();
+        let mut corrupt = valid_plaid;
+        corrupt.uuid = corrupt_uuid;
+        corrupt.fragment_bitmap = Some(RoaringBitmap::new());
+        corrupt.files = Some(vec![IndexFile {
+            path: INDEX_FILE_NAME.to_string(),
+            size_bytes: corrupt_bytes.len() as u64,
+        }]);
+        let transaction = crate::dataset::transaction::Transaction::new(
+            dataset.manifest.version,
+            crate::dataset::transaction::Operation::CreateIndex {
+                new_indices: vec![corrupt],
+                removed_indices: Vec::new(),
+            },
+            None,
+        );
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        let before_version = dataset.version().version;
+        let before_dirs = dataset
+            .object_store
+            .read_dir(dataset.indices_dir())
+            .await
+            .unwrap()
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        let before_scalar = dataset.load_indices_by_name("id_idx").await.unwrap();
+        let error = dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("invalid magic bytes"));
+        assert_eq!(dataset.version().version, before_version);
+        assert_eq!(
+            dataset
+                .object_store
+                .read_dir(dataset.indices_dir())
+                .await
+                .unwrap()
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>(),
+            before_dirs
+        );
+        assert_eq!(
+            dataset.load_indices_by_name("id_idx").await.unwrap(),
+            before_scalar
+        );
+        assert_eq!(
+            dataset.unindexed_fragments("id_idx").await.unwrap().len(),
+            1
         );
     }
 
