@@ -22,7 +22,9 @@ pub use error::{Error, Result};
 pub use format::PlaidFormatVersion;
 pub use index::PlaidIndex;
 pub use maxsim::maxsim_naive;
-pub use search::{PlaidSearchParams, PlaidSearchStats, SearchHit};
+pub use search::{
+    EligibleCentroidDecision, EligibleCentroidPlan, PlaidSearchParams, PlaidSearchStats, SearchHit,
+};
 
 /// On-disk file name used by the first version of the native PLAID format.
 pub const PLAID_DATA_FILE: &str = "plaid.bin";

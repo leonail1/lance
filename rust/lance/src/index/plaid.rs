@@ -33,7 +33,8 @@ use lance_index::vector::{Query, VECTOR_RESULT_SCHEMA, VectorIndex};
 use lance_index::{INDEX_FILE_NAME, Index, IndexParams, IndexType};
 use lance_linalg::distance::DistanceType;
 use lance_plaid::{
-    Eligibility, PlaidIndex, PlaidSearchParams, PlaidSearchStats, ResidualQuantizer,
+    Eligibility, EligibleCentroidDecision, EligibleCentroidPlan, PlaidIndex, PlaidSearchParams,
+    PlaidSearchStats, ResidualQuantizer,
 };
 use lance_select::RowAddrMask;
 use lance_table::format::{IndexFile, IndexMetadata};
@@ -406,6 +407,14 @@ pub(crate) struct PlaidVectorIndex {
     quantizer: FlatQuantizer,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct PlaidCandidatePlan {
+    pub(crate) params: PlaidSearchParams,
+    pub(crate) eligible_documents: usize,
+    pub(crate) maximum_nprobes: usize,
+    pub(crate) eligible_centroids: EligibleCentroidPlan,
+}
+
 impl PlaidVectorIndex {
     fn try_new(core: PlaidIndex) -> Result<Self> {
         let dimension = core.dimension();
@@ -418,18 +427,22 @@ impl PlaidVectorIndex {
         })
     }
 
-    pub(crate) fn candidate_params(
+    pub(crate) fn candidate_plan(
         &self,
         query: &Query,
         requested_candidates: usize,
+        query_tokens: usize,
         mask: &RowAddrMask,
-    ) -> (PlaidSearchParams, usize) {
+    ) -> Result<PlaidCandidatePlan> {
         let probe_ceiling = query
             .maximum_nprobes
             .unwrap_or(self.core.num_centroids())
             .min(self.core.num_centroids())
             .max(1);
         let base_nprobe = query.minimum_nprobes.max(8).min(probe_ceiling).max(1);
+        // This is the same allocation-free segment count required by adaptive
+        // nprobe before eligible-centroid probing. Wide filters stop here and
+        // retain the prior global path without allocating or scanning codes.
         let segment_eligible = mask.iter_addrs().map(|addresses| {
             addresses
                 .map(u64::from)
@@ -452,20 +465,50 @@ impl PlaidVectorIndex {
         let core_residual_candidates = requested_candidates
             .max(PLAID_DEFAULT_DECOMPRESS_DOCUMENTS)
             .min(eligible.max(1));
-        (
-            PlaidSearchParams {
-                n_ivf_probe,
-                n_full_scores: PLAID_DEFAULT_N_FULL_SCORES
-                    .max(core_residual_candidates.saturating_mul(4)),
-                top_k: core_residual_candidates,
-                centroid_score_threshold: None,
-            },
-            eligible,
-        )
-    }
-
-    pub(crate) fn num_centroids(&self) -> usize {
-        self.core.num_centroids()
+        let params = PlaidSearchParams {
+            n_ivf_probe,
+            n_full_scores: PLAID_DEFAULT_N_FULL_SCORES
+                .max(core_residual_candidates.saturating_mul(4)),
+            top_k: core_residual_candidates,
+            centroid_score_threshold: None,
+        };
+        let filtered = !mask.is_select_all();
+        let mut eligible_centroids = self
+            .core
+            .plan_eligible_centroids(None, segment_eligible, filtered, query_tokens, n_ivf_probe)
+            .map_err(plaid_error)?;
+        if filtered
+            && segment_eligible.is_some()
+            && eligible_centroids.decision() == EligibleCentroidDecision::NonEnumerable
+        {
+            // Only a cost-model-eligible narrow allow-list pays for a second
+            // pass that materializes dense ordinals and then scans token codes.
+            let addresses = mask.iter_addrs().ok_or_else(|| {
+                Error::internal(
+                    "PLAID enumerable filter changed while building its centroid plan".to_string(),
+                )
+            })?;
+            let eligible_ordinals = addresses
+                .map(u64::from)
+                .filter_map(|address| self.core.document_ordinal(address))
+                .collect::<Vec<_>>();
+            eligible_centroids = self
+                .core
+                .plan_eligible_centroids(
+                    Some(&eligible_ordinals),
+                    segment_eligible,
+                    filtered,
+                    query_tokens,
+                    n_ivf_probe,
+                )
+                .map_err(plaid_error)?;
+        }
+        Ok(PlaidCandidatePlan {
+            params,
+            eligible_documents: eligible,
+            maximum_nprobes: probe_ceiling,
+            eligible_centroids,
+        })
     }
 
     pub(crate) fn num_documents(&self) -> usize {
@@ -497,11 +540,19 @@ impl PlaidVectorIndex {
     pub(crate) fn search_candidates(
         &self,
         query: ArrayView2<'_, f32>,
-        params: &PlaidSearchParams,
+        plan: &PlaidCandidatePlan,
+        desired_candidates: usize,
         mask: &RowAddrMask,
     ) -> Result<(Vec<lance_plaid::SearchHit>, PlaidSearchStats)> {
         self.core
-            .search(query, params, &MaskEligibility { mask })
+            .search_adaptive(
+                query,
+                &plan.params,
+                plan.maximum_nprobes,
+                desired_candidates,
+                &MaskEligibility { mask },
+                Some(&plan.eligible_centroids),
+            )
             .map_err(plaid_error)
     }
 }
@@ -572,8 +623,17 @@ impl VectorIndex for PlaidVectorIndex {
         let query_tokens = query_to_array(query, self.core.dimension())?;
         pre_filter.wait_for_ready().await?;
         let mask = pre_filter.mask();
-        let (params, _) = self.candidate_params(query, query.k, mask.as_ref());
-        let (hits, stats) = self.search_candidates(query_tokens.view(), &params, mask.as_ref())?;
+        let plan = self.candidate_plan(query, query.k, query_tokens.nrows(), mask.as_ref())?;
+        let desired_candidates = plan
+            .eligible_documents
+            .min(plan.params.top_k)
+            .min(self.num_documents());
+        let (hits, stats) = self.search_candidates(
+            query_tokens.view(),
+            &plan,
+            desired_candidates,
+            mask.as_ref(),
+        )?;
         metrics.record_comparisons(
             usize::try_from(stats.exact_documents)
                 .unwrap_or(usize::MAX)
@@ -1259,6 +1319,203 @@ mod tests {
                 .as_primitive::<arrow::datatypes::Int32Type>()
                 .values()
                 .contains(&2)
+        );
+    }
+
+    #[tokio::test]
+    async fn adaptive_eligible_centroids_preserve_database_semantics_and_report_costs() {
+        const DOCUMENTS: i32 = 512;
+        const FILTERED: i32 = 16;
+        let directory = TempStrDir::default();
+        let documents = (0..DOCUMENTS)
+            .map(|_| {
+                vec![
+                    [1.0, 0.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0, 0.0],
+                    [0.0, 0.0, 1.0, 0.0],
+                    [0.0, 0.0, 0.0, 1.0],
+                ]
+            })
+            .collect::<Vec<_>>();
+        let batch = make_batch((0..DOCUMENTS).collect(), documents);
+        let schema = batch.schema();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            directory.as_ref(),
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["mv"],
+                IndexType::Vector,
+                Some("plaid_idx".to_string()),
+                &PlaidIndexParams {
+                    num_centroids: 4,
+                    nbits: 2,
+                    max_iterations: 3,
+                    sample_rate: 4,
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        let four_token_query = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![
+                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+            ]),
+            4,
+        )
+        .unwrap();
+
+        // F/N = 1/32 and the eligible token scan is safely below the global
+        // posting estimate, so the database-native eligible-centroid path is
+        // selected. Stable row IDs require a row-id-only take, never a raw
+        // vector read in index-only mode.
+        let mut index_only = dataset.scan();
+        index_only.prefilter(true);
+        index_only.filter(&format!("id < {FILTERED}")).unwrap();
+        index_only.nearest("mv", &four_token_query, 10).unwrap();
+        index_only.project(&["id"]).unwrap();
+        let analyzed = index_only.analyze_plan().await.unwrap();
+        assert!(
+            analyzed.contains("plaid_eligible_centroid_enabled_segments=1"),
+            "unexpected analyzed plan:\n{analyzed}"
+        );
+        assert!(
+            analyzed.contains("plaid_eligible_documents=16"),
+            "unexpected analyzed plan:\n{analyzed}"
+        );
+        assert!(
+            analyzed.contains("plaid_eligible_token_codes_scanned=64"),
+            "unexpected analyzed plan:\n{analyzed}"
+        );
+        assert!(
+            analyzed.contains("plaid_probe_rounds=1"),
+            "unexpected analyzed plan:\n{analyzed}"
+        );
+        assert!(
+            analyzed.contains("plaid_probe_retries=0"),
+            "unexpected analyzed plan:\n{analyzed}"
+        );
+        assert!(
+            analyzed.contains("plaid_row_id_only_rows=10"),
+            "unexpected analyzed plan:\n{analyzed}"
+        );
+        assert!(
+            analyzed.contains("plaid_raw_vector_rows=0"),
+            "unexpected analyzed plan:\n{analyzed}"
+        );
+        let indexed = index_only.try_into_batch().await.unwrap();
+        assert_eq!(indexed.num_rows(), 10);
+        assert_eq!(
+            indexed["id"]
+                .as_primitive::<arrow::datatypes::Int32Type>()
+                .values(),
+            &(0..10).collect::<Vec<_>>()
+        );
+
+        // Exact refine=1 shares the same eligible-centroid candidate path and
+        // reads exactly k raw rows. With zero residuals it agrees with a flat
+        // structured-filter MaxSim scan.
+        let mut exact = dataset.scan();
+        exact.prefilter(true);
+        exact.filter(&format!("id < {FILTERED}")).unwrap();
+        exact.nearest("mv", &four_token_query, 10).unwrap();
+        exact.refine(1);
+        exact.project(&["id"]).unwrap();
+        let exact_analyzed = exact.analyze_plan().await.unwrap();
+        assert!(
+            exact_analyzed.contains("plaid_eligible_centroid_enabled_segments=1"),
+            "unexpected analyzed plan:\n{exact_analyzed}"
+        );
+        assert!(
+            exact_analyzed.contains("plaid_raw_vector_rows=10"),
+            "unexpected analyzed plan:\n{exact_analyzed}"
+        );
+        let exact_result = exact.try_into_batch().await.unwrap();
+
+        let mut flat = dataset.scan();
+        flat.use_index(false);
+        flat.filter(&format!("id < {FILTERED}")).unwrap();
+        flat.nearest("mv", &four_token_query, 10).unwrap();
+        flat.project(&["id"]).unwrap();
+        let flat_result = flat.try_into_batch().await.unwrap();
+        assert_eq!(
+            exact_result["id"]
+                .as_primitive::<arrow::datatypes::Int32Type>()
+                .values(),
+            flat_result["id"]
+                .as_primitive::<arrow::datatypes::Int32Type>()
+                .values()
+        );
+
+        // A 50% predicate stays on the prior global probing path and does not
+        // scan any token codes to construct an eligible-centroid bitmap.
+        let mut wide = dataset.scan();
+        wide.prefilter(true);
+        wide.filter("id < 256").unwrap();
+        wide.nearest("mv", &four_token_query, 10).unwrap();
+        wide.project(&["id"]).unwrap();
+        let wide_analyzed = wide.analyze_plan().await.unwrap();
+        assert!(
+            wide_analyzed.contains("plaid_eligible_centroid_skipped_wide_segments=1"),
+            "unexpected analyzed plan:\n{wide_analyzed}"
+        );
+        assert!(
+            wide_analyzed.contains("plaid_eligible_token_codes_scanned=0"),
+            "unexpected analyzed plan:\n{wide_analyzed}"
+        );
+
+        // Deletion visibility is incorporated before dense ordinals and
+        // eligible centroids are built; deleted stable row IDs cannot leak.
+        dataset.delete("id = 0").await.unwrap();
+        let mut after_delete = dataset.scan();
+        after_delete.prefilter(true);
+        after_delete.filter("id < 17").unwrap();
+        after_delete.nearest("mv", &four_token_query, 10).unwrap();
+        after_delete.project(&["id"]).unwrap();
+        let after_delete_analyzed = after_delete.analyze_plan().await.unwrap();
+        assert!(
+            after_delete_analyzed.contains("plaid_eligible_documents=16"),
+            "unexpected analyzed plan:\n{after_delete_analyzed}"
+        );
+        let after_delete = after_delete.try_into_batch().await.unwrap();
+        assert_eq!(after_delete.num_rows(), 10);
+        assert!(
+            !after_delete["id"]
+                .as_primitive::<arrow::datatypes::Int32Type>()
+                .values()
+                .contains(&0)
+        );
+
+        // Filters at or below the requested budget retain the exact fallback;
+        // eligible-centroid construction is intentionally bypassed.
+        let mut fallback = dataset.scan();
+        fallback.prefilter(true);
+        fallback.filter("id < 5").unwrap();
+        fallback.nearest("mv", &four_token_query, 10).unwrap();
+        fallback.project(&["id"]).unwrap();
+        let fallback_analyzed = fallback.analyze_plan().await.unwrap();
+        assert!(
+            fallback_analyzed.contains("plaid_filter_exact_small_filter_fallbacks=1"),
+            "unexpected analyzed plan:\n{fallback_analyzed}"
+        );
+        assert!(
+            fallback_analyzed.contains("plaid_raw_vector_rows=4"),
+            "unexpected analyzed plan:\n{fallback_analyzed}"
+        );
+        let fallback = fallback.try_into_batch().await.unwrap();
+        assert_eq!(fallback.num_rows(), 4);
+        assert!(
+            !fallback["id"]
+                .as_primitive::<arrow::datatypes::Int32Type>()
+                .values()
+                .contains(&0)
         );
     }
 

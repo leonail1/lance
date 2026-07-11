@@ -3,7 +3,8 @@
 
 use approx::assert_abs_diff_eq;
 use lance_plaid::{
-    AddressEligibility, AllEligible, PlaidIndex, PlaidSearchParams, ResidualQuantizer, maxsim_naive,
+    AddressEligibility, AllEligible, EligibleCentroidDecision, PlaidIndex, PlaidSearchParams,
+    ResidualQuantizer, maxsim_naive,
 };
 use ndarray::{Array2, array};
 
@@ -39,6 +40,36 @@ fn exhaustive_params(top_k: usize) -> PlaidSearchParams {
         top_k,
         centroid_score_threshold: None,
     }
+}
+
+fn filter_cost_index(tokens_per_document: usize) -> PlaidIndex {
+    const DOCUMENTS: usize = 128;
+    let quantizer = ResidualQuantizer::try_new(2, vec![-0.1, 0.0, 0.1], vec![0.0; 4]).unwrap();
+    let centroids = array![[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]];
+    let total_tokens = DOCUMENTS * tokens_per_document;
+    let residuals = Array2::<f32>::zeros((total_tokens, 4));
+    let packed_residuals = quantizer.quantize(residuals.view()).unwrap();
+    let mut document_offsets = Vec::with_capacity(DOCUMENTS + 1);
+    let mut token_codes = Vec::with_capacity(total_tokens);
+    document_offsets.push(0);
+    for document in 0..DOCUMENTS {
+        token_codes.extend(std::iter::repeat_n(
+            (document % 2) as u32,
+            tokens_per_document,
+        ));
+        document_offsets.push(token_codes.len() as u64);
+    }
+    PlaidIndex::try_new(
+        centroids,
+        quantizer,
+        (0..DOCUMENTS)
+            .map(|ordinal| 1_000 + ordinal as u64)
+            .collect(),
+        document_offsets,
+        token_codes,
+        packed_residuals,
+    )
+    .unwrap()
 }
 
 #[test]
@@ -104,6 +135,108 @@ fn stable_ties_use_ascending_row_address() {
     assert_eq!(stats.candidate_documents, 3);
     assert_eq!(stats.exact_documents, 2);
     assert!(stats.total_nanos > 0);
+}
+
+#[test]
+fn eligible_centroid_cost_model_enables_only_selective_cheap_filters() {
+    let index = filter_cost_index(1);
+
+    let unfiltered = index
+        .plan_eligible_centroids(None, None, false, 1, 1)
+        .unwrap();
+    assert_eq!(unfiltered.decision(), EligibleCentroidDecision::Unfiltered);
+    assert!(!unfiltered.is_enabled());
+
+    let non_enumerable = index
+        .plan_eligible_centroids(None, None, true, 1, 1)
+        .unwrap();
+    assert_eq!(
+        non_enumerable.decision(),
+        EligibleCentroidDecision::NonEnumerable
+    );
+    assert!(!non_enumerable.is_enabled());
+
+    let empty = index
+        .plan_eligible_centroids(Some(&[]), Some(0), true, 1, 1)
+        .unwrap();
+    assert_eq!(empty.decision(), EligibleCentroidDecision::Empty);
+    assert!(empty.is_enabled());
+
+    let selective = index
+        .plan_eligible_centroids(Some(&[0, 1]), Some(2), true, 1, 1)
+        .unwrap();
+    assert_eq!(selective.decision(), EligibleCentroidDecision::Enabled);
+    assert_eq!(selective.eligible_documents(), 2);
+    assert_eq!(selective.eligible_tokens(), 2);
+    assert_eq!(selective.eligible_token_codes_scanned(), 2);
+    assert_eq!(selective.eligible_centroids(), 2);
+    assert_eq!(selective.estimated_global_postings(), 64);
+
+    let wide_ordinals = (0_u32..5).collect::<Vec<_>>();
+    let wide = index
+        .plan_eligible_centroids(Some(&wide_ordinals), Some(5), true, 1, 1)
+        .unwrap();
+    assert_eq!(wide.decision(), EligibleCentroidDecision::TooWide);
+    assert!(!wide.is_enabled());
+    assert_eq!(wide.eligible_token_codes_scanned(), 0);
+    let wide_count_only = index
+        .plan_eligible_centroids(None, Some(5), true, 1, 1)
+        .unwrap();
+    assert_eq!(
+        wide_count_only.decision(),
+        EligibleCentroidDecision::TooWide
+    );
+    assert_eq!(wide_count_only.eligible_documents(), 5);
+    assert_eq!(wide_count_only.eligible_tokens(), 0);
+
+    let token_heavy = filter_cost_index(16)
+        .plan_eligible_centroids(Some(&[0, 1]), Some(2), true, 1, 1)
+        .unwrap();
+    assert_eq!(
+        token_heavy.decision(),
+        EligibleCentroidDecision::ScanCostTooHigh
+    );
+    assert!(!token_heavy.is_enabled());
+    assert_eq!(token_heavy.eligible_token_codes_scanned(), 0);
+}
+
+#[test]
+fn eligible_centroid_retry_expands_postings_incrementally() {
+    let index = filter_cost_index(1);
+    let query = array![[1.0, 0.0, 0.0, 0.0]];
+    let plan = index
+        .plan_eligible_centroids(Some(&[0, 1]), Some(2), true, 1, 1)
+        .unwrap();
+    let eligibility = AddressEligibility::allow([1_000, 1_001]);
+    let params = PlaidSearchParams {
+        n_ivf_probe: 1,
+        n_full_scores: 128,
+        top_k: 2,
+        centroid_score_threshold: None,
+    };
+    let (incremental, stats) = index
+        .search_adaptive(query.view(), &params, 2, 2, &eligibility, Some(&plan))
+        .unwrap();
+
+    let mut exhaustive = params;
+    exhaustive.n_ivf_probe = 2;
+    let (expected, expected_stats) = index
+        .search(query.view(), &exhaustive, &eligibility)
+        .unwrap();
+    assert_eq!(incremental, expected);
+    assert_eq!(stats.probe_rounds, 2);
+    assert_eq!(stats.probe_retries, 1);
+    assert_eq!(stats.configured_probes, 3);
+    assert_eq!(stats.final_nprobe, 2);
+    assert_eq!(stats.centroids_probed, 2);
+    assert_eq!(stats.incremental_centroids_reused, 1);
+    assert_eq!(stats.posting_entries_read, 128);
+    assert_eq!(stats.posting_entries_eligible, 2);
+    assert_eq!(
+        stats.posting_entries_read,
+        expected_stats.posting_entries_read
+    );
+    assert!(stats.eligible_centroid_selection_nanos > 0);
 }
 
 #[test]

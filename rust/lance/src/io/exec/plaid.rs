@@ -31,6 +31,7 @@ use lance_core::utils::tokio::spawn_cpu;
 use lance_datafusion::utils::ExecutionPlanMetricsSetExt;
 use lance_index::prefilter::PreFilter;
 use lance_index::vector::Query;
+use lance_plaid::{EligibleCentroidDecision, EligibleCentroidPlan};
 use lance_select::{RowAddrMask, RowAddrTreeMap};
 use lance_table::format::IndexMetadata;
 use ndarray::{ArrayView1, ArrayView2};
@@ -47,6 +48,8 @@ use crate::index::plaid::{
 use crate::{Error, Result};
 
 const FILTER_TIME: &str = "plaid_filter_materialization_time";
+const ELIGIBLE_CENTROID_BUILD_TIME: &str = "plaid_eligible_centroid_build_time";
+const ELIGIBLE_CENTROID_SELECTION_TIME: &str = "plaid_eligible_centroid_selection_time";
 const CENTROID_TIME: &str = "plaid_centroid_probe_time";
 const POSTINGS_TIME: &str = "plaid_postings_time";
 const CANDIDATE_TIME: &str = "plaid_candidate_total_time";
@@ -71,7 +74,23 @@ const RAW_VECTOR_ROWS_COUNT: &str = "plaid_raw_vector_rows";
 const INDEX_ONLY_QUERY_COUNT: &str = "plaid_index_only_queries";
 const EXACT_QUERY_COUNT: &str = "plaid_exact_refinement_queries";
 const PROBE_RETRY_COUNT: &str = "plaid_probe_retries";
+const PROBE_ROUND_COUNT: &str = "plaid_probe_rounds";
 const CONFIGURED_PROBES_COUNT: &str = "plaid_configured_probes";
+const FINAL_PROBES_COUNT: &str = "plaid_final_probes";
+const INCREMENTAL_CENTROIDS_REUSED_COUNT: &str = "plaid_incremental_centroids_reused";
+const ELIGIBLE_CENTROID_ENABLED_COUNT: &str = "plaid_eligible_centroid_enabled_segments";
+const ELIGIBLE_CENTROID_EMPTY_COUNT: &str = "plaid_eligible_centroid_empty_segments";
+const ELIGIBLE_CENTROID_UNFILTERED_COUNT: &str =
+    "plaid_eligible_centroid_skipped_unfiltered_segments";
+const ELIGIBLE_CENTROID_NON_ENUMERABLE_COUNT: &str =
+    "plaid_eligible_centroid_skipped_non_enumerable_segments";
+const ELIGIBLE_CENTROID_WIDE_COUNT: &str = "plaid_eligible_centroid_skipped_wide_segments";
+const ELIGIBLE_CENTROID_COST_COUNT: &str = "plaid_eligible_centroid_skipped_cost_segments";
+const ELIGIBLE_DOCUMENTS_COUNT: &str = "plaid_eligible_documents";
+const ELIGIBLE_TOKENS_COUNT: &str = "plaid_eligible_tokens";
+const ELIGIBLE_TOKEN_CODES_SCANNED_COUNT: &str = "plaid_eligible_token_codes_scanned";
+const ELIGIBLE_CENTROIDS_COUNT: &str = "plaid_eligible_centroids";
+const ESTIMATED_GLOBAL_POSTINGS_COUNT: &str = "plaid_estimated_global_postings";
 const CORE_APPROXIMATE_BUDGET_COUNT: &str = "plaid_core_approximate_budget";
 const CORE_RESIDUAL_BUDGET_COUNT: &str = "plaid_core_residual_budget";
 const RAW_REFINEMENT_BUDGET_COUNT: &str = "plaid_raw_refinement_budget";
@@ -319,6 +338,8 @@ struct PlaidExecMetrics {
     baseline: BaselineMetrics,
     index: IndexMetrics,
     filter: Time,
+    eligible_centroid_build: Time,
+    eligible_centroid_selection: Time,
     centroid: Time,
     postings: Time,
     candidate: Time,
@@ -343,7 +364,21 @@ struct PlaidExecMetrics {
     index_only_query_count: Count,
     exact_query_count: Count,
     probe_retry_count: Count,
+    probe_round_count: Count,
     configured_probes_count: Count,
+    final_probes_count: Count,
+    incremental_centroids_reused_count: Count,
+    eligible_centroid_enabled_count: Count,
+    eligible_centroid_empty_count: Count,
+    eligible_centroid_unfiltered_count: Count,
+    eligible_centroid_non_enumerable_count: Count,
+    eligible_centroid_wide_count: Count,
+    eligible_centroid_cost_count: Count,
+    eligible_documents_count: Count,
+    eligible_tokens_count: Count,
+    eligible_token_codes_scanned_count: Count,
+    eligible_centroids_count: Count,
+    estimated_global_postings_count: Count,
     core_approximate_budget_count: Count,
     core_residual_budget_count: Count,
     raw_refinement_budget_count: Count,
@@ -355,6 +390,9 @@ impl PlaidExecMetrics {
             baseline: BaselineMetrics::new(metrics, partition),
             index: IndexMetrics::new(metrics, partition),
             filter: metrics.new_time(FILTER_TIME, partition),
+            eligible_centroid_build: metrics.new_time(ELIGIBLE_CENTROID_BUILD_TIME, partition),
+            eligible_centroid_selection: metrics
+                .new_time(ELIGIBLE_CENTROID_SELECTION_TIME, partition),
             centroid: metrics.new_time(CENTROID_TIME, partition),
             postings: metrics.new_time(POSTINGS_TIME, partition),
             candidate: metrics.new_time(CANDIDATE_TIME, partition),
@@ -381,7 +419,30 @@ impl PlaidExecMetrics {
             index_only_query_count: metrics.new_count(INDEX_ONLY_QUERY_COUNT, partition),
             exact_query_count: metrics.new_count(EXACT_QUERY_COUNT, partition),
             probe_retry_count: metrics.new_count(PROBE_RETRY_COUNT, partition),
+            probe_round_count: metrics.new_count(PROBE_ROUND_COUNT, partition),
             configured_probes_count: metrics.new_count(CONFIGURED_PROBES_COUNT, partition),
+            final_probes_count: metrics.new_count(FINAL_PROBES_COUNT, partition),
+            incremental_centroids_reused_count: metrics
+                .new_count(INCREMENTAL_CENTROIDS_REUSED_COUNT, partition),
+            eligible_centroid_enabled_count: metrics
+                .new_count(ELIGIBLE_CENTROID_ENABLED_COUNT, partition),
+            eligible_centroid_empty_count: metrics
+                .new_count(ELIGIBLE_CENTROID_EMPTY_COUNT, partition),
+            eligible_centroid_unfiltered_count: metrics
+                .new_count(ELIGIBLE_CENTROID_UNFILTERED_COUNT, partition),
+            eligible_centroid_non_enumerable_count: metrics
+                .new_count(ELIGIBLE_CENTROID_NON_ENUMERABLE_COUNT, partition),
+            eligible_centroid_wide_count: metrics
+                .new_count(ELIGIBLE_CENTROID_WIDE_COUNT, partition),
+            eligible_centroid_cost_count: metrics
+                .new_count(ELIGIBLE_CENTROID_COST_COUNT, partition),
+            eligible_documents_count: metrics.new_count(ELIGIBLE_DOCUMENTS_COUNT, partition),
+            eligible_tokens_count: metrics.new_count(ELIGIBLE_TOKENS_COUNT, partition),
+            eligible_token_codes_scanned_count: metrics
+                .new_count(ELIGIBLE_TOKEN_CODES_SCANNED_COUNT, partition),
+            eligible_centroids_count: metrics.new_count(ELIGIBLE_CENTROIDS_COUNT, partition),
+            estimated_global_postings_count: metrics
+                .new_count(ESTIMATED_GLOBAL_POSTINGS_COUNT, partition),
             core_approximate_budget_count: metrics
                 .new_count(CORE_APPROXIMATE_BUDGET_COUNT, partition),
             core_residual_budget_count: metrics.new_count(CORE_RESIDUAL_BUDGET_COUNT, partition),
@@ -398,9 +459,38 @@ impl PlaidExecMetrics {
             .add(mode.raw_refinement_budget());
     }
 
+    fn record_eligible_centroid_plan(&self, plan: &EligibleCentroidPlan) {
+        self.eligible_centroid_build
+            .add_duration(Duration::from_nanos(plan.build_nanos()));
+        self.eligible_documents_count
+            .add(usize::try_from(plan.eligible_documents()).unwrap_or(usize::MAX));
+        self.eligible_tokens_count
+            .add(usize::try_from(plan.eligible_tokens()).unwrap_or(usize::MAX));
+        self.eligible_token_codes_scanned_count
+            .add(usize::try_from(plan.eligible_token_codes_scanned()).unwrap_or(usize::MAX));
+        self.eligible_centroids_count
+            .add(usize::try_from(plan.eligible_centroids()).unwrap_or(usize::MAX));
+        self.estimated_global_postings_count
+            .add(usize::try_from(plan.estimated_global_postings()).unwrap_or(usize::MAX));
+        match plan.decision() {
+            EligibleCentroidDecision::Enabled => self.eligible_centroid_enabled_count.add(1),
+            EligibleCentroidDecision::Empty => self.eligible_centroid_empty_count.add(1),
+            EligibleCentroidDecision::Unfiltered => self.eligible_centroid_unfiltered_count.add(1),
+            EligibleCentroidDecision::NonEnumerable => {
+                self.eligible_centroid_non_enumerable_count.add(1)
+            }
+            EligibleCentroidDecision::TooWide => self.eligible_centroid_wide_count.add(1),
+            EligibleCentroidDecision::ScanCostTooHigh => self.eligible_centroid_cost_count.add(1),
+        }
+    }
+
     fn record_core(&self, stats: &lance_plaid::PlaidSearchStats) {
         self.centroid
             .add_duration(Duration::from_nanos(stats.centroid_probe_nanos));
+        self.eligible_centroid_selection
+            .add_duration(Duration::from_nanos(
+                stats.eligible_centroid_selection_nanos,
+            ));
         self.postings
             .add_duration(Duration::from_nanos(stats.postings_nanos));
         self.approximate
@@ -421,6 +511,16 @@ impl PlaidExecMetrics {
             .add(usize::try_from(stats.approximate_documents).unwrap_or(usize::MAX));
         self.residual_documents_count
             .add(usize::try_from(stats.exact_documents).unwrap_or(usize::MAX));
+        self.probe_retry_count
+            .add(usize::try_from(stats.probe_retries).unwrap_or(usize::MAX));
+        self.probe_round_count
+            .add(usize::try_from(stats.probe_rounds).unwrap_or(usize::MAX));
+        self.configured_probes_count
+            .add(usize::try_from(stats.configured_probes).unwrap_or(usize::MAX));
+        self.final_probes_count
+            .add(usize::try_from(stats.final_nprobe).unwrap_or(usize::MAX));
+        self.incremental_centroids_reused_count
+            .add(usize::try_from(stats.incremental_centroids_reused).unwrap_or(usize::MAX));
     }
 }
 
@@ -468,7 +568,7 @@ async fn execute_search(
         let raw_index = dataset
             .open_vector_index(&query.column, &metadata.uuid, &metrics.index)
             .await?;
-        let plaid = raw_index
+        raw_index
             .as_any()
             .downcast_ref::<PlaidVectorIndex>()
             .ok_or_else(|| {
@@ -478,54 +578,42 @@ async fn execute_search(
         if small_filter_exact {
             continue;
         }
-        let (mut params, segment_eligible) =
-            plaid.candidate_params(&query, requested_candidates, mask.as_ref());
+        let query_for_cpu = query_tokens.clone();
+        let mask_for_cpu = mask.clone();
+        let index_for_cpu = raw_index.clone();
+        let query_settings = query.clone();
+        let (hits, stats, plan) = spawn_cpu(move || {
+            let index = index_for_cpu
+                .as_any()
+                .downcast_ref::<PlaidVectorIndex>()
+                .ok_or_else(|| {
+                    Error::internal("PLAID index downcast failed on CPU worker".to_string())
+                })?;
+            let plan = index.candidate_plan(
+                &query_settings,
+                requested_candidates,
+                query_for_cpu.nrows(),
+                mask_for_cpu.as_ref(),
+            )?;
+            let desired_candidates = plan
+                .eligible_documents
+                .min(plan.params.top_k)
+                .min(index.num_documents());
+            let (hits, stats) = index.search_candidates(
+                query_for_cpu.view(),
+                &plan,
+                desired_candidates,
+                mask_for_cpu.as_ref(),
+            )?;
+            Ok::<_, Error>((hits, stats, plan))
+        })
+        .await?;
         metrics
             .core_approximate_budget_count
-            .add(params.n_full_scores);
-        metrics.core_residual_budget_count.add(params.top_k);
-        let desired_candidates = segment_eligible
-            .min(params.top_k)
-            .min(plaid.num_documents());
-        let max_centroids = query
-            .maximum_nprobes
-            .unwrap_or(plaid.num_centroids())
-            .min(plaid.num_centroids())
-            .max(1);
-        let hits = loop {
-            metrics.configured_probes_count.add(params.n_ivf_probe);
-            let query_for_cpu = query_tokens.clone();
-            let mask_for_cpu = mask.clone();
-            let index_for_cpu = raw_index.clone();
-            let params_for_cpu = params.clone();
-            let (hits, stats) = spawn_cpu(move || {
-                let index = index_for_cpu
-                    .as_any()
-                    .downcast_ref::<PlaidVectorIndex>()
-                    .ok_or_else(|| {
-                        Error::internal("PLAID index downcast failed on CPU worker".to_string())
-                    })?;
-                index.search_candidates(
-                    query_for_cpu.view(),
-                    &params_for_cpu,
-                    mask_for_cpu.as_ref(),
-                )
-            })
-            .await?;
-            metrics.record_core(&stats);
-            if hits.len() >= desired_candidates {
-                break hits;
-            }
-            if params.n_ivf_probe >= max_centroids {
-                break hits;
-            }
-            params.n_ivf_probe = params
-                .n_ivf_probe
-                .saturating_mul(2)
-                .min(max_centroids)
-                .max(1);
-            metrics.probe_retry_count.add(1);
-        };
+            .add(plan.params.n_full_scores);
+        metrics.core_residual_budget_count.add(plan.params.top_k);
+        metrics.record_eligible_centroid_plan(&plan.eligible_centroids);
+        metrics.record_core(&stats);
         for hit in hits {
             candidates
                 .entry(hit.row_address)
