@@ -58,6 +58,9 @@ const SORT_TIME: &str = "plaid_sort_time";
 const TOTAL_TIME: &str = "plaid_total_time";
 const POSTINGS_COUNT: &str = "plaid_posting_entries";
 const CANDIDATE_COUNT: &str = "plaid_candidate_documents";
+const FILTER_EXACT_SMALL_COUNT: &str = "plaid_filter_exact_small_filter_fallbacks";
+const FILTER_EXACT_UNDERFILLED_COUNT: &str = "plaid_filter_exact_underfilled_fallbacks";
+const FILTER_EXACT_DOCUMENTS_COUNT: &str = "plaid_filter_exact_documents";
 const RAW_ROWS_COUNT: &str = "plaid_raw_rows";
 const PROBE_RETRY_COUNT: &str = "plaid_probe_retries";
 const CONFIGURED_PROBES_COUNT: &str = "plaid_configured_probes";
@@ -256,6 +259,9 @@ struct PlaidExecMetrics {
     total: Time,
     postings_count: Count,
     candidate_count: Count,
+    filter_exact_small_count: Count,
+    filter_exact_underfilled_count: Count,
+    filter_exact_documents_count: Count,
     raw_rows_count: Count,
     probe_retry_count: Count,
     configured_probes_count: Count,
@@ -280,6 +286,11 @@ impl PlaidExecMetrics {
             total: metrics.new_time(TOTAL_TIME, partition),
             postings_count: metrics.new_count(POSTINGS_COUNT, partition),
             candidate_count: metrics.new_count(CANDIDATE_COUNT, partition),
+            filter_exact_small_count: metrics.new_count(FILTER_EXACT_SMALL_COUNT, partition),
+            filter_exact_underfilled_count: metrics
+                .new_count(FILTER_EXACT_UNDERFILLED_COUNT, partition),
+            filter_exact_documents_count: metrics
+                .new_count(FILTER_EXACT_DOCUMENTS_COUNT, partition),
             raw_rows_count: metrics.new_count(RAW_ROWS_COUNT, partition),
             probe_retry_count: metrics.new_count(PROBE_RETRY_COUNT, partition),
             configured_probes_count: metrics.new_count(CONFIGURED_PROBES_COUNT, partition),
@@ -306,6 +317,20 @@ impl PlaidExecMetrics {
     }
 }
 
+fn small_filter_exact_fallback(filter_max_len: Option<u64>, requested_candidates: usize) -> bool {
+    filter_max_len
+        .is_some_and(|count| count <= u64::try_from(requested_candidates).unwrap_or(u64::MAX))
+}
+
+fn underfilled_filter_exact_fallback(
+    filtered_query: bool,
+    ann_candidates: usize,
+    top_k: usize,
+    eligible_documents: usize,
+) -> bool {
+    filtered_query && ann_candidates < top_k.min(eligible_documents)
+}
+
 async fn execute_search(
     dataset: Arc<Dataset>,
     indices: Vec<IndexMetadata>,
@@ -328,8 +353,14 @@ async fn execute_search(
     let requested_candidates = query.k.saturating_mul(refine).max(query.k);
     let candidate_limit = requested_candidates.max(PLAID_DEFAULT_DECOMPRESS_DOCUMENTS);
     let mask = plaid_address_mask(dataset.as_ref(), prefilter.mask()).await?;
+    // Proactive exact scoring must stay within the work already requested for
+    // ANN refinement.  This captures very selective filters without turning a
+    // 1% or 10% predicate into an accidental full-filter scan.
+    let small_filter_exact = small_filter_exact_fallback(mask.max_len(), requested_candidates);
+    let filtered_query = !mask.is_select_all();
     let candidate_started = Instant::now();
     let mut candidates = HashMap::<u64, f32>::new();
+    let mut opened_indices = Vec::with_capacity(indices.len());
 
     for metadata in &indices {
         let raw_index = dataset
@@ -341,6 +372,10 @@ async fn execute_search(
             .ok_or_else(|| {
                 Error::internal("persisted PLAID segment opened as another index type".to_string())
             })?;
+        opened_indices.push(raw_index.clone());
+        if small_filter_exact {
+            continue;
+        }
         let (mut params, segment_eligible) =
             plaid.candidate_params(&query, requested_candidates, mask.as_ref());
         metrics.n_full_budget_count.add(params.n_full_scores);
@@ -374,7 +409,14 @@ async fn execute_search(
             })
             .await?;
             metrics.record_core(&stats);
-            if hits.len() >= desired_candidates || params.n_ivf_probe >= max_centroids {
+            if hits.len() >= desired_candidates {
+                break hits;
+            }
+            if params.n_ivf_probe >= max_centroids {
+                if params.centroid_score_threshold.take().is_some() {
+                    metrics.probe_retry_count.add(1);
+                    continue;
+                }
                 break hits;
             }
             params.n_ivf_probe = params
@@ -396,17 +438,68 @@ async fn execute_search(
                 .or_insert(hit.score);
         }
     }
+    let collect_eligible_addresses = || -> Result<Vec<u64>> {
+        let mut addresses = Vec::new();
+        for raw_index in &opened_indices {
+            let plaid = raw_index
+                .as_any()
+                .downcast_ref::<PlaidVectorIndex>()
+                .ok_or_else(|| {
+                    Error::internal(
+                        "PLAID index downcast failed during exact filter fallback".to_string(),
+                    )
+                })?;
+            addresses.extend(plaid.eligible_row_addresses(mask.as_ref()));
+        }
+        addresses.sort_unstable();
+        addresses.dedup();
+        Ok(addresses)
+    };
+    let mut exact_addresses = None;
+    if small_filter_exact {
+        exact_addresses = Some(collect_eligible_addresses()?);
+    } else if filtered_query && candidates.len() < query.k {
+        // Larger filters remain on the ANN path unless it cannot produce
+        // min(k, eligible) rows. Only then pay O(F) I/O and exact MaxSim work
+        // to preserve database top-k completeness.
+        let eligible_addresses = collect_eligible_addresses()?;
+        if underfilled_filter_exact_fallback(
+            filtered_query,
+            candidates.len(),
+            query.k,
+            eligible_addresses.len(),
+        ) {
+            exact_addresses = Some(eligible_addresses);
+        }
+    }
+    let exact_fallback = exact_addresses.is_some();
+    if let Some(addresses) = exact_addresses {
+        candidates.clear();
+        for row_address in addresses {
+            candidates.insert(row_address, 0.0);
+        }
+        if small_filter_exact {
+            metrics.filter_exact_small_count.add(1);
+        } else {
+            metrics.filter_exact_underfilled_count.add(1);
+        }
+        metrics.filter_exact_documents_count.add(candidates.len());
+    }
     metrics.candidate.add_duration(candidate_started.elapsed());
 
     let sort_started = Instant::now();
     let mut candidates = candidates.into_iter().collect::<Vec<_>>();
-    candidates.sort_unstable_by(|left, right| {
-        right
-            .1
-            .total_cmp(&left.1)
-            .then_with(|| left.0.cmp(&right.0))
-    });
-    candidates.truncate(candidate_limit.min(candidates.len()));
+    if exact_fallback {
+        candidates.sort_unstable_by_key(|(row_address, _)| *row_address);
+    } else {
+        candidates.sort_unstable_by(|left, right| {
+            right
+                .1
+                .total_cmp(&left.1)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        candidates.truncate(candidate_limit.min(candidates.len()));
+    }
     metrics.sort.add_duration(sort_started.elapsed());
 
     if candidates.is_empty() {
@@ -593,6 +686,21 @@ mod tests {
     use lance_arrow::FixedSizeListArrayExt;
     use lance_linalg::distance::{DistanceType, multivec_distance};
     use ndarray::array;
+
+    #[test]
+    fn exact_filter_fallback_policy_tracks_budget_and_true_underfill() {
+        assert!(small_filter_exact_fallback(Some(10), 50));
+        assert!(small_filter_exact_fallback(Some(50), 50));
+        assert!(!small_filter_exact_fallback(Some(51), 50));
+        assert!(!small_filter_exact_fallback(Some(1_000), 50));
+        assert!(!small_filter_exact_fallback(None, 50));
+
+        assert!(underfilled_filter_exact_fallback(true, 3, 10, 10));
+        assert!(underfilled_filter_exact_fallback(true, 4, 10, 5));
+        assert!(!underfilled_filter_exact_fallback(true, 5, 10, 5));
+        assert!(!underfilled_filter_exact_fallback(true, 10, 10, 100));
+        assert!(!underfilled_filter_exact_fallback(false, 3, 10, 10));
+    }
 
     #[test]
     fn exact_scores_equal_multivec_dot_distance() {

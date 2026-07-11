@@ -468,6 +468,28 @@ impl PlaidVectorIndex {
         self.core.num_documents()
     }
 
+    /// Returns every indexed physical row address selected by `mask`.
+    ///
+    /// Allow lists are normally much smaller than the index, so probe them with
+    /// the index's binary-search address lookup. Block lists cannot be
+    /// enumerated directly and instead require one linear pass over this
+    /// segment's dense address array.
+    pub(crate) fn eligible_row_addresses(&self, mask: &RowAddrMask) -> Vec<u64> {
+        if let Some(addresses) = mask.iter_addrs() {
+            addresses
+                .map(u64::from)
+                .filter(|address| self.core.document_ordinal(*address).is_some())
+                .collect()
+        } else {
+            self.core
+                .row_addresses()
+                .iter()
+                .copied()
+                .filter(|address| mask.selected(*address))
+                .collect()
+        }
+    }
+
     pub(crate) fn search_candidates(
         &self,
         query: ArrayView2<'_, f32>,
@@ -1005,6 +1027,53 @@ mod tests {
             .await
             .unwrap();
 
+        // With one fixed probe, the positive centroid cannot discover the
+        // negative document.  The small-filter exact path must still return
+        // every visible row selected by the structured filter.
+        let single_token_query = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![1.0, 0.0, 0.0, 0.0]),
+            4,
+        )
+        .unwrap();
+        let mut filtered_scanner = dataset.scan();
+        filtered_scanner.prefilter(true);
+        filtered_scanner.filter("id IN (0, 1, 2, 3)").unwrap();
+        filtered_scanner
+            .nearest("mv", &single_token_query, 4)
+            .unwrap();
+        filtered_scanner.nprobes(1);
+        filtered_scanner.project(&["id"]).unwrap();
+        let filtered = filtered_scanner.try_into_batch().await.unwrap();
+        assert_eq!(filtered.num_rows(), 4);
+        let distances = filtered[DIST_COL].as_primitive::<Float32Type>();
+        for (actual, expected) in distances.values().iter().zip([0.0_f32, 0.2, 0.3, 1.0]) {
+            assert!((*actual - expected).abs() < 1.0e-5);
+        }
+        let mut filtered_ids = filtered["id"]
+            .as_primitive::<arrow::datatypes::Int32Type>()
+            .values()
+            .to_vec();
+        filtered_ids.sort_unstable();
+        assert_eq!(filtered_ids, &[0, 1, 2, 3]);
+
+        let mut analyzed_scanner = dataset.scan();
+        analyzed_scanner.prefilter(true);
+        analyzed_scanner.filter("id IN (0, 1, 2, 3)").unwrap();
+        analyzed_scanner
+            .nearest("mv", &single_token_query, 4)
+            .unwrap();
+        analyzed_scanner.nprobes(1);
+        analyzed_scanner.project(&["id"]).unwrap();
+        let analyzed = analyzed_scanner.analyze_plan().await.unwrap();
+        assert!(
+            analyzed.contains("plaid_filter_exact_small_filter_fallbacks=1"),
+            "unexpected analyzed plan:\n{analyzed}"
+        );
+        assert!(
+            analyzed.contains("plaid_filter_exact_documents=4"),
+            "unexpected analyzed plan:\n{analyzed}"
+        );
+
         let second_fragment = search_ids(&dataset, Some("id = 2"), 1).await;
         assert_eq!(
             second_fragment["id"]
@@ -1013,7 +1082,26 @@ mod tests {
             &[2]
         );
         dataset.delete("id = 2").await.unwrap();
+
+        let mut filtered_after_delete = dataset.scan();
+        filtered_after_delete.prefilter(true);
+        filtered_after_delete.filter("id IN (0, 1, 2, 3)").unwrap();
+        filtered_after_delete
+            .nearest("mv", &single_token_query, 4)
+            .unwrap();
+        filtered_after_delete.nprobes(1);
+        filtered_after_delete.project(&["id"]).unwrap();
+        let filtered_after_delete = filtered_after_delete.try_into_batch().await.unwrap();
+        assert_eq!(filtered_after_delete.num_rows(), 3);
+        let mut filtered_ids = filtered_after_delete["id"]
+            .as_primitive::<arrow::datatypes::Int32Type>()
+            .values()
+            .to_vec();
+        filtered_ids.sort_unstable();
+        assert_eq!(filtered_ids, &[0, 1, 3]);
+
         let after_delete = search_ids(&dataset, None, 4).await;
+        assert_eq!(after_delete.num_rows(), 3);
         assert!(
             !after_delete["id"]
                 .as_primitive::<arrow::datatypes::Int32Type>()
