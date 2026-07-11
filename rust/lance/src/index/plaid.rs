@@ -62,6 +62,25 @@ const PLAID_TRAINING_SEED: u64 = 42;
 pub(crate) const PLAID_DEFAULT_N_FULL_SCORES: usize = 4096;
 pub(crate) const PLAID_DEFAULT_DECOMPRESS_DOCUMENTS: usize = 1024;
 
+/// Constructs the candidate budgets shared by the legacy and direct query
+/// paths. Keeping this pure makes it possible for the direct gate to prove
+/// that the legacy approximate and residual stages would not truncate F.
+pub(crate) fn plaid_search_params(
+    requested_candidates: usize,
+    eligible_documents: usize,
+    n_ivf_probe: usize,
+) -> PlaidSearchParams {
+    let core_residual_candidates = requested_candidates
+        .max(PLAID_DEFAULT_DECOMPRESS_DOCUMENTS)
+        .min(eligible_documents.max(1));
+    PlaidSearchParams {
+        n_ivf_probe,
+        n_full_scores: PLAID_DEFAULT_N_FULL_SCORES.max(core_residual_candidates.saturating_mul(4)),
+        top_k: core_residual_candidates,
+        centroid_score_threshold: None,
+    }
+}
+
 /// Build parameters for the database-native CPU PLAID index.
 #[derive(Clone, Debug)]
 pub struct PlaidIndexParams {
@@ -419,6 +438,41 @@ pub(crate) struct PlaidCandidatePlan {
     pub(crate) total_plan_nanos: u64,
 }
 
+pub(crate) enum BoundedEligibleOrdinals {
+    NonEnumerable,
+    WithinLimit(Vec<u32>),
+    OverLimit,
+}
+
+fn collect_bounded_document_ordinals(
+    addresses: impl Iterator<Item = u64>,
+    max_documents: usize,
+    mut resolve: impl FnMut(u64) -> Option<u32>,
+) -> BoundedEligibleOrdinals {
+    let mut ordinals = Vec::new();
+    let mut previous = None;
+    for address in addresses {
+        let Some(ordinal) = resolve(address) else {
+            continue;
+        };
+        // RowAddrTreeMap is a set backed by ordered BTreeMap/Roaring iterators,
+        // and PLAID row addresses are persisted strictly increasing. Their
+        // address-to-ordinal mapping is therefore also sorted and unique, so no
+        // O(F log F) sort/dedup pass is necessary here.
+        debug_assert!(previous.is_none_or(|previous| previous < ordinal));
+        if ordinals.len() == max_documents {
+            // We resolved at most max_documents + 1 matching rows from this
+            // segment and never allocate the over-limit row. The enclosing
+            // global mask iterator may still advance past addresses belonging
+            // to other segments before finding those matching rows.
+            return BoundedEligibleOrdinals::OverLimit;
+        }
+        previous = Some(ordinal);
+        ordinals.push(ordinal);
+    }
+    BoundedEligibleOrdinals::WithinLimit(ordinals)
+}
+
 impl PlaidVectorIndex {
     fn try_new(core: PlaidIndex) -> Result<Self> {
         let dimension = core.dimension();
@@ -467,16 +521,7 @@ impl PlaidVectorIndex {
         // The storage-independent core may residual-rerank a wider set than
         // the database layer will raw-refine.  These are quantized residual
         // candidates, not raw-vector fetches.
-        let core_residual_candidates = requested_candidates
-            .max(PLAID_DEFAULT_DECOMPRESS_DOCUMENTS)
-            .min(eligible.max(1));
-        let params = PlaidSearchParams {
-            n_ivf_probe,
-            n_full_scores: PLAID_DEFAULT_N_FULL_SCORES
-                .max(core_residual_candidates.saturating_mul(4)),
-            top_k: core_residual_candidates,
-            centroid_score_threshold: None,
-        };
+        let params = plaid_search_params(requested_candidates, eligible, n_ivf_probe);
         let filtered = !mask.is_select_all();
         let mut eligible_centroids = self
             .core
@@ -515,6 +560,37 @@ impl PlaidVectorIndex {
             eligible_centroids,
             total_plan_nanos: u64::try_from(plan_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
         })
+    }
+
+    /// Maps an exact enumerable mask to at most `max_documents` sorted, unique
+    /// ordinals for this segment. Wide masks stop on the first over-limit row
+    /// matching this segment instead of fully allocating and sorting F before
+    /// returning to the legacy path. A global mask can contain additional
+    /// addresses owned by other segments, which do not count toward this cap.
+    pub(crate) fn bounded_eligible_document_ordinals(
+        &self,
+        mask: &RowAddrMask,
+        max_documents: usize,
+    ) -> BoundedEligibleOrdinals {
+        let Some(addresses) = mask.iter_addrs() else {
+            return BoundedEligibleOrdinals::NonEnumerable;
+        };
+        collect_bounded_document_ordinals(addresses.map(u64::from), max_documents, |address| {
+            self.core.document_ordinal(address)
+        })
+    }
+
+    /// Directly residual-scores an exact ordinal set. `None` means at least
+    /// one selected document is empty and the caller must use the legacy
+    /// posting semantics instead.
+    pub(crate) fn search_quantized_residuals(
+        &self,
+        query: ArrayView2<'_, f32>,
+        document_ordinals: &[u32],
+    ) -> Result<Option<(Vec<lance_plaid::SearchHit>, PlaidSearchStats)>> {
+        self.core
+            .search_quantized_residuals(query, document_ordinals)
+            .map_err(plaid_error)
     }
 
     pub(crate) fn num_documents(&self) -> usize {
@@ -1041,6 +1117,42 @@ mod tests {
     }
 
     #[test]
+    fn bounded_direct_ordinal_collection_stops_at_cap_plus_one() {
+        let visited = std::cell::Cell::new(0_usize);
+        let outcome = collect_bounded_document_ordinals(
+            (0_u64..10_000).inspect(|_| visited.set(visited.get() + 1)),
+            3,
+            |address| Some(address as u32),
+        );
+        assert!(matches!(outcome, BoundedEligibleOrdinals::OverLimit));
+        assert_eq!(visited.get(), 4);
+
+        let visited = std::cell::Cell::new(0_usize);
+        let outcome = collect_bounded_document_ordinals(
+            (0_u64..10_000).inspect(|_| visited.set(visited.get() + 1)),
+            0,
+            |address| Some(address as u32),
+        );
+        assert!(matches!(outcome, BoundedEligibleOrdinals::OverLimit));
+        assert_eq!(visited.get(), 1);
+
+        let outcome =
+            collect_bounded_document_ordinals([10_u64, 20, 30].into_iter(), 3, |address| {
+                Some((address / 10) as u32)
+            });
+        let BoundedEligibleOrdinals::WithinLimit(ordinals) = outcome else {
+            panic!("three rows at the cap should remain eligible");
+        };
+        assert_eq!(ordinals, vec![1, 2, 3]);
+
+        let outcome = collect_bounded_document_ordinals([].into_iter(), 3, |_| Some(0));
+        let BoundedEligibleOrdinals::WithinLimit(ordinals) = outcome else {
+            panic!("an empty segment-local result must remain independently empty");
+        };
+        assert!(ordinals.is_empty());
+    }
+
+    #[test]
     fn pooled_token_residual_uses_raw_next_plaid_semantics() {
         let token = [0.5_f32, 0.0, 0.0, 0.0];
         let centroid = [1.0_f32, 0.0, 0.0, 0.0];
@@ -1330,6 +1442,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_residual_empty_document_falls_back_to_legacy() {
+        let directory = TempStrDir::default();
+        let batch = make_batch(
+            vec![0, 1, 2, 3],
+            vec![
+                vec![[1.0, 0.0, 0.0, 0.0]],
+                Vec::new(),
+                vec![[0.0, 1.0, 0.0, 0.0]],
+                vec![[-1.0, 0.0, 0.0, 0.0]],
+            ],
+        );
+        let schema = batch.schema();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            directory.as_ref(),
+            None,
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["mv"],
+                IndexType::Vector,
+                Some("plaid_idx".to_string()),
+                &PlaidIndexParams {
+                    num_centroids: 2,
+                    nbits: 2,
+                    max_iterations: 3,
+                    sample_rate: 4,
+                },
+                false,
+            )
+            .await
+            .unwrap();
+
+        let mut scanner = dataset.scan();
+        scanner.prefilter(true);
+        scanner.filter("id >= 0").unwrap();
+        scanner.nearest("mv", &query(), 1).unwrap();
+        scanner.project(&["id"]).unwrap();
+        let analyzed = scanner.analyze_plan().await.unwrap();
+        for expected in [
+            "plaid_direct_residual_queries=0",
+            "plaid_legacy_residual_queries=1",
+            "plaid_legacy_residual_segments=1",
+            "plaid_direct_residual_skipped_empty_tokens_segments=1",
+            "plaid_direct_residual_time",
+        ] {
+            assert!(
+                analyzed.contains(expected),
+                "missing {expected} in empty-token analyzed plan:\n{analyzed}"
+            );
+        }
+        assert!(
+            !analyzed.contains("plaid_direct_residual_time=1ns"),
+            "empty-token direct attempt time was not recorded:\n{analyzed}"
+        );
+        let result = scanner.try_into_batch().await.unwrap();
+        assert_eq!(result.num_rows(), 1);
+        assert_eq!(
+            result["id"]
+                .as_primitive::<arrow::datatypes::Int32Type>()
+                .values(),
+            &[0]
+        );
+    }
+
+    #[tokio::test]
     async fn adaptive_eligible_centroids_preserve_database_semantics_and_report_costs() {
         const DOCUMENTS: i32 = 512;
         const FILTERED: i32 = 16;
@@ -1379,14 +1559,67 @@ mod tests {
         )
         .unwrap();
 
+        // With no explicit probe ceiling, all 16 enumerable rows fit the
+        // direct quantized-residual hard cap. The shortcut must bypass every
+        // centroid/posting/approximate phase while retaining stable-row-ID
+        // projection and deterministic top-k semantics.
+        let mut direct = dataset.scan();
+        direct.prefilter(true);
+        direct.filter(&format!("id < {FILTERED}")).unwrap();
+        direct.nearest("mv", &four_token_query, 10).unwrap();
+        direct.project(&["id"]).unwrap();
+        let direct_plan = direct.explain_plan(false).await.unwrap();
+        assert!(
+            direct_plan.contains("direct_residual_mode=enabled"),
+            "unexpected direct plan:\n{direct_plan}"
+        );
+        assert!(
+            direct_plan.contains("direct_residual_max_documents=1024"),
+            "unexpected direct plan:\n{direct_plan}"
+        );
+        let direct_analyzed = direct.analyze_plan().await.unwrap();
+        for expected in [
+            "plaid_direct_residual_queries=1",
+            "plaid_direct_residual_segments=1",
+            "plaid_direct_residual_documents=16",
+            "plaid_legacy_residual_queries=0",
+            "plaid_legacy_residual_segments=0",
+            "plaid_centroids_probed=0",
+            "plaid_posting_entries=0",
+            "plaid_approximate_documents=0",
+            "plaid_candidate_documents=16",
+            "plaid_residual_documents=16",
+            "plaid_row_id_only_rows=10",
+            "plaid_raw_vector_rows=0",
+            "plaid_direct_residual_time",
+        ] {
+            assert!(
+                direct_analyzed.contains(expected),
+                "missing {expected} in direct analyzed plan:\n{direct_analyzed}"
+            );
+        }
+        assert!(
+            !direct_analyzed.contains("plaid_direct_residual_time=1ns"),
+            "direct attempt time was not recorded:\n{direct_analyzed}"
+        );
+        let direct_indexed = direct.try_into_batch().await.unwrap();
+        assert_eq!(direct_indexed.num_rows(), 10);
+        assert_eq!(
+            direct_indexed["id"]
+                .as_primitive::<arrow::datatypes::Int32Type>()
+                .values(),
+            &(0..10).collect::<Vec<_>>()
+        );
+
         // F/N = 1/32 and the eligible token scan is safely below the global
         // posting estimate, so the database-native eligible-centroid path is
-        // selected. Stable row IDs require a row-id-only take, never a raw
-        // vector read in index-only mode.
+        // selected when an explicit all-centroid ceiling forces legacy. Stable
+        // row IDs require a row-id-only take, never a raw vector read.
         let mut index_only = dataset.scan();
         index_only.prefilter(true);
         index_only.filter(&format!("id < {FILTERED}")).unwrap();
         index_only.nearest("mv", &four_token_query, 10).unwrap();
+        index_only.maximum_nprobes(4);
         index_only.project(&["id"]).unwrap();
         let analyzed = index_only.analyze_plan().await.unwrap();
         assert!(
@@ -1422,6 +1655,10 @@ mod tests {
             "unexpected analyzed plan:\n{analyzed}"
         );
         assert!(
+            analyzed.contains("plaid_direct_residual_skipped_explicit_ceiling_segments=1"),
+            "unexpected analyzed plan:\n{analyzed}"
+        );
+        assert!(
             analyzed.contains("plaid_row_id_only_rows=10"),
             "unexpected analyzed plan:\n{analyzed}"
         );
@@ -1438,6 +1675,79 @@ mod tests {
             &(0..10).collect::<Vec<_>>()
         );
 
+        // refine=5 requests 50 raw candidates while F=64. The direct path may
+        // skip only candidate generation: it must still feed the same ordered
+        // 50-address budget to the existing raw Take/exact MaxSim tail.
+        let refined = |maximum_nprobes: Option<usize>| {
+            let mut scanner = dataset.scan();
+            scanner.prefilter(true);
+            scanner.filter("id < 64").unwrap();
+            scanner.nearest("mv", &four_token_query, 10).unwrap();
+            scanner.refine(5);
+            if let Some(maximum_nprobes) = maximum_nprobes {
+                scanner.maximum_nprobes(maximum_nprobes);
+            }
+            scanner.project(&["id"]).unwrap();
+            scanner
+        };
+        let refined_direct = refined(None);
+        let refined_direct_analyzed = refined_direct.analyze_plan().await.unwrap();
+        for expected in [
+            "plaid_direct_residual_queries=1",
+            "plaid_direct_residual_segments=1",
+            "plaid_direct_residual_documents=64",
+            "plaid_legacy_residual_segments=0",
+            "plaid_approximate_documents=0",
+            "plaid_candidate_documents=64",
+            "plaid_residual_documents=64",
+            "plaid_raw_refinement_budget=50",
+            "plaid_raw_vector_rows=50",
+        ] {
+            assert!(
+                refined_direct_analyzed.contains(expected),
+                "missing {expected} in refined direct plan:\n{refined_direct_analyzed}"
+            );
+        }
+        let refined_direct = refined_direct.try_into_batch().await.unwrap();
+
+        let refined_legacy = refined(Some(4));
+        let refined_legacy_analyzed = refined_legacy.analyze_plan().await.unwrap();
+        for expected in [
+            "plaid_direct_residual_queries=0",
+            "plaid_legacy_residual_queries=1",
+            "plaid_direct_residual_skipped_explicit_ceiling_segments=1",
+            "plaid_raw_refinement_budget=50",
+            "plaid_raw_vector_rows=50",
+        ] {
+            assert!(
+                refined_legacy_analyzed.contains(expected),
+                "missing {expected} in refined legacy plan:\n{refined_legacy_analyzed}"
+            );
+        }
+        let refined_legacy = refined_legacy.try_into_batch().await.unwrap();
+        assert_eq!(
+            refined_direct["id"]
+                .as_primitive::<arrow::datatypes::Int32Type>()
+                .values(),
+            refined_legacy["id"]
+                .as_primitive::<arrow::datatypes::Int32Type>()
+                .values()
+        );
+        assert_eq!(
+            refined_direct[DIST_COL]
+                .as_primitive::<Float32Type>()
+                .values()
+                .iter()
+                .map(|distance| distance.to_bits())
+                .collect::<Vec<_>>(),
+            refined_legacy[DIST_COL]
+                .as_primitive::<Float32Type>()
+                .values()
+                .iter()
+                .map(|distance| distance.to_bits())
+                .collect::<Vec<_>>()
+        );
+
         // Exact refine=1 shares the same eligible-centroid candidate path and
         // reads exactly k raw rows. With zero residuals it agrees with a flat
         // structured-filter MaxSim scan.
@@ -1445,6 +1755,7 @@ mod tests {
         exact.prefilter(true);
         exact.filter(&format!("id < {FILTERED}")).unwrap();
         exact.nearest("mv", &four_token_query, 10).unwrap();
+        exact.maximum_nprobes(4);
         exact.refine(1);
         exact.project(&["id"]).unwrap();
         let exact_analyzed = exact.analyze_plan().await.unwrap();
@@ -1479,6 +1790,7 @@ mod tests {
         wide.prefilter(true);
         wide.filter("id < 256").unwrap();
         wide.nearest("mv", &four_token_query, 10).unwrap();
+        wide.maximum_nprobes(4);
         wide.project(&["id"]).unwrap();
         let wide_analyzed = wide.analyze_plan().await.unwrap();
         assert!(
@@ -1497,6 +1809,7 @@ mod tests {
         after_delete.prefilter(true);
         after_delete.filter("id < 17").unwrap();
         after_delete.nearest("mv", &four_token_query, 10).unwrap();
+        after_delete.maximum_nprobes(4);
         after_delete.project(&["id"]).unwrap();
         let after_delete_analyzed = after_delete.analyze_plan().await.unwrap();
         assert!(
@@ -1512,6 +1825,57 @@ mod tests {
                 .contains(&0)
         );
 
+        let mut direct_after_delete = dataset.scan();
+        direct_after_delete.prefilter(true);
+        direct_after_delete.filter("id < 17").unwrap();
+        direct_after_delete
+            .nearest("mv", &four_token_query, 10)
+            .unwrap();
+        direct_after_delete.project(&["id"]).unwrap();
+        let direct_after_delete_analyzed = direct_after_delete.analyze_plan().await.unwrap();
+        for expected in [
+            "plaid_direct_residual_queries=1",
+            "plaid_direct_residual_segments=1",
+            "plaid_direct_residual_documents=16",
+            "plaid_legacy_residual_segments=0",
+            "plaid_candidate_documents=16",
+            "plaid_residual_documents=16",
+        ] {
+            assert!(
+                direct_after_delete_analyzed.contains(expected),
+                "missing {expected} after deletion:\n{direct_after_delete_analyzed}"
+            );
+        }
+        let direct_after_delete = direct_after_delete.try_into_batch().await.unwrap();
+        assert!(
+            !direct_after_delete["id"]
+                .as_primitive::<arrow::datatypes::Int32Type>()
+                .values()
+                .contains(&0)
+        );
+        assert_eq!(
+            direct_after_delete["id"]
+                .as_primitive::<arrow::datatypes::Int32Type>()
+                .values(),
+            after_delete["id"]
+                .as_primitive::<arrow::datatypes::Int32Type>()
+                .values()
+        );
+        assert_eq!(
+            direct_after_delete[DIST_COL]
+                .as_primitive::<Float32Type>()
+                .values()
+                .iter()
+                .map(|distance| distance.to_bits())
+                .collect::<Vec<_>>(),
+            after_delete[DIST_COL]
+                .as_primitive::<Float32Type>()
+                .values()
+                .iter()
+                .map(|distance| distance.to_bits())
+                .collect::<Vec<_>>()
+        );
+
         // Filters at or below the requested budget retain the exact fallback;
         // eligible-centroid construction is intentionally bypassed.
         let mut fallback = dataset.scan();
@@ -1522,6 +1886,10 @@ mod tests {
         let fallback_analyzed = fallback.analyze_plan().await.unwrap();
         assert!(
             fallback_analyzed.contains("plaid_filter_exact_small_filter_fallbacks=1"),
+            "unexpected analyzed plan:\n{fallback_analyzed}"
+        );
+        assert!(
+            fallback_analyzed.contains("plaid_direct_residual_small_exact_precedence_queries=1"),
             "unexpected analyzed plan:\n{fallback_analyzed}"
         );
         assert!(

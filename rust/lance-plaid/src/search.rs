@@ -302,6 +302,77 @@ impl PlaidIndex {
         Ok(plan)
     }
 
+    /// Scores an exact, sorted set of document ordinals directly with the
+    /// quantized-residual MaxSim kernel.
+    ///
+    /// This is equivalent to the tail of [`Self::search_adaptive`] only when
+    /// its caller has already proved that the legacy pipeline would retain and
+    /// residual-score every supplied document. Returning `None` for an empty
+    /// document lets database adapters conservatively fall back to that legacy
+    /// pipeline: empty documents have no posting and are therefore not normal
+    /// PLAID candidates.
+    pub fn search_quantized_residuals(
+        &self,
+        query: ArrayView2<'_, f32>,
+        document_ordinals: &[u32],
+    ) -> Result<Option<(Vec<SearchHit>, PlaidSearchStats)>> {
+        let total_started = Instant::now();
+        self.validate_query(query)?;
+        if document_ordinals.is_empty() {
+            return Err(Error::InvalidInput(
+                "direct quantized-residual search requires at least one document".to_string(),
+            ));
+        }
+        if document_ordinals.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(Error::InvalidInput(
+                "direct quantized-residual ordinals must be sorted and unique".to_string(),
+            ));
+        }
+        for document_ordinal in document_ordinals {
+            if self.document_token_range(*document_ordinal)?.is_empty() {
+                return Ok(None);
+            }
+        }
+
+        let mut stats = PlaidSearchStats {
+            candidate_documents: document_ordinals.len() as u64,
+            ..Default::default()
+        };
+        let exact_started = Instant::now();
+        let mut exact_scores = document_ordinals
+            .par_iter()
+            .map(|document_ordinal| {
+                Ok((
+                    *document_ordinal,
+                    self.quantized_maxsim(query, *document_ordinal)?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        stats.exact_score_nanos = duration_nanos(exact_started.elapsed());
+        stats.exact_documents = exact_scores.len() as u64;
+
+        let sort_started = Instant::now();
+        exact_scores.sort_unstable_by(|left, right| {
+            compare_ranked(
+                left.1,
+                self.row_addresses[left.0 as usize],
+                right.1,
+                self.row_addresses[right.0 as usize],
+            )
+        });
+        stats.sort_nanos = duration_nanos(sort_started.elapsed());
+        let hits = exact_scores
+            .into_iter()
+            .map(|(document_ordinal, score)| SearchHit {
+                document_ordinal,
+                row_address: self.row_addresses[document_ordinal as usize],
+                score,
+            })
+            .collect();
+        stats.total_nanos = duration_nanos(total_started.elapsed());
+        Ok(Some((hits, stats)))
+    }
+
     /// Runs centroid probing, posting expansion, code-only scoring, and
     /// quantized-residual MaxSim reranking for one multi-vector query.
     pub fn search(
@@ -490,11 +561,7 @@ impl PlaidIndex {
         Ok((hits, stats))
     }
 
-    fn validate_search(
-        &self,
-        query: ArrayView2<'_, f32>,
-        params: &PlaidSearchParams,
-    ) -> Result<()> {
+    fn validate_query(&self, query: ArrayView2<'_, f32>) -> Result<()> {
         if query.nrows() == 0 || query.ncols() != self.dimension {
             return Err(Error::InvalidInput(format!(
                 "query shape must be [positive, {}], got [{}, {}]",
@@ -508,6 +575,15 @@ impl PlaidIndex {
                 "query values must be finite".to_string(),
             ));
         }
+        Ok(())
+    }
+
+    fn validate_search(
+        &self,
+        query: ArrayView2<'_, f32>,
+        params: &PlaidSearchParams,
+    ) -> Result<()> {
+        self.validate_query(query)?;
         if params.n_ivf_probe == 0 || params.n_full_scores == 0 || params.top_k == 0 {
             return Err(Error::InvalidInput(format!(
                 "n_ivf_probe, n_full_scores, and top_k must be positive, got {}, {}, {}",

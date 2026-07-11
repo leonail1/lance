@@ -31,7 +31,7 @@ use lance_core::utils::tokio::spawn_cpu;
 use lance_datafusion::utils::ExecutionPlanMetricsSetExt;
 use lance_index::prefilter::PreFilter;
 use lance_index::vector::Query;
-use lance_plaid::EligibleCentroidDecision;
+use lance_plaid::{EligibleCentroidDecision, PlaidSearchParams};
 use lance_select::{RowAddrMask, RowAddrTreeMap};
 use lance_table::format::IndexMetadata;
 use ndarray::{ArrayView1, ArrayView2};
@@ -42,8 +42,9 @@ use crate::dataset::rowids::get_row_id_index;
 use crate::dataset::{Dataset, ProjectionRequest, TakeBuilder};
 use crate::index::DatasetIndexInternalExt;
 use crate::index::plaid::{
-    PLAID_DEFAULT_DECOMPRESS_DOCUMENTS, PlaidCandidatePlan, PlaidVectorIndex,
-    is_plaid_index_metadata, maxsim_distance, query_to_array,
+    BoundedEligibleOrdinals, PLAID_DEFAULT_DECOMPRESS_DOCUMENTS, PlaidCandidatePlan,
+    PlaidVectorIndex, is_plaid_index_metadata, maxsim_distance, plaid_search_params,
+    query_to_array,
 };
 use crate::{Error, Result};
 
@@ -97,6 +98,178 @@ const ESTIMATED_GLOBAL_POSTINGS_COUNT: &str = "plaid_estimated_global_postings";
 const CORE_APPROXIMATE_BUDGET_COUNT: &str = "plaid_core_approximate_budget";
 const CORE_RESIDUAL_BUDGET_COUNT: &str = "plaid_core_residual_budget";
 const RAW_REFINEMENT_BUDGET_COUNT: &str = "plaid_raw_refinement_budget";
+// Nested candidate sub-time for a direct scoring attempt. It includes direct
+// planning, mask/ordinal enumeration, query and token-range validation, score,
+// and sort, so it overlaps residual/sort and the executor's end-to-end time.
+const DIRECT_RESIDUAL_TIME: &str = "plaid_direct_residual_time";
+const DIRECT_RESIDUAL_QUERY_COUNT: &str = "plaid_direct_residual_queries";
+const DIRECT_RESIDUAL_SEGMENT_COUNT: &str = "plaid_direct_residual_segments";
+const DIRECT_RESIDUAL_DOCUMENT_COUNT: &str = "plaid_direct_residual_documents";
+const LEGACY_RESIDUAL_QUERY_COUNT: &str = "plaid_legacy_residual_queries";
+const LEGACY_RESIDUAL_SEGMENT_COUNT: &str = "plaid_legacy_residual_segments";
+const DIRECT_RESIDUAL_SMALL_EXACT_PRECEDENCE_COUNT: &str =
+    "plaid_direct_residual_small_exact_precedence_queries";
+const DIRECT_RESIDUAL_DISABLED_COUNT: &str = "plaid_direct_residual_skipped_disabled_segments";
+const DIRECT_RESIDUAL_EXPLICIT_CEILING_COUNT: &str =
+    "plaid_direct_residual_skipped_explicit_ceiling_segments";
+const DIRECT_RESIDUAL_UNFILTERED_COUNT: &str = "plaid_direct_residual_skipped_unfiltered_segments";
+const DIRECT_RESIDUAL_NON_ENUMERABLE_COUNT: &str =
+    "plaid_direct_residual_skipped_non_enumerable_segments";
+const DIRECT_RESIDUAL_EMPTY_SEGMENT_COUNT: &str = "plaid_direct_residual_skipped_empty_segments";
+const DIRECT_RESIDUAL_OVER_LIMIT_COUNT: &str = "plaid_direct_residual_skipped_over_limit_segments";
+const DIRECT_RESIDUAL_BUDGET_MISMATCH_COUNT: &str =
+    "plaid_direct_residual_skipped_budget_mismatch_segments";
+const DIRECT_RESIDUAL_EMPTY_TOKENS_COUNT: &str =
+    "plaid_direct_residual_skipped_empty_tokens_segments";
+
+const DIRECT_RESIDUAL_ENABLED_ENV: &str = "LANCE_PLAID_DIRECT_RESIDUAL_ENABLED";
+const DIRECT_RESIDUAL_MAX_DOCUMENTS_ENV: &str = "LANCE_PLAID_DIRECT_RESIDUAL_MAX_DOCUMENTS";
+const DEFAULT_DIRECT_RESIDUAL_MAX_DOCUMENTS: usize = 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DirectResidualConfig {
+    enabled: bool,
+    max_documents: usize,
+}
+
+impl Default for DirectResidualConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_documents: DEFAULT_DIRECT_RESIDUAL_MAX_DOCUMENTS,
+        }
+    }
+}
+
+impl DirectResidualConfig {
+    fn from_env() -> Result<Self> {
+        let enabled = read_utf8_env(DIRECT_RESIDUAL_ENABLED_ENV)?;
+        let max_documents = read_utf8_env(DIRECT_RESIDUAL_MAX_DOCUMENTS_ENV)?;
+        Self::from_values(enabled.as_deref(), max_documents.as_deref())
+    }
+
+    fn from_values(enabled: Option<&str>, max_documents: Option<&str>) -> Result<Self> {
+        let default = Self::default();
+        let enabled = enabled
+            .map(|value| {
+                parse_bool(value).ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "invalid {DIRECT_RESIDUAL_ENABLED_ENV}={value:?}; expected true/false"
+                    ))
+                })
+            })
+            .transpose()?
+            .unwrap_or(default.enabled);
+        let max_documents = max_documents
+            .map(|value| {
+                value.parse::<usize>().map_err(|_| {
+                    Error::invalid_input(format!(
+                        "invalid {DIRECT_RESIDUAL_MAX_DOCUMENTS_ENV}={value:?}; expected a non-negative integer"
+                    ))
+                })
+            })
+            .transpose()?
+            .unwrap_or(default.max_documents);
+        Ok(Self {
+            enabled,
+            max_documents,
+        })
+    }
+
+    fn mode_name(self) -> &'static str {
+        if self.enabled { "enabled" } else { "disabled" }
+    }
+}
+
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn read_utf8_env(name: &str) -> Result<Option<String>> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(Error::invalid_input(format!(
+            "environment variable {name} is not valid UTF-8"
+        ))),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DirectResidualDecision {
+    Direct,
+    Disabled,
+    ExplicitProbeCeiling,
+    Unfiltered,
+    NonEnumerable,
+    EmptySegment,
+    OverLimit,
+    BudgetMismatch,
+    EmptyTokens,
+}
+
+enum DirectResidualPlan {
+    Direct {
+        document_ordinals: Vec<u32>,
+        params: PlaidSearchParams,
+    },
+    Empty,
+    Legacy(DirectResidualDecision),
+}
+
+enum SegmentSearchOutcome {
+    Direct {
+        hits: Vec<lance_plaid::SearchHit>,
+        stats: lance_plaid::PlaidSearchStats,
+        documents: usize,
+        n_full_scores: usize,
+        attempt_nanos: u64,
+    },
+    Empty,
+    Legacy {
+        hits: Vec<lance_plaid::SearchHit>,
+        stats: lance_plaid::PlaidSearchStats,
+        plan: PlaidCandidatePlan,
+        direct_decision: DirectResidualDecision,
+        direct_attempt_nanos: Option<u64>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResidualSegmentPath {
+    Direct,
+    Legacy,
+    Empty,
+}
+
+#[derive(Default)]
+struct ResidualQueryUsage {
+    used_direct: bool,
+    used_legacy: bool,
+}
+
+impl ResidualQueryUsage {
+    fn observe(&mut self, path: ResidualSegmentPath) {
+        match path {
+            ResidualSegmentPath::Direct => self.used_direct = true,
+            ResidualSegmentPath::Legacy => self.used_legacy = true,
+            ResidualSegmentPath::Empty => {}
+        }
+    }
+
+    fn record_query_metrics(&self, metrics: &PlaidExecMetrics) {
+        if self.used_direct {
+            metrics.direct_residual_query_count.add(1);
+        }
+        if self.used_legacy {
+            metrics.legacy_residual_query_count.add(1);
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PlaidExecutionMode {
@@ -153,6 +326,7 @@ pub struct PlaidSearchExec {
     indices: Vec<IndexMetadata>,
     query: Query,
     mode: PlaidExecutionMode,
+    direct_residual_config: DirectResidualConfig,
     prefilter_source: PreFilterSource,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
@@ -164,6 +338,22 @@ impl PlaidSearchExec {
         indices: Vec<IndexMetadata>,
         query: Query,
         prefilter_source: PreFilterSource,
+    ) -> Result<Self> {
+        Self::try_new_with_direct_residual_config(
+            dataset,
+            indices,
+            query,
+            prefilter_source,
+            DirectResidualConfig::from_env()?,
+        )
+    }
+
+    fn try_new_with_direct_residual_config(
+        dataset: Arc<Dataset>,
+        indices: Vec<IndexMetadata>,
+        query: Query,
+        prefilter_source: PreFilterSource,
+        direct_residual_config: DirectResidualConfig,
     ) -> Result<Self> {
         if indices.is_empty() {
             return Err(Error::invalid_input(
@@ -187,6 +377,7 @@ impl PlaidSearchExec {
             indices,
             query,
             mode,
+            direct_residual_config,
             prefilter_source,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -203,7 +394,7 @@ impl DisplayAs for PlaidSearchExec {
         match format {
             DisplayFormatType::Default | DisplayFormatType::Verbose => write!(
                 formatter,
-                "PlaidSearch: name={}, k={}, segments={}, mode={}, core_residual_budget={}, raw_refinement_budget={}, filter_exact_fallback=enabled",
+                "PlaidSearch: name={}, k={}, segments={}, mode={}, core_residual_budget={}, raw_refinement_budget={}, filter_exact_fallback=enabled, direct_residual_mode={}, direct_residual_max_documents={}",
                 self.indices[0].name,
                 self.query.k,
                 self.indices.len(),
@@ -212,10 +403,12 @@ impl DisplayAs for PlaidSearchExec {
                     .requested_candidates(self.query.k)
                     .max(PLAID_DEFAULT_DECOMPRESS_DOCUMENTS),
                 self.mode.raw_refinement_budget(),
+                self.direct_residual_config.mode_name(),
+                self.direct_residual_config.max_documents,
             ),
             DisplayFormatType::TreeRender => write!(
                 formatter,
-                "PlaidSearch\nname={}\nk={}\nsegments={}\nmode={}\ncore_residual_budget={}\nraw_refinement_budget={}\nfilter_exact_fallback=enabled",
+                "PlaidSearch\nname={}\nk={}\nsegments={}\nmode={}\ncore_residual_budget={}\nraw_refinement_budget={}\nfilter_exact_fallback=enabled\ndirect_residual_mode={}\ndirect_residual_max_documents={}",
                 self.indices[0].name,
                 self.query.k,
                 self.indices.len(),
@@ -224,6 +417,8 @@ impl DisplayAs for PlaidSearchExec {
                     .requested_candidates(self.query.k)
                     .max(PLAID_DEFAULT_DECOMPRESS_DOCUMENTS),
                 self.mode.raw_refinement_budget(),
+                self.direct_residual_config.mode_name(),
+                self.direct_residual_config.max_documents,
             ),
         }
     }
@@ -280,11 +475,12 @@ impl ExecutionPlan for PlaidSearchExec {
                 ));
             }
         };
-        Ok(Arc::new(Self::try_new(
+        Ok(Arc::new(Self::try_new_with_direct_residual_config(
             self.dataset.clone(),
             self.indices.clone(),
             self.query.clone(),
             prefilter_source,
+            self.direct_residual_config,
         )?))
     }
 
@@ -305,11 +501,20 @@ impl ExecutionPlan for PlaidSearchExec {
         let indices = self.indices.clone();
         let query = self.query.clone();
         let mode = self.mode;
+        let direct_residual_config = self.direct_residual_config;
         let stream = stream::once(async move {
             let total_started = Instant::now();
-            let result = execute_search(dataset, indices, query, mode, prefilter, metrics.clone())
-                .await
-                .map_err(DataFusionError::from);
+            let result = execute_search(
+                dataset,
+                indices,
+                query,
+                mode,
+                direct_residual_config,
+                prefilter,
+                metrics.clone(),
+            )
+            .await
+            .map_err(DataFusionError::from);
             metrics.total.add_duration(total_started.elapsed());
             metrics.index.flush_io();
             metrics.baseline.done();
@@ -349,6 +554,7 @@ struct PlaidExecMetrics {
     candidate: Time,
     approximate: Time,
     residual_rerank: Time,
+    direct_residual: Time,
     row_id_fetch: Time,
     raw_vector_fetch: Time,
     exact: Time,
@@ -388,6 +594,20 @@ struct PlaidExecMetrics {
     core_approximate_budget_count: Count,
     core_residual_budget_count: Count,
     raw_refinement_budget_count: Count,
+    direct_residual_query_count: Count,
+    direct_residual_segment_count: Count,
+    direct_residual_document_count: Count,
+    legacy_residual_query_count: Count,
+    legacy_residual_segment_count: Count,
+    direct_residual_small_exact_precedence_count: Count,
+    direct_residual_disabled_count: Count,
+    direct_residual_explicit_ceiling_count: Count,
+    direct_residual_unfiltered_count: Count,
+    direct_residual_non_enumerable_count: Count,
+    direct_residual_empty_segment_count: Count,
+    direct_residual_over_limit_count: Count,
+    direct_residual_budget_mismatch_count: Count,
+    direct_residual_empty_tokens_count: Count,
 }
 
 impl PlaidExecMetrics {
@@ -407,6 +627,7 @@ impl PlaidExecMetrics {
             candidate: metrics.new_time(CANDIDATE_TIME, partition),
             approximate: metrics.new_time(APPROXIMATE_TIME, partition),
             residual_rerank: metrics.new_time(RESIDUAL_RERANK_TIME, partition),
+            direct_residual: metrics.new_time(DIRECT_RESIDUAL_TIME, partition),
             row_id_fetch: metrics.new_time(ROW_ID_FETCH_TIME, partition),
             raw_vector_fetch: metrics.new_time(RAW_VECTOR_FETCH_TIME, partition),
             exact: metrics.new_time(EXACT_TIME, partition),
@@ -458,6 +679,32 @@ impl PlaidExecMetrics {
                 .new_count(CORE_APPROXIMATE_BUDGET_COUNT, partition),
             core_residual_budget_count: metrics.new_count(CORE_RESIDUAL_BUDGET_COUNT, partition),
             raw_refinement_budget_count: metrics.new_count(RAW_REFINEMENT_BUDGET_COUNT, partition),
+            direct_residual_query_count: metrics.new_count(DIRECT_RESIDUAL_QUERY_COUNT, partition),
+            direct_residual_segment_count: metrics
+                .new_count(DIRECT_RESIDUAL_SEGMENT_COUNT, partition),
+            direct_residual_document_count: metrics
+                .new_count(DIRECT_RESIDUAL_DOCUMENT_COUNT, partition),
+            legacy_residual_query_count: metrics.new_count(LEGACY_RESIDUAL_QUERY_COUNT, partition),
+            legacy_residual_segment_count: metrics
+                .new_count(LEGACY_RESIDUAL_SEGMENT_COUNT, partition),
+            direct_residual_small_exact_precedence_count: metrics
+                .new_count(DIRECT_RESIDUAL_SMALL_EXACT_PRECEDENCE_COUNT, partition),
+            direct_residual_disabled_count: metrics
+                .new_count(DIRECT_RESIDUAL_DISABLED_COUNT, partition),
+            direct_residual_explicit_ceiling_count: metrics
+                .new_count(DIRECT_RESIDUAL_EXPLICIT_CEILING_COUNT, partition),
+            direct_residual_unfiltered_count: metrics
+                .new_count(DIRECT_RESIDUAL_UNFILTERED_COUNT, partition),
+            direct_residual_non_enumerable_count: metrics
+                .new_count(DIRECT_RESIDUAL_NON_ENUMERABLE_COUNT, partition),
+            direct_residual_empty_segment_count: metrics
+                .new_count(DIRECT_RESIDUAL_EMPTY_SEGMENT_COUNT, partition),
+            direct_residual_over_limit_count: metrics
+                .new_count(DIRECT_RESIDUAL_OVER_LIMIT_COUNT, partition),
+            direct_residual_budget_mismatch_count: metrics
+                .new_count(DIRECT_RESIDUAL_BUDGET_MISMATCH_COUNT, partition),
+            direct_residual_empty_tokens_count: metrics
+                .new_count(DIRECT_RESIDUAL_EMPTY_TOKENS_COUNT, partition),
         }
     }
 
@@ -468,6 +715,43 @@ impl PlaidExecMetrics {
         }
         self.raw_refinement_budget_count
             .add(mode.raw_refinement_budget());
+    }
+
+    fn record_direct_residual_decision(&self, decision: DirectResidualDecision) {
+        match decision {
+            DirectResidualDecision::Direct => self.direct_residual_segment_count.add(1),
+            DirectResidualDecision::Disabled => {
+                self.legacy_residual_segment_count.add(1);
+                self.direct_residual_disabled_count.add(1);
+            }
+            DirectResidualDecision::ExplicitProbeCeiling => {
+                self.legacy_residual_segment_count.add(1);
+                self.direct_residual_explicit_ceiling_count.add(1);
+            }
+            DirectResidualDecision::Unfiltered => {
+                self.legacy_residual_segment_count.add(1);
+                self.direct_residual_unfiltered_count.add(1);
+            }
+            DirectResidualDecision::NonEnumerable => {
+                self.legacy_residual_segment_count.add(1);
+                self.direct_residual_non_enumerable_count.add(1);
+            }
+            DirectResidualDecision::EmptySegment => {
+                self.direct_residual_empty_segment_count.add(1);
+            }
+            DirectResidualDecision::OverLimit => {
+                self.legacy_residual_segment_count.add(1);
+                self.direct_residual_over_limit_count.add(1);
+            }
+            DirectResidualDecision::BudgetMismatch => {
+                self.legacy_residual_segment_count.add(1);
+                self.direct_residual_budget_mismatch_count.add(1);
+            }
+            DirectResidualDecision::EmptyTokens => {
+                self.legacy_residual_segment_count.add(1);
+                self.direct_residual_empty_tokens_count.add(1);
+            }
+        }
     }
 
     fn record_eligible_centroid_plan(&self, candidate_plan: &PlaidCandidatePlan) {
@@ -544,6 +828,110 @@ fn small_filter_exact_fallback(filter_max_len: Option<u64>, requested_candidates
     })
 }
 
+fn direct_residual_precheck(
+    config: DirectResidualConfig,
+    maximum_nprobes: Option<usize>,
+    filtered_query: bool,
+) -> Option<DirectResidualDecision> {
+    if !config.enabled {
+        return Some(DirectResidualDecision::Disabled);
+    }
+    // Even a ceiling equal to the current centroid count is an explicit user
+    // contract. The experimental shortcut must never silently ignore it.
+    if maximum_nprobes.is_some() {
+        return Some(DirectResidualDecision::ExplicitProbeCeiling);
+    }
+    if !filtered_query {
+        return Some(DirectResidualDecision::Unfiltered);
+    }
+    None
+}
+
+fn direct_residual_budget_params(
+    requested_candidates: usize,
+    eligible_documents: usize,
+) -> Option<PlaidSearchParams> {
+    // nprobe does not affect candidate truncation. The real candidate plan
+    // derives it from the query/mask; one is sufficient to construct the same
+    // shared budgets and threshold here.
+    let params = plaid_search_params(requested_candidates, eligible_documents, 1);
+    let desired_candidates = eligible_documents.min(params.top_k);
+    let approximate_retained = eligible_documents.min(params.n_full_scores);
+    let residual_scored = (params.n_full_scores / 4)
+        .max(params.top_k)
+        .min(approximate_retained);
+    let final_retained = params.top_k.min(residual_scored);
+    (params.centroid_score_threshold.is_none()
+        && params.top_k == eligible_documents
+        && desired_candidates == eligible_documents
+        && approximate_retained == eligible_documents
+        && residual_scored == eligible_documents
+        && final_retained == eligible_documents)
+        .then_some(params)
+}
+
+fn direct_residual_count_decision(
+    config: DirectResidualConfig,
+    requested_candidates: usize,
+    enumerable_documents: Option<usize>,
+) -> DirectResidualDecision {
+    let Some(eligible_documents) = enumerable_documents else {
+        return DirectResidualDecision::NonEnumerable;
+    };
+    if eligible_documents == 0 {
+        return DirectResidualDecision::EmptySegment;
+    }
+    if eligible_documents > config.max_documents {
+        return DirectResidualDecision::OverLimit;
+    }
+
+    if direct_residual_budget_params(requested_candidates, eligible_documents).is_none() {
+        return DirectResidualDecision::BudgetMismatch;
+    }
+    DirectResidualDecision::Direct
+}
+
+fn direct_residual_plan(
+    config: DirectResidualConfig,
+    query: &Query,
+    requested_candidates: usize,
+    filtered_query: bool,
+    index: &PlaidVectorIndex,
+    mask: &RowAddrMask,
+) -> DirectResidualPlan {
+    if let Some(decision) = direct_residual_precheck(config, query.maximum_nprobes, filtered_query)
+    {
+        return DirectResidualPlan::Legacy(decision);
+    }
+    let document_ordinals =
+        match index.bounded_eligible_document_ordinals(mask, config.max_documents) {
+            BoundedEligibleOrdinals::NonEnumerable => {
+                return DirectResidualPlan::Legacy(DirectResidualDecision::NonEnumerable);
+            }
+            BoundedEligibleOrdinals::OverLimit => {
+                return DirectResidualPlan::Legacy(DirectResidualDecision::OverLimit);
+            }
+            BoundedEligibleOrdinals::WithinLimit(document_ordinals) => document_ordinals,
+        };
+    match direct_residual_count_decision(
+        config,
+        requested_candidates,
+        Some(document_ordinals.len()),
+    ) {
+        DirectResidualDecision::EmptySegment => DirectResidualPlan::Empty,
+        DirectResidualDecision::Direct => {
+            match direct_residual_budget_params(requested_candidates, document_ordinals.len()) {
+                Some(params) => DirectResidualPlan::Direct {
+                    document_ordinals,
+                    params,
+                },
+                None => DirectResidualPlan::Legacy(DirectResidualDecision::BudgetMismatch),
+            }
+        }
+        decision => DirectResidualPlan::Legacy(decision),
+    }
+}
+
 fn underfilled_filter_exact_fallback(
     filtered_query: bool,
     ann_candidates: usize,
@@ -553,11 +941,32 @@ fn underfilled_filter_exact_fallback(
     filtered_query && ann_candidates < top_k.min(eligible_documents)
 }
 
+fn elapsed_nanos(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+fn merge_segment_hits(
+    candidates: &mut HashMap<u64, f32>,
+    hits: impl IntoIterator<Item = lance_plaid::SearchHit>,
+) {
+    for hit in hits {
+        candidates
+            .entry(hit.row_address)
+            .and_modify(|score| {
+                if hit.score.total_cmp(score).is_gt() {
+                    *score = hit.score;
+                }
+            })
+            .or_insert(hit.score);
+    }
+}
+
 async fn execute_search(
     dataset: Arc<Dataset>,
     indices: Vec<IndexMetadata>,
     query: Query,
     mode: PlaidExecutionMode,
+    direct_residual_config: DirectResidualConfig,
     prefilter: Arc<crate::index::prefilter::DatasetPreFilter>,
     metrics: Arc<PlaidExecMetrics>,
 ) -> Result<RecordBatch> {
@@ -576,6 +985,9 @@ async fn execute_search(
         // opening an index or entering the Q x C kernel.
         metrics.empty_filter_query_count.add(1);
         metrics.eligible_centroid_empty_count.add(indices.len());
+        metrics
+            .direct_residual_empty_segment_count
+            .add(indices.len());
         metrics.candidate.add_duration(candidate_started.elapsed());
         let batch = RecordBatch::new_empty(KNN_INDEX_SCHEMA.clone());
         metrics.baseline.record_output(0);
@@ -588,6 +1000,10 @@ async fn execute_search(
     let filtered_query = !mask.is_select_all();
     let mut candidates = HashMap::<u64, f32>::new();
     let mut opened_indices = Vec::with_capacity(indices.len());
+    let mut residual_usage = ResidualQueryUsage::default();
+    if small_filter_exact {
+        metrics.direct_residual_small_exact_precedence_count.add(1);
+    }
 
     for metadata in &indices {
         metrics.segments_searched_count.add(1);
@@ -608,13 +1024,50 @@ async fn execute_search(
         let mask_for_cpu = mask.clone();
         let index_for_cpu = raw_index.clone();
         let query_settings = query.clone();
-        let (hits, stats, plan) = spawn_cpu(move || {
+        let outcome = spawn_cpu(move || {
             let index = index_for_cpu
                 .as_any()
                 .downcast_ref::<PlaidVectorIndex>()
                 .ok_or_else(|| {
                     Error::internal("PLAID index downcast failed on CPU worker".to_string())
                 })?;
+            let direct_attempt_started = Instant::now();
+            let (direct_decision, direct_attempt_nanos) = match direct_residual_plan(
+                direct_residual_config,
+                &query_settings,
+                requested_candidates,
+                filtered_query,
+                index,
+                mask_for_cpu.as_ref(),
+            ) {
+                DirectResidualPlan::Direct {
+                    document_ordinals,
+                    params,
+                } => {
+                    let documents = document_ordinals.len();
+                    let n_full_scores = params.n_full_scores;
+                    match index
+                        .search_quantized_residuals(query_for_cpu.view(), &document_ordinals)?
+                    {
+                        Some((hits, stats)) => {
+                            let attempt_nanos = elapsed_nanos(direct_attempt_started);
+                            return Ok::<_, Error>(SegmentSearchOutcome::Direct {
+                                hits,
+                                stats,
+                                documents,
+                                n_full_scores,
+                                attempt_nanos,
+                            });
+                        }
+                        None => (
+                            DirectResidualDecision::EmptyTokens,
+                            Some(elapsed_nanos(direct_attempt_started)),
+                        ),
+                    }
+                }
+                DirectResidualPlan::Empty => return Ok::<_, Error>(SegmentSearchOutcome::Empty),
+                DirectResidualPlan::Legacy(decision) => (decision, None),
+            };
             let plan = index.candidate_plan(
                 &query_settings,
                 requested_candidates,
@@ -631,26 +1084,65 @@ async fn execute_search(
                 desired_candidates,
                 mask_for_cpu.as_ref(),
             )?;
-            Ok::<_, Error>((hits, stats, plan))
+            Ok::<_, Error>(SegmentSearchOutcome::Legacy {
+                hits,
+                stats,
+                plan,
+                direct_decision,
+                direct_attempt_nanos,
+            })
         })
         .await?;
-        metrics
-            .core_approximate_budget_count
-            .add(plan.params.n_full_scores);
-        metrics.core_residual_budget_count.add(plan.params.top_k);
-        metrics.record_eligible_centroid_plan(&plan);
-        metrics.record_core(&stats);
-        for hit in hits {
-            candidates
-                .entry(hit.row_address)
-                .and_modify(|score| {
-                    if hit.score.total_cmp(score).is_gt() {
-                        *score = hit.score;
-                    }
-                })
-                .or_insert(hit.score);
-        }
+        let hits = match outcome {
+            SegmentSearchOutcome::Direct {
+                hits,
+                stats,
+                documents,
+                n_full_scores,
+                attempt_nanos,
+            } => {
+                residual_usage.observe(ResidualSegmentPath::Direct);
+                metrics.record_direct_residual_decision(DirectResidualDecision::Direct);
+                metrics.direct_residual_document_count.add(documents);
+                metrics
+                    .direct_residual
+                    .add_duration(Duration::from_nanos(attempt_nanos));
+                metrics.core_approximate_budget_count.add(n_full_scores);
+                metrics.core_residual_budget_count.add(documents);
+                metrics.record_core(&stats);
+                hits
+            }
+            SegmentSearchOutcome::Empty => {
+                residual_usage.observe(ResidualSegmentPath::Empty);
+                metrics.record_direct_residual_decision(DirectResidualDecision::EmptySegment);
+                Vec::new()
+            }
+            SegmentSearchOutcome::Legacy {
+                hits,
+                stats,
+                plan,
+                direct_decision,
+                direct_attempt_nanos,
+            } => {
+                residual_usage.observe(ResidualSegmentPath::Legacy);
+                if let Some(direct_attempt_nanos) = direct_attempt_nanos {
+                    metrics
+                        .direct_residual
+                        .add_duration(Duration::from_nanos(direct_attempt_nanos));
+                }
+                metrics.record_direct_residual_decision(direct_decision);
+                metrics
+                    .core_approximate_budget_count
+                    .add(plan.params.n_full_scores);
+                metrics.core_residual_budget_count.add(plan.params.top_k);
+                metrics.record_eligible_centroid_plan(&plan);
+                metrics.record_core(&stats);
+                hits
+            }
+        };
+        merge_segment_hits(&mut candidates, hits);
     }
+    residual_usage.record_query_metrics(metrics.as_ref());
     let collect_eligible_addresses = || -> Result<Vec<u64>> {
         let mut addresses = Vec::new();
         for raw_index in &opened_indices {
@@ -1023,6 +1515,247 @@ mod tests {
         assert!(!underfilled_filter_exact_fallback(true, 5, 10, 5));
         assert!(!underfilled_filter_exact_fallback(true, 10, 10, 100));
         assert!(!underfilled_filter_exact_fallback(false, 3, 10, 10));
+    }
+
+    #[test]
+    fn direct_residual_config_values_are_reproducible_and_fail_closed() {
+        assert_eq!(
+            DirectResidualConfig::from_values(None, None).unwrap(),
+            DirectResidualConfig::default()
+        );
+        for enabled in ["1", "true", "YES", "on"] {
+            assert_eq!(
+                DirectResidualConfig::from_values(Some(enabled), Some("64")).unwrap(),
+                DirectResidualConfig {
+                    enabled: true,
+                    max_documents: 64,
+                }
+            );
+        }
+        for disabled in ["0", "false", "No", "OFF"] {
+            assert_eq!(
+                DirectResidualConfig::from_values(Some(disabled), Some("0")).unwrap(),
+                DirectResidualConfig {
+                    enabled: false,
+                    max_documents: 0,
+                }
+            );
+        }
+        for (enabled, maximum) in [(Some("maybe"), None), (None, Some("-1"))] {
+            let error = DirectResidualConfig::from_values(enabled, maximum).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("invalid LANCE_PLAID_DIRECT_RESIDUAL")
+            );
+        }
+    }
+
+    #[test]
+    fn direct_residual_policy_covers_every_gate_and_hard_cap_boundary() {
+        let default = DirectResidualConfig::default();
+        assert_eq!(
+            direct_residual_precheck(
+                DirectResidualConfig {
+                    enabled: false,
+                    ..default
+                },
+                None,
+                true,
+            ),
+            Some(DirectResidualDecision::Disabled)
+        );
+        assert_eq!(
+            direct_residual_precheck(default, Some(1), true),
+            Some(DirectResidualDecision::ExplicitProbeCeiling)
+        );
+        assert_eq!(
+            direct_residual_precheck(default, None, false),
+            Some(DirectResidualDecision::Unfiltered)
+        );
+        assert_eq!(direct_residual_precheck(default, None, true), None);
+
+        assert_eq!(
+            direct_residual_count_decision(default, 10, None),
+            DirectResidualDecision::NonEnumerable
+        );
+        assert_eq!(
+            direct_residual_count_decision(default, 10, Some(0)),
+            DirectResidualDecision::EmptySegment
+        );
+        assert_eq!(
+            direct_residual_count_decision(default, 10, Some(1024)),
+            DirectResidualDecision::Direct
+        );
+        assert_eq!(
+            direct_residual_count_decision(default, 10, Some(1025)),
+            DirectResidualDecision::OverLimit
+        );
+
+        let cap64 = DirectResidualConfig {
+            enabled: true,
+            max_documents: 64,
+        };
+        assert_eq!(
+            direct_residual_count_decision(cap64, 5_000, Some(64)),
+            DirectResidualDecision::Direct
+        );
+        assert_eq!(
+            direct_residual_count_decision(cap64, 5_000, Some(65)),
+            DirectResidualDecision::OverLimit
+        );
+        assert_eq!(
+            direct_residual_count_decision(
+                DirectResidualConfig {
+                    enabled: true,
+                    max_documents: 0,
+                },
+                5_000,
+                Some(1),
+            ),
+            DirectResidualDecision::OverLimit
+        );
+        assert_eq!(
+            direct_residual_count_decision(
+                DirectResidualConfig {
+                    enabled: true,
+                    max_documents: 2_048,
+                },
+                10,
+                Some(1_025),
+            ),
+            DirectResidualDecision::BudgetMismatch
+        );
+    }
+
+    #[test]
+    fn empty_segment_metrics_do_not_claim_direct_or_legacy_query_work() {
+        fn assert_usage(
+            paths: &[ResidualSegmentPath],
+            expected_direct_queries: usize,
+            expected_legacy_queries: usize,
+            expected_direct_segments: usize,
+            expected_legacy_segments: usize,
+            expected_empty_segments: usize,
+        ) {
+            let metrics_set = ExecutionPlanMetricsSet::new();
+            let metrics = PlaidExecMetrics::new(&metrics_set, 0);
+            let mut usage = ResidualQueryUsage::default();
+            for path in paths {
+                usage.observe(*path);
+                metrics.record_direct_residual_decision(match path {
+                    ResidualSegmentPath::Direct => DirectResidualDecision::Direct,
+                    ResidualSegmentPath::Legacy => DirectResidualDecision::Disabled,
+                    ResidualSegmentPath::Empty => DirectResidualDecision::EmptySegment,
+                });
+            }
+            usage.record_query_metrics(&metrics);
+
+            assert_eq!(
+                metrics.direct_residual_query_count.value(),
+                expected_direct_queries
+            );
+            assert_eq!(
+                metrics.legacy_residual_query_count.value(),
+                expected_legacy_queries
+            );
+            assert_eq!(
+                metrics.direct_residual_segment_count.value(),
+                expected_direct_segments
+            );
+            assert_eq!(
+                metrics.legacy_residual_segment_count.value(),
+                expected_legacy_segments
+            );
+            assert_eq!(
+                metrics.direct_residual_empty_segment_count.value(),
+                expected_empty_segments
+            );
+        }
+
+        assert_usage(
+            &[ResidualSegmentPath::Empty, ResidualSegmentPath::Empty],
+            0,
+            0,
+            0,
+            0,
+            2,
+        );
+        assert_usage(
+            &[ResidualSegmentPath::Empty, ResidualSegmentPath::Direct],
+            1,
+            0,
+            1,
+            0,
+            1,
+        );
+        assert_usage(
+            &[ResidualSegmentPath::Empty, ResidualSegmentPath::Legacy],
+            0,
+            1,
+            0,
+            1,
+            1,
+        );
+        assert_usage(
+            &[
+                ResidualSegmentPath::Empty,
+                ResidualSegmentPath::Direct,
+                ResidualSegmentPath::Legacy,
+            ],
+            1,
+            1,
+            1,
+            1,
+            1,
+        );
+    }
+
+    #[test]
+    fn mixed_segment_hit_merge_keeps_best_score_and_deduplicates_addresses() {
+        let mut candidates = HashMap::new();
+        merge_segment_hits(
+            &mut candidates,
+            [
+                lance_plaid::SearchHit {
+                    document_ordinal: 0,
+                    row_address: 10,
+                    score: 1.0,
+                },
+                lance_plaid::SearchHit {
+                    document_ordinal: 1,
+                    row_address: 20,
+                    score: 0.5,
+                },
+            ],
+        );
+        merge_segment_hits(
+            &mut candidates,
+            [
+                // A lower score for an overlapping address must not replace
+                // the first segment's candidate.
+                lance_plaid::SearchHit {
+                    document_ordinal: 7,
+                    row_address: 10,
+                    score: 0.75,
+                },
+                // A higher score from either a direct or legacy segment wins.
+                lance_plaid::SearchHit {
+                    document_ordinal: 8,
+                    row_address: 20,
+                    score: 0.875,
+                },
+                lance_plaid::SearchHit {
+                    document_ordinal: 9,
+                    row_address: 30,
+                    score: 0.25,
+                },
+            ],
+        );
+        assert_eq!(candidates.len(), 3);
+        assert_eq!(candidates[&10].to_bits(), 1.0_f32.to_bits());
+        assert_eq!(candidates[&20].to_bits(), 0.875_f32.to_bits());
+        assert_eq!(candidates[&30].to_bits(), 0.25_f32.to_bits());
     }
 
     #[tokio::test]

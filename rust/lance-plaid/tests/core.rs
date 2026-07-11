@@ -93,6 +93,23 @@ fn tie_index() -> PlaidIndex {
     .unwrap()
 }
 
+fn empty_document_index() -> PlaidIndex {
+    let quantizer = ResidualQuantizer::try_new(2, vec![-0.1, 0.0, 0.1], vec![0.0; 4]).unwrap();
+    let centroids = array![[1.0, 0.0, 0.0, 0.0]];
+    let packed_residuals = quantizer
+        .quantize(Array2::<f32>::zeros((1, 4)).view())
+        .unwrap();
+    PlaidIndex::try_new(
+        centroids,
+        quantizer,
+        vec![10, 20],
+        vec![0, 1, 1],
+        vec![0],
+        packed_residuals,
+    )
+    .unwrap()
+}
+
 fn retry_ceiling_index() -> PlaidIndex {
     const DOCUMENTS: usize = 128;
     const CENTROIDS: usize = 8;
@@ -184,6 +201,77 @@ fn stable_ties_use_ascending_row_address() {
     assert_eq!(stats.candidate_documents, 3);
     assert_eq!(stats.exact_documents, 2);
     assert!(stats.total_nanos > 0);
+}
+
+#[test]
+fn direct_quantized_residuals_are_bitwise_identical_to_exhaustive_legacy() {
+    for nbits in [2, 4] {
+        let index = test_index(nbits);
+        let query = array![[1.0_f32, 0.0, 0.0, 0.0], [0.0_f32, 1.0, 0.0, 0.0]];
+        let eligibility = AddressEligibility::allow([7, 42, 1001]);
+        let (legacy, legacy_stats) = index
+            .search(query.view(), &exhaustive_params(3), &eligibility)
+            .unwrap();
+        let (direct, direct_stats) = index
+            .search_quantized_residuals(query.view(), &[0, 1, 2])
+            .unwrap()
+            .expect("all documents have tokens");
+
+        assert_eq!(
+            direct
+                .iter()
+                .map(|hit| (hit.document_ordinal, hit.row_address, hit.score.to_bits()))
+                .collect::<Vec<_>>(),
+            legacy
+                .iter()
+                .map(|hit| (hit.document_ordinal, hit.row_address, hit.score.to_bits()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(direct_stats.candidate_documents, 3);
+        assert_eq!(direct_stats.approximate_documents, 0);
+        assert_eq!(direct_stats.exact_documents, 3);
+        assert_eq!(legacy_stats.exact_documents, 3);
+    }
+}
+
+#[test]
+fn direct_quantized_residuals_share_legacy_tie_breaking() {
+    let index = tie_index();
+    let query = array![[1.0_f32, 0.0, 0.0, 0.0], [0.0_f32, 1.0, 0.0, 0.0]];
+    let params = PlaidSearchParams {
+        n_ivf_probe: 4,
+        n_full_scores: 16,
+        top_k: 4,
+        centroid_score_threshold: None,
+    };
+    let (legacy, _) = index.search(query.view(), &params, &AllEligible).unwrap();
+    let (direct, _) = index
+        .search_quantized_residuals(query.view(), &[0, 1, 2, 3])
+        .unwrap()
+        .expect("all documents have tokens");
+    assert_eq!(direct, legacy);
+    assert_eq!(
+        direct.iter().map(|hit| hit.row_address).collect::<Vec<_>>(),
+        vec![100, 101, 102, 103]
+    );
+}
+
+#[test]
+fn direct_quantized_residuals_reject_noncanonical_ordinals_and_fallback_on_empty_tokens() {
+    let index = empty_document_index();
+    let query = array![[1.0_f32, 0.0, 0.0, 0.0]];
+    assert!(
+        index
+            .search_quantized_residuals(query.view(), &[0, 1])
+            .unwrap()
+            .is_none()
+    );
+    for ordinals in [&[1_u32, 0][..], &[0_u32, 0][..]] {
+        let error = index
+            .search_quantized_residuals(query.view(), ordinals)
+            .unwrap_err();
+        assert!(error.to_string().contains("sorted and unique"));
+    }
 }
 
 #[test]
