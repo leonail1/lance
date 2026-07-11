@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arrow::array::AsArray;
-use arrow::datatypes::{Float32Type, UInt64Type};
+use arrow::datatypes::UInt64Type;
 use arrow_array::{Array, Float32Array, RecordBatch, UInt64Array};
 use arrow_schema::SchemaRef;
 use datafusion::common::stats::Precision;
@@ -31,10 +31,11 @@ use lance_core::utils::tokio::spawn_cpu;
 use lance_datafusion::utils::ExecutionPlanMetricsSetExt;
 use lance_index::prefilter::PreFilter;
 use lance_index::vector::Query;
+use lance_linalg::distance::dot_f32;
 use lance_plaid::{EligibleCentroidDecision, PlaidSearchParams};
 use lance_select::{RowAddrMask, RowAddrTreeMap};
 use lance_table::format::IndexMetadata;
-use ndarray::{ArrayView1, ArrayView2};
+use ndarray::ArrayView2;
 
 use super::knn::KNN_INDEX_SCHEMA;
 use super::utils::{IndexMetrics, PreFilterSource, build_prefilter};
@@ -1417,6 +1418,7 @@ fn exact_scores(
         .ok_or_else(|| Error::internal(format!("PLAID raw batch is missing {column}")))?
         .as_list::<i32>();
     let mut hits = Vec::with_capacity(documents.len());
+    let scorer = ExactMaxsimScorer::try_new(query)?;
     for row_index in 0..documents.len() {
         if documents.is_null(row_index) {
             return Err(Error::internal(
@@ -1425,7 +1427,7 @@ fn exact_scores(
         }
         let document = documents.value(row_index);
         let tokens = document.as_fixed_size_list();
-        let score = exact_maxsim(query, tokens)?;
+        let score = scorer.score(tokens)?;
         hits.push(ExactHit {
             row_address: 0,
             distance: maxsim_distance(score),
@@ -1434,62 +1436,135 @@ fn exact_scores(
     Ok(hits)
 }
 
+/// A row-major, finite multi-vector query validated once for a batch of exact
+/// refinement candidates.
+///
+/// `query_to_array` already establishes these invariants for a PLAID query.
+/// Keeping the checks at this boundary makes `exact_scores` robust without
+/// repeating them for every query-token/document-token pair.
+#[derive(Debug)]
+struct ExactMaxsimScorer<'a> {
+    query_values: &'a [f32],
+    dimension: usize,
+}
+
+impl<'a> ExactMaxsimScorer<'a> {
+    fn try_new(query: ArrayView2<'a, f32>) -> Result<Self> {
+        let dimension = query.ncols();
+        if dimension == 0 {
+            return Err(Error::invalid_input(
+                "PLAID exact query dimension must be positive".to_string(),
+            ));
+        }
+        let query_values = query.to_slice().ok_or_else(|| {
+            Error::invalid_input(
+                "PLAID exact query matrix must be row-major contiguous".to_string(),
+            )
+        })?;
+        if query_values.iter().any(|value| !value.is_finite()) {
+            return Err(Error::invalid_input(
+                "PLAID exact query contains non-finite values".to_string(),
+            ));
+        }
+        Ok(Self {
+            query_values,
+            dimension,
+        })
+    }
+
+    fn score(&self, document: &arrow_array::FixedSizeListArray) -> Result<f32> {
+        // Preserve the established multi-vector convention: an empty document
+        // has an undefined MaxSim score, represented as NaN.
+        if document.is_empty() {
+            return Ok(f32::NAN);
+        }
+
+        let document_dimension = usize::try_from(document.value_length()).map_err(|_| {
+            Error::invalid_input("PLAID exact document dimension does not fit usize".to_string())
+        })?;
+        if document_dimension != self.dimension {
+            return Err(Error::invalid_input(format!(
+                "PLAID exact document dimension {document_dimension} does not match query dimension {}",
+                self.dimension
+            )));
+        }
+        if document.null_count() != 0 {
+            return Err(Error::invalid_input(
+                "PLAID exact refinement does not support null token vectors".to_string(),
+            ));
+        }
+
+        // FixedSizeList stores every token in one contiguous primitive child.
+        // Validate its null/finite invariants once per document, then slice it
+        // directly instead of allocating an Arrow value for every token.
+        let document_values = document
+            .values()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .ok_or_else(|| {
+                Error::invalid_input(
+                    "PLAID exact refinement requires Float32 document token values".to_string(),
+                )
+            })?;
+        if document_values.null_count() != 0 {
+            return Err(Error::invalid_input(
+                "PLAID exact refinement does not support null token values".to_string(),
+            ));
+        }
+        let document_values = document_values.values();
+        if document_values.iter().any(|value| !value.is_finite()) {
+            return Err(Error::invalid_input(
+                "PLAID exact document contains non-finite values".to_string(),
+            ));
+        }
+        if document_values.len()
+            != document.len().checked_mul(self.dimension).ok_or_else(|| {
+                Error::invalid_input("PLAID exact document shape overflow".to_string())
+            })?
+        {
+            return Err(Error::invalid_input(
+                "PLAID exact document values do not match its token shape".to_string(),
+            ));
+        }
+
+        let mut score = 0.0_f32;
+        for query_token in self.query_values.chunks_exact(self.dimension) {
+            let mut maximum = f32::NEG_INFINITY;
+            for document_token in document_values.chunks_exact(self.dimension) {
+                // Runtime dispatch selects AVX-512 on capable CPUs and the
+                // portable SIMD-friendly implementation everywhere else.
+                // Its FMA/reduction order may differ by a few ULPs from the old
+                // scalar iterator; exact refinement guarantees numerical, not
+                // bitwise, equivalence.
+                maximum = maximum.max(dot_f32(query_token, document_token));
+            }
+            score += maximum;
+        }
+        Ok(score)
+    }
+}
+
+#[cfg(test)]
 fn exact_maxsim(
     query: ArrayView2<'_, f32>,
     document: &arrow_array::FixedSizeListArray,
 ) -> Result<f32> {
-    if document.is_empty() {
-        return Ok(f32::NAN);
-    }
-    let mut score = 0.0_f32;
-    for query_token in query.outer_iter() {
-        let mut maximum = f32::NEG_INFINITY;
-        for token_index in 0..document.len() {
-            if document.is_null(token_index) {
-                return Err(Error::invalid_input(
-                    "PLAID exact refinement does not support null token vectors".to_string(),
-                ));
-            }
-            let token = document.value(token_index);
-            let token = token.as_primitive::<Float32Type>();
-            let similarity = raw_dot(query_token, token.values())?;
-            maximum = maximum.max(similarity);
-        }
-        score += maximum;
-    }
-    Ok(score)
-}
-
-fn raw_dot(query: ArrayView1<'_, f32>, document: &[f32]) -> Result<f32> {
-    if query.len() != document.len()
-        || query.iter().any(|value| !value.is_finite())
-        || document.iter().any(|value| !value.is_finite())
-    {
-        return Err(Error::invalid_input(format!(
-            "PLAID exact token dimension {} does not match query dimension {} or contains non-finite values",
-            document.len(),
-            query.len()
-        )));
-    }
-    Ok(query
-        .iter()
-        .zip(document)
-        .map(|(left, right)| left * right)
-        .sum())
+    ExactMaxsimScorer::try_new(query)?.score(document)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::types::Float32Type;
     use arrow_array::{
         ArrayRef, FixedSizeListArray, Float32Array, Int32Array, ListArray, RecordBatchIterator,
     };
-    use arrow_buffer::OffsetBuffer;
+    use arrow_buffer::{NullBuffer, OffsetBuffer};
     use arrow_schema::Field;
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::utils::address::RowAddress;
     use lance_linalg::distance::{DistanceType, multivec_distance};
-    use ndarray::array;
+    use ndarray::{Array2, ArrayView1, array};
 
     use crate::dataset::WriteParams;
 
@@ -1884,5 +1959,406 @@ mod tests {
             higher_raw_score > low_norm_score,
             "raw dot ranks the 0.6 token first; cosine would rank the 0.5 collinear token first"
         );
+    }
+
+    /// The pre-optimization kernel, retained only as an oracle and benchmark
+    /// baseline. In particular, it recreates an Arrow slice and rescans both
+    /// inputs for every query-token/document-token pair.
+    fn scalar_exact_maxsim_reference(
+        query: ArrayView2<'_, f32>,
+        document: &FixedSizeListArray,
+    ) -> Result<f32> {
+        if document.is_empty() {
+            return Ok(f32::NAN);
+        }
+        let mut score = 0.0_f32;
+        for query_token in query.outer_iter() {
+            let mut maximum = f32::NEG_INFINITY;
+            for token_index in 0..document.len() {
+                if document.is_null(token_index) {
+                    return Err(Error::invalid_input(
+                        "reference does not support null token vectors".to_string(),
+                    ));
+                }
+                let token = document.value(token_index);
+                let token = token.as_primitive::<Float32Type>();
+                let similarity = scalar_checked_dot(query_token, token.values())?;
+                maximum = maximum.max(similarity);
+            }
+            score += maximum;
+        }
+        Ok(score)
+    }
+
+    fn scalar_checked_dot(query: ArrayView1<'_, f32>, document: &[f32]) -> Result<f32> {
+        if query.len() != document.len()
+            || query.iter().any(|value| !value.is_finite())
+            || document.iter().any(|value| !value.is_finite())
+        {
+            return Err(Error::invalid_input(
+                "reference dimension mismatch or non-finite value".to_string(),
+            ));
+        }
+        Ok(query
+            .iter()
+            .zip(document)
+            .map(|(left, right)| left * right)
+            .sum())
+    }
+
+    fn deterministic_values(len: usize, mut state: u64) -> Vec<f32> {
+        (0..len)
+            .map(|_| {
+                // xorshift64*: deterministic and sufficient for numerical
+                // coverage without coupling tests to a rand crate version.
+                state ^= state >> 12;
+                state ^= state << 25;
+                state ^= state >> 27;
+                let bits = state.wrapping_mul(0x2545_F491_4F6C_DD1D);
+                let unit = ((bits >> 40) as u32) as f32 / ((1_u32 << 24) - 1) as f32;
+                (unit - 0.5) * 0.5
+            })
+            .collect()
+    }
+
+    fn assert_numerically_equivalent(actual: f32, expected: f32, context: &str) {
+        if expected.is_nan() {
+            assert!(actual.is_nan(), "{context}: expected NaN, got {actual}");
+            return;
+        }
+        let tolerance = 2.0e-5_f32 * expected.abs().max(1.0);
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "{context}: SIMD={actual} (0x{:08x}), scalar={expected} (0x{:08x}), tolerance={tolerance}",
+            actual.to_bits(),
+            expected.to_bits()
+        );
+    }
+
+    #[test]
+    fn exact_maxsim_simd_matches_scalar_reference_across_shapes() {
+        let dimensions = [1_usize, 2, 3, 7, 15, 16, 17, 31, 32, 64, 127, 128, 129];
+        for case in 0..39_usize {
+            let dimension = dimensions[case % dimensions.len()];
+            let query_tokens = 1 + (case * 5) % 9;
+            let document_tokens = 1 + (case * 17) % 73;
+            let query = Array2::from_shape_vec(
+                (query_tokens, dimension),
+                deterministic_values(
+                    query_tokens * dimension,
+                    0x1234_5678_9abc_def0 ^ case as u64,
+                ),
+            )
+            .unwrap();
+            let document = FixedSizeListArray::try_new_from_values(
+                Float32Array::from(deterministic_values(
+                    document_tokens * dimension,
+                    0xfedc_ba98_7654_3210 ^ case as u64,
+                )),
+                dimension as i32,
+            )
+            .unwrap();
+            let expected = scalar_exact_maxsim_reference(query.view(), &document).unwrap();
+            let actual = exact_maxsim(query.view(), &document).unwrap();
+            assert_numerically_equivalent(
+                actual,
+                expected,
+                &format!("case={case}, q={query_tokens}, d={document_tokens}, dim={dimension}"),
+            );
+        }
+
+        for (label, query_tokens, document_tokens, dimension, seed) in [
+            (
+                "canonical 13x64x96 shape",
+                13_usize,
+                64_usize,
+                96_usize,
+                41_u64,
+            ),
+            (
+                "stress/ColBERT-style 32x180x128 shape",
+                32_usize,
+                180_usize,
+                128_usize,
+                43_u64,
+            ),
+        ] {
+            let query = Array2::from_shape_vec(
+                (query_tokens, dimension),
+                deterministic_values(query_tokens * dimension, seed),
+            )
+            .unwrap();
+            let document = FixedSizeListArray::try_new_from_values(
+                Float32Array::from(deterministic_values(document_tokens * dimension, seed + 1)),
+                dimension as i32,
+            )
+            .unwrap();
+            assert_numerically_equivalent(
+                exact_maxsim(query.view(), &document).unwrap(),
+                scalar_exact_maxsim_reference(query.view(), &document).unwrap(),
+                label,
+            );
+        }
+    }
+
+    #[test]
+    fn exact_maxsim_uses_only_the_sliced_document_values() {
+        let all_tokens = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![
+                100.0, 100.0, 100.0, 100.0, // excluded prefix
+                0.5, 0.0, 0.0, 0.0, // first included token
+                0.0, 0.25, 0.0, 0.0, // second included token
+                200.0, 200.0, 200.0, 200.0, // excluded suffix
+            ]),
+            4,
+        )
+        .unwrap();
+        let document = all_tokens.slice(1, 2);
+        let query = array![[1.0_f32, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]];
+        let actual = exact_maxsim(query.view(), &document).unwrap();
+        assert_eq!(actual.to_bits(), 0.75_f32.to_bits());
+        assert_numerically_equivalent(
+            actual,
+            scalar_exact_maxsim_reference(query.view(), &document).unwrap(),
+            "sliced FixedSizeList child",
+        );
+    }
+
+    #[test]
+    fn exact_maxsim_preserves_empty_and_rejects_invalid_shapes() {
+        let query = array![[1.0_f32, 2.0]];
+        let empty =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(Vec::<f32>::new()), 2)
+                .unwrap();
+        assert!(exact_maxsim(query.view(), &empty).unwrap().is_nan());
+
+        let wrong_dimension =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![1.0, 2.0, 3.0]), 3)
+                .unwrap();
+        let error = exact_maxsim(query.view(), &wrong_dimension).unwrap_err();
+        assert!(error.to_string().contains("dimension 3"));
+
+        let zero_dimension_query = Array2::<f32>::zeros((1, 0));
+        let error = ExactMaxsimScorer::try_new(zero_dimension_query.view()).unwrap_err();
+        assert!(error.to_string().contains("dimension must be positive"));
+
+        let query_storage = array![[1.0_f32, 2.0], [3.0, 4.0]];
+        let error = ExactMaxsimScorer::try_new(query_storage.t()).unwrap_err();
+        assert!(error.to_string().contains("row-major contiguous"));
+
+        let wrong_type =
+            FixedSizeListArray::try_new_from_values(Int32Array::from(vec![1, 2]), 2).unwrap();
+        let error = exact_maxsim(query.view(), &wrong_type).unwrap_err();
+        assert!(error.to_string().contains("requires Float32"));
+    }
+
+    #[test]
+    fn exact_maxsim_rejects_null_and_non_finite_values() {
+        let query = array![[1.0_f32, 2.0]];
+        let float_field = Arc::new(Field::new("item", arrow_schema::DataType::Float32, true));
+        let null_token = FixedSizeListArray::try_new(
+            float_field.clone(),
+            2,
+            Arc::new(Float32Array::from(vec![1.0, 2.0])),
+            Some(NullBuffer::from(vec![false])),
+        )
+        .unwrap();
+        let error = exact_maxsim(query.view(), &null_token).unwrap_err();
+        assert!(error.to_string().contains("null token vectors"));
+
+        let null_value = FixedSizeListArray::try_new(
+            float_field,
+            2,
+            Arc::new(Float32Array::from(vec![Some(1.0), None])),
+            None,
+        )
+        .unwrap();
+        let error = exact_maxsim(query.view(), &null_value).unwrap_err();
+        assert!(error.to_string().contains("null token values"));
+
+        for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let invalid_document =
+                FixedSizeListArray::try_new_from_values(Float32Array::from(vec![1.0, invalid]), 2)
+                    .unwrap();
+            let error = exact_maxsim(query.view(), &invalid_document).unwrap_err();
+            assert!(error.to_string().contains("non-finite"));
+
+            let invalid_query = array![[1.0_f32, invalid]];
+            let finite_document =
+                FixedSizeListArray::try_new_from_values(Float32Array::from(vec![1.0, 2.0]), 2)
+                    .unwrap();
+            let error = exact_maxsim(invalid_query.view(), &finite_document).unwrap_err();
+            assert!(error.to_string().contains("non-finite"));
+        }
+    }
+
+    #[test]
+    fn exact_scores_rejects_a_null_document() {
+        let tokens =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![1.0_f32, 2.0]), 2)
+                .unwrap();
+        let field = Arc::new(Field::new("item", tokens.data_type().clone(), true));
+        let documents = ListArray::try_new(
+            field,
+            OffsetBuffer::from_lengths([1_usize]),
+            Arc::new(tokens),
+            Some(NullBuffer::from(vec![false])),
+        )
+        .unwrap();
+        let batch = RecordBatch::try_from_iter([("mv", Arc::new(documents) as ArrayRef)]).unwrap();
+        let query = array![[1.0_f32, 2.0]];
+        let error = match exact_scores(&batch, "mv", query.view()) {
+            Ok(_) => panic!("null document unexpectedly produced exact scores"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("null document"));
+    }
+
+    #[test]
+    fn exact_equal_scores_keep_row_id_tie_order() {
+        let document = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![0.5_f32, 0.25, -0.5, 0.125]),
+            4,
+        )
+        .unwrap();
+        let query_values = vec![1.0_f32, 0.0, 0.0, 0.0];
+        let query_matrix = Array2::from_shape_vec((1, 4), query_values.clone()).unwrap();
+        let first = exact_maxsim(query_matrix.view(), &document).unwrap();
+        let second = exact_maxsim(query_matrix.view(), &document).unwrap();
+        assert_eq!(first.to_bits(), second.to_bits());
+
+        let mut hits = vec![
+            ExactHit {
+                row_address: 9,
+                distance: maxsim_distance(first),
+            },
+            ExactHit {
+                row_address: 3,
+                distance: maxsim_distance(second),
+            },
+            ExactHit {
+                row_address: 7,
+                distance: maxsim_distance(first),
+            },
+        ];
+        let query = Query {
+            column: "mv".to_string(),
+            key: Arc::new(Float32Array::from(query_values)),
+            k: 2,
+            lower_bound: None,
+            upper_bound: None,
+            minimum_nprobes: 1,
+            maximum_nprobes: None,
+            ef: None,
+            refine_factor: None,
+            metric_type: Some(DistanceType::Dot),
+            use_index: true,
+            query_parallelism: 1,
+            dist_q_c: 0.0,
+            approx_mode: lance_index::vector::ApproxMode::Normal,
+        };
+        rank_hits(&mut hits, &query);
+        assert_eq!(
+            hits.iter().map(|hit| hit.row_address).collect::<Vec<_>>(),
+            vec![3, 7]
+        );
+    }
+
+    /// Run manually with an optimized build and one pinned CPU, for example:
+    /// `taskset -c 0 cargo +1.95.0 test -p lance --release
+    /// exact_maxsim_kernel_microbenchmark -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "deterministic CPU microbenchmark; run explicitly with --release"]
+    fn exact_maxsim_kernel_microbenchmark() {
+        use std::hint::black_box;
+
+        fn run_profile(
+            label: &str,
+            candidates: usize,
+            query_tokens: usize,
+            document_tokens: usize,
+            dimension: usize,
+            samples: usize,
+        ) {
+            let query = Array2::from_shape_vec(
+                (query_tokens, dimension),
+                deterministic_values(query_tokens * dimension, 0x5eed),
+            )
+            .unwrap();
+            let documents = (0..candidates)
+                .map(|candidate| {
+                    FixedSizeListArray::try_new_from_values(
+                        Float32Array::from(deterministic_values(
+                            document_tokens * dimension,
+                            0xc001_d00d ^ candidate as u64,
+                        )),
+                        dimension as i32,
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let scorer = ExactMaxsimScorer::try_new(query.view()).unwrap();
+
+            let run_scalar = || {
+                documents
+                    .iter()
+                    .map(|document| {
+                        scalar_exact_maxsim_reference(black_box(query.view()), black_box(document))
+                            .unwrap()
+                    })
+                    .sum::<f32>()
+            };
+            let run_simd = || {
+                documents
+                    .iter()
+                    .map(|document| scorer.score(black_box(document)).unwrap())
+                    .sum::<f32>()
+            };
+            let scalar_result = black_box(run_scalar());
+            let simd_result = black_box(run_simd());
+            assert_numerically_equivalent(
+                simd_result,
+                scalar_result,
+                &format!("{label} microbenchmark checksum"),
+            );
+
+            let mut scalar_samples = Vec::with_capacity(samples);
+            let mut simd_samples = Vec::with_capacity(samples);
+            for sample in 0..samples {
+                let measure_scalar = || {
+                    let started = Instant::now();
+                    black_box(run_scalar());
+                    started.elapsed()
+                };
+                let measure_simd = || {
+                    let started = Instant::now();
+                    black_box(run_simd());
+                    started.elapsed()
+                };
+                let (scalar, simd) = if sample % 2 == 0 {
+                    (measure_scalar(), measure_simd())
+                } else {
+                    let simd = measure_simd();
+                    let scalar = measure_scalar();
+                    (scalar, simd)
+                };
+                scalar_samples.push(scalar);
+                simd_samples.push(simd);
+            }
+            scalar_samples.sort_unstable();
+            simd_samples.sort_unstable();
+            let scalar = scalar_samples[samples / 2];
+            let simd = simd_samples[samples / 2];
+            println!(
+                "exact_maxsim profile={label} candidates={candidates} query_tokens={query_tokens} document_tokens={document_tokens} dimension={dimension}: scalar_median={scalar:?}, simd_median={simd:?}, speedup={:.3}x",
+                scalar.as_secs_f64() / simd.as_secs_f64()
+            );
+        }
+
+        // Canonical shape from the current LOTTE smoke workload. This is the
+        // representative number used for performance claims.
+        run_profile("canonical", 50, 13, 64, 96, 11);
+        // Retain a larger shape as a stress/throughput diagnostic only.
+        run_profile("stress", 50, 32, 180, 128, 7);
     }
 }
