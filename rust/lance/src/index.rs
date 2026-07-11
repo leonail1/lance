@@ -2179,12 +2179,16 @@ impl DatasetIndexInternalExt for Dataset {
         // versioned binary format, so it must be opened before LanceFile tail
         // and version parsing.
         if plaid::is_plaid_index_metadata(&index_meta) {
-            let index = plaid::open_plaid_index(self, &index_meta).await?;
+            let dataset = self.clone();
+            let cached = self
+                .index_cache
+                .get_or_insert_with_key(cache_key, move || async move {
+                    let index = plaid::open_plaid_index(&dataset, &index_meta).await?;
+                    Ok(CachedLegacyVectorIndex(index))
+                })
+                .await?;
             metrics.record_index_load();
-            self.index_cache
-                .insert_with_key(&cache_key, Arc::new(CachedLegacyVectorIndex(index.clone())))
-                .await;
-            return Ok(index);
+            return Ok(cached.0.clone());
         }
 
         let frag_reuse_index = self.open_frag_reuse_index(metrics).await?;

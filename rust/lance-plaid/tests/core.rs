@@ -144,3 +144,20 @@ fn versioned_bytes_reject_unknown_version() {
     let error = PlaidIndex::read_from_bytes(&bytes).unwrap_err();
     assert!(error.to_string().contains("unsupported format version 2"));
 }
+
+#[test]
+fn versioned_bytes_reject_unbounded_header_counts_before_allocation() {
+    let index = test_index(2);
+    let mut bytes = index.to_bytes().unwrap();
+    bytes[32..40].copy_from_slice(&u64::MAX.to_le_bytes());
+    let error = PlaidIndex::read_from_bytes(&bytes).unwrap_err();
+    assert!(
+        error.to_string().contains("overflow")
+            || error.to_string().contains("encoded length mismatch")
+    );
+
+    let valid_bytes = index.to_bytes().unwrap();
+    let truncated = &valid_bytes[..47];
+    let error = PlaidIndex::read_from_bytes(truncated).unwrap_err();
+    assert!(error.to_string().contains("shorter than the 48-byte header"));
+}

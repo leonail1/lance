@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Cursor, Read, Write};
+use std::io::{BufWriter, Cursor, Read, Write};
 use std::path::Path;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -12,6 +12,7 @@ use crate::{Error, PlaidIndex, ResidualQuantizer, Result};
 
 const MAGIC: [u8; 8] = *b"LPLDIDX\0";
 const ENDIAN_MARKER: u32 = 0x0102_0304;
+const HEADER_LEN: usize = 48;
 
 /// Version discriminator for the stable local PLAID file format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,13 +83,13 @@ impl PlaidIndex {
 
     /// Loads and validates an index from the versioned local PLAID format.
     pub fn read_from_path(path: impl AsRef<Path>) -> Result<Self> {
-        let file = File::open(path)?;
-        let mut reader = BufReader::new(file);
-        Self::read_from(&mut reader)
+        let bytes = std::fs::read(path)?;
+        Self::read_from_bytes(&bytes)
     }
 
     /// Loads and validates an index from in-memory versioned PLAID bytes.
     pub fn read_from_bytes(bytes: &[u8]) -> Result<Self> {
+        validate_encoded_len(bytes)?;
         Self::read_from(&mut Cursor::new(bytes))
     }
 
@@ -188,6 +189,154 @@ impl PlaidIndex {
         )
         .map_err(|error| Error::CorruptFile(error.to_string()))
     }
+}
+
+fn validate_encoded_len(bytes: &[u8]) -> Result<()> {
+    if bytes.len() < HEADER_LEN {
+        return Err(Error::CorruptFile(format!(
+            "file is shorter than the {HEADER_LEN}-byte header: {} bytes",
+            bytes.len()
+        )));
+    }
+    let mut reader = Cursor::new(bytes);
+    let mut magic = [0_u8; 8];
+    reader.read_exact(&mut magic)?;
+    if magic != MAGIC {
+        return Err(Error::CorruptFile(format!("invalid magic bytes {magic:?}")));
+    }
+    let _version = PlaidFormatVersion::try_from(reader.read_u16::<LittleEndian>()?)?;
+    let nbits = reader.read_u8()?;
+    if !matches!(nbits, 2 | 4) {
+        return Err(Error::CorruptFile(format!(
+            "nbits must be 2 or 4, got {nbits}"
+        )));
+    }
+    let reserved = reader.read_u8()?;
+    if reserved != 0 {
+        return Err(Error::CorruptFile(format!(
+            "reserved header byte must be zero, got {reserved}"
+        )));
+    }
+    let marker = reader.read_u32::<LittleEndian>()?;
+    if marker != ENDIAN_MARKER {
+        return Err(Error::CorruptFile(format!(
+            "invalid endian marker {marker:#010x}"
+        )));
+    }
+
+    let dimension = usize_len(u64::from(reader.read_u32::<LittleEndian>()?), "dimension")?;
+    let num_centroids =
+        usize_len(u64::from(reader.read_u32::<LittleEndian>()?), "centroid count")?;
+    let num_documents = usize_len(reader.read_u64::<LittleEndian>()?, "document count")?;
+    let num_tokens = usize_len(reader.read_u64::<LittleEndian>()?, "token count")?;
+    let num_postings = usize_len(reader.read_u64::<LittleEndian>()?, "posting count")?;
+    if dimension == 0 || num_centroids == 0 {
+        return Err(Error::CorruptFile(
+            "dimension and centroid count must be positive".to_string(),
+        ));
+    }
+    if num_documents > u32::MAX as usize {
+        return Err(Error::CorruptFile(format!(
+            "document count {num_documents} exceeds PLAID v1 limit {}",
+            u32::MAX
+        )));
+    }
+    if num_postings > num_tokens {
+        return Err(Error::CorruptFile(format!(
+            "posting count {num_postings} exceeds token count {num_tokens}"
+        )));
+    }
+    let residual_bits = dimension
+        .checked_mul(usize::from(nbits))
+        .ok_or_else(|| Error::CorruptFile("residual bit width overflow".to_string()))?;
+    if residual_bits % 8 != 0 {
+        return Err(Error::CorruptFile(format!(
+            "dimension * nbits must be divisible by 8, got {dimension} * {nbits}"
+        )));
+    }
+    let num_buckets = 1_usize << nbits;
+    let mut expected = HEADER_LEN;
+    expected = checked_section_len(
+        expected,
+        num_centroids
+            .checked_mul(dimension)
+            .ok_or_else(|| Error::CorruptFile("centroid count overflow".to_string()))?,
+        std::mem::size_of::<f32>(),
+        "centroids",
+    )?;
+    expected = checked_section_len(
+        expected,
+        num_buckets - 1,
+        std::mem::size_of::<f32>(),
+        "bucket cutoffs",
+    )?;
+    expected = checked_section_len(
+        expected,
+        num_buckets,
+        std::mem::size_of::<f32>(),
+        "bucket weights",
+    )?;
+    expected = checked_section_len(
+        expected,
+        num_documents,
+        std::mem::size_of::<u64>(),
+        "row addresses",
+    )?;
+    expected = checked_section_len(
+        expected,
+        num_documents
+            .checked_add(1)
+            .ok_or_else(|| Error::CorruptFile("document offset count overflow".to_string()))?,
+        std::mem::size_of::<u64>(),
+        "document offsets",
+    )?;
+    expected = checked_section_len(
+        expected,
+        num_tokens,
+        std::mem::size_of::<u32>(),
+        "token codes",
+    )?;
+    expected = checked_section_len(
+        expected,
+        num_tokens,
+        residual_bits / 8,
+        "packed residuals",
+    )?;
+    expected = checked_section_len(
+        expected,
+        num_centroids
+            .checked_add(1)
+            .ok_or_else(|| Error::CorruptFile("posting offset count overflow".to_string()))?,
+        std::mem::size_of::<u64>(),
+        "posting offsets",
+    )?;
+    expected = checked_section_len(
+        expected,
+        num_postings,
+        std::mem::size_of::<u32>(),
+        "postings",
+    )?;
+    if expected != bytes.len() {
+        return Err(Error::CorruptFile(format!(
+            "encoded length mismatch: header requires {expected} bytes, file has {}",
+            bytes.len()
+        )));
+    }
+    Ok(())
+}
+
+fn checked_section_len(
+    current: usize,
+    count: usize,
+    width: usize,
+    name: &str,
+) -> Result<usize> {
+    let bytes = count
+        .checked_mul(width)
+        .ok_or_else(|| Error::CorruptFile(format!("{name} byte length overflow")))?;
+    current
+        .checked_add(bytes)
+        .ok_or_else(|| Error::CorruptFile(format!("encoded length overflow at {name}")))
 }
 
 fn u32_len(value: usize, name: &str) -> Result<u32> {

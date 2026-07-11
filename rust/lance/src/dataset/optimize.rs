@@ -82,7 +82,7 @@
 //! they can be committed in any order.
 use lance_core::utils::row_addr_remap::{GroupInput, RowAddrRemap};
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::ops::{AddAssign, Range};
 use std::sync::Arc;
@@ -99,6 +99,7 @@ use crate::Dataset;
 use crate::Result;
 use crate::dataset::utils::CapturedRowIds;
 use crate::index::DatasetIndexExt;
+use crate::index::plaid::is_plaid_index_metadata;
 use crate::io::commit::{commit_transaction, migrate_fragments};
 use arrow::array::AsArray;
 use arrow::datatypes::{UInt8Type, UInt32Type, UInt64Type};
@@ -798,6 +799,14 @@ impl CompactionPlanner for DefaultCompactionPlanner {
             all_tasks
         };
 
+        refuse_plaid_compaction(
+            dataset,
+            tasks
+                .iter()
+                .flat_map(|task| task.fragments.iter().map(|fragment| fragment.id)),
+        )
+        .await?;
+
         let mut compaction_plan =
             CompactionPlan::new(dataset.manifest.version, self.options.clone());
         compaction_plan.extend_tasks(tasks);
@@ -1363,6 +1372,11 @@ impl CompactionTask {
         } else {
             Cow::Owned(dataset.checkout_version(self.read_version).await?)
         };
+        refuse_plaid_compaction(
+            dataset.as_ref(),
+            self.task.fragments.iter().map(|fragment| fragment.id),
+        )
+        .await?;
         rewrite_files(dataset, self.task.clone(), &self.options).await
     }
 }
@@ -1955,6 +1969,34 @@ async fn recalc_versions_for_rewritten_fragments(
     Ok(())
 }
 
+async fn refuse_plaid_compaction(
+    dataset: &Dataset,
+    affected_fragment_ids: impl IntoIterator<Item = u64>,
+) -> Result<()> {
+    let affected = affected_fragment_ids.into_iter().collect::<HashSet<_>>();
+    if affected.is_empty() {
+        return Ok(());
+    }
+    let indices = dataset.load_indices().await?;
+    if let Some(index) = indices.iter().find(|index| {
+        is_plaid_index_metadata(index)
+            && index.fragment_bitmap.as_ref().is_none_or(|covered| {
+                covered
+                    .iter()
+                    .any(|fragment_id| affected.contains(&u64::from(fragment_id)))
+            })
+    }) {
+        return Err(Error::not_supported_source(
+            format!(
+                "compaction would rewrite rows covered by PLAID index '{}'; drop and rebuild the PLAID index before compaction",
+                index.name
+            )
+            .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Commit the results of file compaction.
 ///
 /// It is not required that all tasks are passed to this method. If some failed,
@@ -1970,6 +2012,15 @@ pub async fn commit_compaction(
     if completed_tasks.is_empty() {
         return Ok(CompactionMetrics::default());
     }
+    refuse_plaid_compaction(
+        dataset,
+        completed_tasks.iter().flat_map(|task| {
+            task.original_fragments
+                .iter()
+                .map(|fragment| fragment.id)
+        }),
+    )
+    .await?;
 
     // If we aren't using stable row ids, then we need to remap indices.
     let needs_remapping = !dataset.manifest.uses_stable_row_ids() && !options.defer_index_remap;

@@ -18,6 +18,7 @@ use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_core::utils::tokio::spawn_cpu;
 use lance_core::{Error, ROW_ADDR, Result};
 use lance_index::metrics::MetricsCollector;
 use lance_index::pb::vector_index_details::{Compression, FlatCompression};
@@ -38,13 +39,13 @@ use lance_select::RowAddrMask;
 use lance_table::format::{IndexFile, IndexMetadata};
 use ndarray::{Array2, ArrayView2};
 use prost_types::Any as ProstAny;
+use rand::rngs::SmallRng;
+use rand::{Rng, SeedableRng};
 use roaring::RoaringBitmap;
 use serde_json::json;
 use uuid::Uuid;
 
-use super::vector::utils::{
-    filter_finite_training_data, get_vector_type, maybe_sample_training_data,
-};
+use super::vector::utils::{filter_finite_training_data, get_vector_type};
 use crate::dataset::Dataset;
 
 /// Built-in index family name used by [`PlaidIndexParams`].
@@ -53,11 +54,16 @@ pub const LANCE_PLAID_INDEX: &str = "PLAID";
 pub const PLAID_RUNTIME_HINT: &str = "lance.plaid";
 const PLAID_FORMAT_HINT: &str = "lance.plaid.format_version";
 const PLAID_NBITS_HINT: &str = "lance.plaid.nbits";
+const PLAID_CENTROIDS_HINT: &str = "lance.plaid.num_centroids";
+const PLAID_TRAINING_SEED_HINT: &str = "lance.plaid.training_seed";
+const PLAID_TRAINING_SEED: u64 = 42;
+pub(crate) const PLAID_DEFAULT_N_FULL_SCORES: usize = 4096;
+pub(crate) const PLAID_DEFAULT_DECOMPRESS_DOCUMENTS: usize = 1024;
 
 /// Build parameters for the database-native CPU PLAID index.
 #[derive(Clone, Debug)]
 pub struct PlaidIndexParams {
-    /// Requested number of coarse centroids. Small datasets use fewer.
+    /// Requested number of coarse centroids. Zero selects NextPlaid's automatic rule.
     pub num_centroids: usize,
     /// Residual bits per dimension. Version 1 supports 2 and 4.
     pub nbits: u8,
@@ -70,7 +76,7 @@ pub struct PlaidIndexParams {
 impl Default for PlaidIndexParams {
     fn default() -> Self {
         Self {
-            num_centroids: 1024,
+            num_centroids: 0,
             nbits: 2,
             max_iterations: 20,
             sample_rate: 256,
@@ -80,10 +86,10 @@ impl Default for PlaidIndexParams {
 
 impl PlaidIndexParams {
     fn validate(&self) -> Result<()> {
-        if self.num_centroids == 0 || self.max_iterations == 0 || self.sample_rate == 0 {
+        if self.max_iterations == 0 || self.sample_rate == 0 {
             return Err(Error::invalid_input(format!(
-                "PLAID num_centroids, max_iterations, and sample_rate must be positive, got {}, {}, {}",
-                self.num_centroids, self.max_iterations, self.sample_rate
+                "PLAID max_iterations and sample_rate must be positive, got {} and {}",
+                self.max_iterations, self.sample_rate
             )));
         }
         if !matches!(self.nbits, 2 | 4) {
@@ -112,9 +118,21 @@ pub(crate) fn plaid_index_details(params: &PlaidIndexParams) -> Result<ProstAny>
         (PLAID_RUNTIME_HINT.to_string(), "true".to_string()),
         (PLAID_FORMAT_HINT.to_string(), "1".to_string()),
         (PLAID_NBITS_HINT.to_string(), params.nbits.to_string()),
+        (
+            PLAID_CENTROIDS_HINT.to_string(),
+            if params.num_centroids == 0 {
+                "auto".to_string()
+            } else {
+                params.num_centroids.to_string()
+            },
+        ),
+        (
+            PLAID_TRAINING_SEED_HINT.to_string(),
+            PLAID_TRAINING_SEED.to_string(),
+        ),
     ]);
     let details = VectorIndexDetails {
-        metric_type: VectorMetricType::Cosine.into(),
+        metric_type: VectorMetricType::Dot.into(),
         target_partition_size: 0,
         hnsw_index_config: None,
         compression: Some(Compression::Flat(FlatCompression {})),
@@ -173,34 +191,41 @@ pub(crate) async fn build_plaid_index(
     progress
         .stage_start("plaid_train", None, "token vectors")
         .await?;
-    let sample_size = params
-        .num_centroids
+    let requested_centroids = if params.num_centroids == 0 {
+        next_plaid_num_centroids(count_plaid_tokens(dataset, column).await?)?
+    } else {
+        params.num_centroids
+    };
+    let sample_size = requested_centroids
         .checked_mul(params.sample_rate)
         .ok_or_else(|| Error::invalid_input("PLAID training sample size overflow".to_string()))?;
-    let training = maybe_sample_training_data(dataset, column, sample_size, None).await?;
+    let training = sample_plaid_training_data(
+        dataset,
+        column,
+        dimension,
+        sample_size,
+        PLAID_TRAINING_SEED,
+    )
+    .await?;
     let training = filter_finite_training_data(training)?;
     if training.is_empty() {
         return Err(Error::invalid_input(
             "PLAID cannot train on an empty multi-vector column".to_string(),
         ));
     }
-    let num_centroids = params.num_centroids.min(training.len());
+    let num_centroids = requested_centroids.min(training.len());
     let raw_training_values = training.values().as_primitive::<Float32Type>().clone();
-    let mut normalized_training_values = raw_training_values.values().to_vec();
-    for token in normalized_training_values.chunks_exact_mut(dimension) {
-        normalize_token(token)?;
-    }
-    let normalized_training_values = Float32Array::from(normalized_training_values);
-    // Lance KMeans lacks direct Cosine membership. L2 assignment on unit
-    // vectors is equivalent to maximum dot-product assignment.
+    // Match NextPlaid: train L2 KMeans on raw pooled embeddings, then
+    // normalize only the learned centroids before assignment and residuals.
     let kmeans_params = lance_index::vector::kmeans::KMeansParams::new(
         None,
         params.max_iterations,
         1,
         DistanceType::L2,
-    );
+    )
+    .with_seed(PLAID_TRAINING_SEED);
     let model = lance_index::vector::kmeans::train_kmeans::<Float32Type>(
-        &normalized_training_values,
+        &raw_training_values,
         kmeans_params,
         dimension,
         num_centroids,
@@ -373,7 +398,8 @@ pub(crate) async fn open_plaid_index(
         .join(metadata.uuid.to_string())
         .join(INDEX_FILE_NAME);
     let bytes = store.read_one_all(&path).await?;
-    let index = PlaidIndex::read_from_bytes(&bytes).map_err(plaid_error)?;
+    let index =
+        spawn_cpu(move || PlaidIndex::read_from_bytes(bytes.as_ref()).map_err(plaid_error)).await?;
     Ok(Arc::new(PlaidVectorIndex::try_new(index)?))
 }
 
@@ -393,22 +419,59 @@ impl PlaidVectorIndex {
         Ok(Self {
             core: Arc::new(core),
             ivf_model: IvfModel::new(centroids, None),
-            quantizer: FlatQuantizer::new(dimension, DistanceType::Cosine),
+            quantizer: FlatQuantizer::new(dimension, DistanceType::Dot),
         })
     }
 
-    pub(crate) fn candidate_params(&self, query: &Query, top_k: usize) -> PlaidSearchParams {
-        let n_ivf_probe = query
+    pub(crate) fn candidate_params(
+        &self,
+        query: &Query,
+        requested_candidates: usize,
+        mask: &RowAddrMask,
+    ) -> (PlaidSearchParams, usize) {
+        let probe_ceiling = query
             .maximum_nprobes
-            .unwrap_or_else(|| query.minimum_nprobes.max(8))
+            .unwrap_or(self.core.num_centroids())
             .min(self.core.num_centroids())
             .max(1);
-        PlaidSearchParams {
-            n_ivf_probe,
-            n_full_scores: top_k.saturating_mul(4).max(top_k),
-            top_k,
-            centroid_score_threshold: Some(0.4),
-        }
+        let base_nprobe = query.minimum_nprobes.max(8).min(probe_ceiling).max(1);
+        let segment_eligible = mask.iter_addrs().map(|addresses| {
+            addresses
+                .map(u64::from)
+                .filter(|address| self.core.document_ordinal(*address).is_some())
+                .count()
+        });
+        let eligible = segment_eligible.unwrap_or(self.core.num_documents());
+        let adaptive_factor = if segment_eligible.is_some() && eligible > 0 {
+            self.core.num_documents().div_ceil(eligible).max(1)
+        } else {
+            1
+        };
+        let n_ivf_probe = base_nprobe
+            .saturating_mul(adaptive_factor)
+            .min(probe_ceiling)
+            .max(1);
+        let raw_candidates = requested_candidates
+            .max(PLAID_DEFAULT_DECOMPRESS_DOCUMENTS)
+            .min(eligible.max(1));
+        (
+            PlaidSearchParams {
+                n_ivf_probe,
+                n_full_scores: PLAID_DEFAULT_N_FULL_SCORES
+                    .max(raw_candidates.saturating_mul(4)),
+                top_k: raw_candidates,
+                centroid_score_threshold: Some(0.4),
+            },
+            eligible,
+        )
+    }
+
+    pub(crate) fn num_centroids(&self) -> usize {
+        self.core.num_centroids()
+    }
+
+    pub(crate) fn num_documents(&self) -> usize {
+        self.core.num_documents()
     }
 
     pub(crate) fn search_candidates(
@@ -488,9 +551,9 @@ impl VectorIndex for PlaidVectorIndex {
     ) -> Result<RecordBatch> {
         let query_tokens = query_to_array(query, self.core.dimension())?;
         pre_filter.wait_for_ready().await?;
-        let params = self.candidate_params(query, query.k);
-        let (hits, stats) =
-            self.search_candidates(query_tokens.view(), &params, &pre_filter.mask())?;
+        let mask = pre_filter.mask();
+        let (params, _) = self.candidate_params(query, query.k, mask.as_ref());
+        let (hits, stats) = self.search_candidates(query_tokens.view(), &params, mask.as_ref())?;
         metrics.record_comparisons(
             usize::try_from(stats.exact_documents)
                 .unwrap_or(usize::MAX)
@@ -498,11 +561,16 @@ impl VectorIndex for PlaidVectorIndex {
         );
         let distances = Float32Array::from(
             hits.iter()
-                .map(|hit| query_tokens.nrows() as f32 - hit.score)
+                .take(query.k)
+                .map(|hit| maxsim_distance(hit.score))
                 .collect::<Vec<_>>(),
         );
-        let row_addresses =
-            UInt64Array::from(hits.iter().map(|hit| hit.row_address).collect::<Vec<_>>());
+        let row_addresses = UInt64Array::from(
+            hits.iter()
+                .take(query.k)
+                .map(|hit| hit.row_address)
+                .collect::<Vec<_>>(),
+        );
         Ok(RecordBatch::try_new(
             VECTOR_RESULT_SCHEMA.clone(),
             vec![Arc::new(distances), Arc::new(row_addresses)],
@@ -570,12 +638,13 @@ impl VectorIndex for PlaidVectorIndex {
 
     async fn remap(&mut self, _mapping: &RowAddrRemap) -> Result<()> {
         Err(Error::not_supported(
-            "PLAID row-address remapping requires rebuilding the segment".to_string(),
+            "PLAID stores physical row addresses and refuses in-place remapping; drop and rebuild the PLAID index"
+                .to_string(),
         ))
     }
 
     fn metric_type(&self) -> DistanceType {
-        DistanceType::Cosine
+        DistanceType::Dot
     }
 
     fn ivf_model(&self) -> &IvfModel {
@@ -597,6 +666,10 @@ impl VectorIndex for PlaidVectorIndex {
     fn sub_index_type(&self) -> (SubIndexType, QuantizationType) {
         (SubIndexType::Flat, QuantizationType::Flat)
     }
+}
+
+pub(crate) fn maxsim_distance(maxsim: f32) -> f32 {
+    1.0 - maxsim
 }
 
 pub(crate) fn query_to_array(query: &Query, dimension: usize) -> Result<Array2<f32>> {
@@ -625,6 +698,98 @@ pub(crate) fn query_to_array(query: &Query, dimension: usize) -> Result<Array2<f
         )?;
     }
     Ok(query_tokens)
+}
+
+async fn count_plaid_tokens(dataset: &Dataset, column: &str) -> Result<usize> {
+    let mut scanner = dataset.scan();
+    scanner.project(&[column])?;
+    let mut stream = scanner.try_into_stream().await?;
+    let mut total = 0_usize;
+    while let Some(batch) = stream.try_next().await? {
+        let documents = batch
+            .column_by_qualified_name(column)
+            .ok_or_else(|| Error::invalid_input(format!("PLAID column {column} missing from batch")))?
+            .as_list::<i32>();
+        for row_index in 0..documents.len() {
+            if !documents.is_null(row_index) {
+                total = total
+                    .checked_add(documents.value(row_index).len())
+                    .ok_or_else(|| Error::invalid_input("PLAID token count overflow".to_string()))?;
+            }
+        }
+    }
+    Ok(total)
+}
+
+async fn sample_plaid_training_data(
+    dataset: &Dataset,
+    column: &str,
+    dimension: usize,
+    sample_size: usize,
+    seed: u64,
+) -> Result<FixedSizeListArray> {
+    let mut scanner = dataset.scan();
+    scanner.project(&[column])?;
+    let mut stream = scanner.try_into_stream().await?;
+    let mut rng = SmallRng::seed_from_u64(seed);
+    let initial_capacity = sample_size
+        .min(4_096)
+        .checked_mul(dimension)
+        .ok_or_else(|| Error::invalid_input("PLAID sample capacity overflow".to_string()))?;
+    let mut sampled = Vec::<f32>::with_capacity(initial_capacity);
+    let mut seen = 0_usize;
+
+    while let Some(batch) = stream.try_next().await? {
+        let documents = batch
+            .column_by_qualified_name(column)
+            .ok_or_else(|| Error::invalid_input(format!("PLAID column {column} missing from batch")))?
+            .as_list::<i32>();
+        for row_index in 0..documents.len() {
+            if documents.is_null(row_index) {
+                continue;
+            }
+            let document = documents.value(row_index);
+            let tokens = document.as_fixed_size_list();
+            for token_index in 0..tokens.len() {
+                if tokens.is_null(token_index) {
+                    return Err(Error::invalid_input(
+                        "PLAID does not support null token vectors".to_string(),
+                    ));
+                }
+                let token = tokens.value(token_index);
+                let token = token.as_primitive::<Float32Type>();
+                validate_token(token.values())?;
+                if seen < sample_size {
+                    sampled.extend_from_slice(token.values());
+                } else {
+                    let replacement = rng.random_range(0..=seen);
+                    if replacement < sample_size {
+                        let start = replacement.checked_mul(dimension).ok_or_else(|| {
+                            Error::invalid_input("PLAID sample offset overflow".to_string())
+                        })?;
+                        sampled[start..start + dimension].copy_from_slice(token.values());
+                    }
+                }
+                seen = seen
+                    .checked_add(1)
+                    .ok_or_else(|| Error::invalid_input("PLAID token count overflow".to_string()))?;
+            }
+        }
+    }
+
+    FixedSizeListArray::try_new_from_values(Float32Array::from(sampled), dimension as i32)
+}
+
+fn next_plaid_num_centroids(total_tokens: usize) -> Result<usize> {
+    if total_tokens == 0 {
+        return Err(Error::invalid_input(
+            "PLAID cannot train on an empty multi-vector column".to_string(),
+        ));
+    }
+    let target = 16.0_f64 * (total_tokens as f64).sqrt();
+    let exponent = target.log2().floor().max(0.0) as u32;
+    let exponent = exponent.min(usize::BITS - 1);
+    Ok((1_usize << exponent).min(total_tokens))
 }
 
 fn normalize_rows(rows: &mut Array2<f32>) -> Result<()> {
@@ -729,6 +894,8 @@ mod tests {
     use lance_index::metrics::NoOpMetricsCollector;
 
     use crate::DatasetBuilder;
+    use crate::dataset::WriteParams;
+    use crate::dataset::optimize::{CompactionOptions, compact_files};
     use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
     use crate::session::Session;
     use lance_index::vector::DIST_COL;
@@ -770,12 +937,162 @@ mod tests {
     }
 
     #[test]
+    fn automatic_centroids_match_next_plaid_rule() {
+        assert_eq!(next_plaid_num_centroids(65_536).unwrap(), 4_096);
+        assert_eq!(next_plaid_num_centroids(1_000_000).unwrap(), 8_192);
+        assert_eq!(next_plaid_num_centroids(1).unwrap(), 1);
+    }
+
+    #[test]
     fn pooled_token_residual_uses_raw_next_plaid_semantics() {
         let token = [0.5_f32, 0.0, 0.0, 0.0];
         let centroid = [1.0_f32, 0.0, 0.0, 0.0];
         let mut residual = Vec::new();
         append_raw_residual(&token, &centroid, &mut residual).unwrap();
         assert_eq!(residual, vec![-0.5, 0.0, 0.0, 0.0]);
+    }
+
+    #[tokio::test]
+    async fn stable_row_ids_take_physical_addresses_across_two_fragments() {
+        let directory = TempStrDir::default();
+        let first = make_batch(
+            vec![0, 1],
+            vec![
+                vec![[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]],
+                vec![[0.8, 0.0, 0.0, 0.0], [0.0, 0.8, 0.0, 0.0]],
+            ],
+        );
+        let schema = first.schema();
+        let reader = RecordBatchIterator::new(vec![Ok(first)], schema.clone());
+        let mut dataset = Dataset::write(
+            reader,
+            directory.as_ref(),
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let second = make_batch(
+            vec![2, 3],
+            vec![
+                vec![[0.7, 0.0, 0.0, 0.0], [0.0, 0.7, 0.0, 0.0]],
+                vec![[-1.0, 0.0, 0.0, 0.0], [0.0, -1.0, 0.0, 0.0]],
+            ],
+        );
+        dataset
+            .append(RecordBatchIterator::new(vec![Ok(second)], schema), None)
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["mv"],
+                IndexType::Vector,
+                Some("plaid_idx".to_string()),
+                &PlaidIndexParams {
+                    num_centroids: 2,
+                    nbits: 2,
+                    max_iterations: 3,
+                    sample_rate: 4,
+                },
+                false,
+            )
+            .await
+            .unwrap();
+
+        let second_fragment = search_ids(&dataset, Some("id = 2"), 1).await;
+        assert_eq!(
+            second_fragment["id"]
+                .as_primitive::<arrow::datatypes::Int32Type>()
+                .values(),
+            &[2]
+        );
+        dataset.delete("id = 2").await.unwrap();
+        let after_delete = search_ids(&dataset, None, 4).await;
+        assert!(
+            !after_delete["id"]
+                .as_primitive::<arrow::datatypes::Int32Type>()
+                .values()
+                .contains(&2)
+        );
+    }
+
+    #[tokio::test]
+    async fn plaid_compaction_is_refused_before_rewrite_for_all_row_id_modes() {
+        for stable_row_ids in [false, true] {
+            for defer_index_remap in [false, true] {
+                let directory = TempStrDir::default();
+                let first = make_batch(
+                    vec![0, 1],
+                    vec![
+                        vec![[1.0, 0.0, 0.0, 0.0]],
+                        vec![[0.0, 1.0, 0.0, 0.0]],
+                    ],
+                );
+                let schema = first.schema();
+                let reader = RecordBatchIterator::new(vec![Ok(first)], schema.clone());
+                let mut dataset = Dataset::write(
+                    reader,
+                    directory.as_ref(),
+                    Some(WriteParams {
+                        max_rows_per_file: 2,
+                        enable_stable_row_ids: stable_row_ids,
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap();
+                let second = make_batch(
+                    vec![2, 3],
+                    vec![
+                        vec![[0.8, 0.0, 0.0, 0.0]],
+                        vec![[0.0, 0.8, 0.0, 0.0]],
+                    ],
+                );
+                dataset
+                    .append(RecordBatchIterator::new(vec![Ok(second)], schema), None)
+                    .await
+                    .unwrap();
+                dataset
+                    .create_index(
+                        &["mv"],
+                        IndexType::Vector,
+                        Some("plaid_idx".to_string()),
+                        &PlaidIndexParams {
+                            num_centroids: 2,
+                            nbits: 2,
+                            max_iterations: 3,
+                            sample_rate: 4,
+                        },
+                        false,
+                    )
+                    .await
+                    .unwrap();
+
+                let version = dataset.version().version;
+                let fragments = dataset.fragments().as_ref().clone();
+                let error = compact_files(
+                    &mut dataset,
+                    CompactionOptions {
+                        target_rows_per_fragment: 100,
+                        defer_index_remap,
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .await
+                .unwrap_err();
+                if stable_row_ids && defer_index_remap {
+                    assert!(error.to_string().contains("stable row IDs"));
+                } else {
+                    assert!(error.to_string().contains("PLAID"));
+                }
+                assert_eq!(dataset.version().version, version);
+                assert_eq!(dataset.fragments().as_ref(), &fragments);
+            }
+        }
     }
 
     #[tokio::test]
@@ -829,6 +1146,7 @@ mod tests {
             .await
             .unwrap();
         let plaid = opened.as_any().downcast_ref::<PlaidVectorIndex>().unwrap();
+        assert_eq!(plaid.metric_type(), DistanceType::Dot);
         assert_eq!(plaid.core.row_addresses().len(), 4);
         assert_eq!(
             RowAddress::from(plaid.core.row_addresses()[0]).fragment_id(),
@@ -874,9 +1192,21 @@ mod tests {
             &[0, 1, 2]
         );
         let distances = result[DIST_COL].as_primitive::<Float32Type>();
-        assert!((distances.value(0) - 0.0).abs() < 1.0e-5);
-        assert!((distances.value(1) - 0.0).abs() < 1.0e-5);
-        assert!((distances.value(2) - 1.0).abs() < 1.0e-5);
+        assert!((distances.value(0) - -1.0).abs() < 1.0e-5);
+        assert!((distances.value(1) - -1.0).abs() < 1.0e-5);
+        assert!((distances.value(2) - 0.0).abs() < 1.0e-5);
+
+        let mut bounded_scanner = dataset.scan();
+        bounded_scanner.nearest("mv", &query(), 4).unwrap();
+        bounded_scanner.distance_range(Some(-0.5), Some(0.5));
+        bounded_scanner.project(&["id"]).unwrap();
+        let bounded = bounded_scanner.try_into_batch().await.unwrap();
+        assert_eq!(
+            bounded["id"]
+                .as_primitive::<arrow::datatypes::Int32Type>()
+                .values(),
+            &[2]
+        );
 
         let allowed = search_ids(&dataset, Some("id IN (1, 2)"), 3).await;
         assert_eq!(
@@ -906,6 +1236,44 @@ mod tests {
                 .as_primitive::<arrow::datatypes::Int32Type>()
                 .values()
                 .contains(&0)
+        );
+
+        let appended = make_batch(
+            vec![4],
+            vec![vec![
+                [0.75, 0.0, 0.0, 0.0],
+                [0.0, 0.75, 0.0, 0.0],
+            ]],
+        );
+        let appended_schema = appended.schema();
+        dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(appended)], appended_schema),
+                None,
+            )
+            .await
+            .unwrap();
+        let with_flat_fallback = search_ids(&dataset, None, 4).await;
+        let fallback_ids = with_flat_fallback["id"]
+            .as_primitive::<arrow::datatypes::Int32Type>();
+        let appended_position = fallback_ids
+            .values()
+            .iter()
+            .position(|id| *id == 4)
+            .expect("unindexed appended row must be merged with PLAID results");
+        let fallback_distances = with_flat_fallback[DIST_COL].as_primitive::<Float32Type>();
+        assert!((fallback_distances.value(appended_position) - -0.5).abs() < 1.0e-5);
+
+        let mut fallback_bounds = dataset.scan();
+        fallback_bounds.nearest("mv", &query(), 4).unwrap();
+        fallback_bounds.distance_range(Some(-0.75), Some(-0.25));
+        fallback_bounds.project(&["id"]).unwrap();
+        let fallback_bounds = fallback_bounds.try_into_batch().await.unwrap();
+        assert_eq!(
+            fallback_bounds["id"]
+                .as_primitive::<arrow::datatypes::Int32Type>()
+                .values(),
+            &[4]
         );
     }
 }

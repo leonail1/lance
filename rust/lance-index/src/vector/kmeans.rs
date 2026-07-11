@@ -88,6 +88,9 @@ pub struct KMeansParams {
 
     /// Optional sync callback for iteration progress: (current_iteration, max_iterations).
     pub on_progress: Option<Arc<dyn Fn(u32, u32) + Send + Sync>>,
+
+    /// Optional deterministic seed for centroid initialization and empty-cluster repair.
+    pub seed: Option<u64>,
 }
 
 impl std::fmt::Debug for KMeansParams {
@@ -101,6 +104,7 @@ impl std::fmt::Debug for KMeansParams {
             .field("balance_factor", &self.balance_factor)
             .field("hierarchical_k", &self.hierarchical_k)
             .field("on_progress", &self.on_progress.as_ref().map(|_| "..."))
+            .field("seed", &self.seed)
             .finish()
     }
 }
@@ -116,6 +120,7 @@ impl Default for KMeansParams {
             balance_factor: 0.0,
             hierarchical_k: 16,
             on_progress: None,
+            seed: None,
         }
     }
 }
@@ -152,6 +157,12 @@ impl KMeansParams {
 
     pub fn with_on_progress(mut self, cb: Arc<dyn Fn(u32, u32) + Send + Sync>) -> Self {
         self.on_progress = Some(cb);
+        self
+    }
+
+    /// Use a deterministic random stream for repeatable KMeans training.
+    pub fn with_seed(mut self, seed: u64) -> Self {
+        self.seed = Some(seed);
         self
     }
 
@@ -198,9 +209,9 @@ fn split_clusters<T: Float + MulAssign>(
     cnts: &mut [usize],
     centroids: &mut [T],
     dim: usize,
+    mut rng: impl Rng,
 ) {
     let eps = T::from(1.0 / 1024.0).unwrap();
-    let mut rng = SmallRng::from_os_rng();
     for i in 0..cnts.len() {
         if cnts[i] == 0 {
             let mut j = 0;
@@ -321,6 +332,7 @@ pub trait KMeansAlgo<T: Num> {
         cluster_sizes: &mut [usize],
         distance_type: DistanceType,
         loss: f64,
+        rng: &mut impl Rng,
     ) -> KMeans;
 }
 
@@ -398,6 +410,7 @@ where
         cluster_sizes: &mut [usize],
         distance_type: DistanceType,
         loss: f64,
+        rng: &mut impl Rng,
     ) -> KMeans {
         let mut centroids = vec![T::Native::zero(); k * dimension];
 
@@ -464,6 +477,7 @@ where
             cluster_sizes,
             &mut centroids,
             dimension,
+            rng,
         );
 
         KMeans {
@@ -514,6 +528,7 @@ impl KMeansAlgo<u8> for KModeAlgo {
         _cluster_sizes: &mut [usize],
         distance_type: DistanceType,
         loss: f64,
+        _rng: &mut impl Rng,
     ) -> KMeans {
         assert_eq!(distance_type, DistanceType::Hamming);
 
@@ -799,8 +814,10 @@ impl KMeans {
         let mut cluster_sizes = vec![0; k];
         let mut adjusted_balance_factor = f32::MAX;
 
-        // TODO: use seed for Rng.
-        let mut rng = SmallRng::from_os_rng();
+        let mut rng = match params.seed {
+            Some(seed) => SmallRng::seed_from_u64(seed),
+            None => SmallRng::from_os_rng(),
+        };
         for redo in 1..=params.redos {
             let mut kmeans: Self = match &params.init {
                 KMeanInit::Random => Self::init_random::<T>(
@@ -860,6 +877,7 @@ impl KMeans {
                     &mut cluster_sizes,
                     params.distance_type,
                     last_loss,
+                    &mut rng,
                 );
                 if (loss - last_loss).abs() < params.tolerance * last_loss {
                     info!(
