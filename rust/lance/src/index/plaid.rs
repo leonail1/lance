@@ -199,14 +199,9 @@ pub(crate) async fn build_plaid_index(
     let sample_size = requested_centroids
         .checked_mul(params.sample_rate)
         .ok_or_else(|| Error::invalid_input("PLAID training sample size overflow".to_string()))?;
-    let training = sample_plaid_training_data(
-        dataset,
-        column,
-        dimension,
-        sample_size,
-        PLAID_TRAINING_SEED,
-    )
-    .await?;
+    let training =
+        sample_plaid_training_data(dataset, column, dimension, sample_size, PLAID_TRAINING_SEED)
+            .await?;
     let training = filter_finite_training_data(training)?;
     if training.is_empty() {
         return Err(Error::invalid_input(
@@ -457,8 +452,7 @@ impl PlaidVectorIndex {
         (
             PlaidSearchParams {
                 n_ivf_probe,
-                n_full_scores: PLAID_DEFAULT_N_FULL_SCORES
-                    .max(raw_candidates.saturating_mul(4)),
+                n_full_scores: PLAID_DEFAULT_N_FULL_SCORES.max(raw_candidates.saturating_mul(4)),
                 top_k: raw_candidates,
                 centroid_score_threshold: Some(0.4),
             },
@@ -708,13 +702,17 @@ async fn count_plaid_tokens(dataset: &Dataset, column: &str) -> Result<usize> {
     while let Some(batch) = stream.try_next().await? {
         let documents = batch
             .column_by_qualified_name(column)
-            .ok_or_else(|| Error::invalid_input(format!("PLAID column {column} missing from batch")))?
+            .ok_or_else(|| {
+                Error::invalid_input(format!("PLAID column {column} missing from batch"))
+            })?
             .as_list::<i32>();
         for row_index in 0..documents.len() {
             if !documents.is_null(row_index) {
                 total = total
                     .checked_add(documents.value(row_index).len())
-                    .ok_or_else(|| Error::invalid_input("PLAID token count overflow".to_string()))?;
+                    .ok_or_else(|| {
+                        Error::invalid_input("PLAID token count overflow".to_string())
+                    })?;
             }
         }
     }
@@ -742,7 +740,9 @@ async fn sample_plaid_training_data(
     while let Some(batch) = stream.try_next().await? {
         let documents = batch
             .column_by_qualified_name(column)
-            .ok_or_else(|| Error::invalid_input(format!("PLAID column {column} missing from batch")))?
+            .ok_or_else(|| {
+                Error::invalid_input(format!("PLAID column {column} missing from batch"))
+            })?
             .as_list::<i32>();
         for row_index in 0..documents.len() {
             if documents.is_null(row_index) {
@@ -770,14 +770,17 @@ async fn sample_plaid_training_data(
                         sampled[start..start + dimension].copy_from_slice(token.values());
                     }
                 }
-                seen = seen
-                    .checked_add(1)
-                    .ok_or_else(|| Error::invalid_input("PLAID token count overflow".to_string()))?;
+                seen = seen.checked_add(1).ok_or_else(|| {
+                    Error::invalid_input("PLAID token count overflow".to_string())
+                })?;
             }
         }
     }
 
-    FixedSizeListArray::try_new_from_values(Float32Array::from(sampled), dimension as i32)
+    Ok(FixedSizeListArray::try_new_from_values(
+        Float32Array::from(sampled),
+        dimension as i32,
+    )?)
 }
 
 fn next_plaid_num_centroids(total_tokens: usize) -> Result<usize> {
@@ -1026,10 +1029,7 @@ mod tests {
                 let directory = TempStrDir::default();
                 let first = make_batch(
                     vec![0, 1],
-                    vec![
-                        vec![[1.0, 0.0, 0.0, 0.0]],
-                        vec![[0.0, 1.0, 0.0, 0.0]],
-                    ],
+                    vec![vec![[1.0, 0.0, 0.0, 0.0]], vec![[0.0, 1.0, 0.0, 0.0]]],
                 );
                 let schema = first.schema();
                 let reader = RecordBatchIterator::new(vec![Ok(first)], schema.clone());
@@ -1046,10 +1046,7 @@ mod tests {
                 .unwrap();
                 let second = make_batch(
                     vec![2, 3],
-                    vec![
-                        vec![[0.8, 0.0, 0.0, 0.0]],
-                        vec![[0.0, 0.8, 0.0, 0.0]],
-                    ],
+                    vec![vec![[0.8, 0.0, 0.0, 0.0]], vec![[0.0, 0.8, 0.0, 0.0]]],
                 );
                 dataset
                     .append(RecordBatchIterator::new(vec![Ok(second)], schema), None)
@@ -1240,10 +1237,7 @@ mod tests {
 
         let appended = make_batch(
             vec![4],
-            vec![vec![
-                [0.75, 0.0, 0.0, 0.0],
-                [0.0, 0.75, 0.0, 0.0],
-            ]],
+            vec![vec![[0.75, 0.0, 0.0, 0.0], [0.0, 0.75, 0.0, 0.0]]],
         );
         let appended_schema = appended.schema();
         dataset
@@ -1254,8 +1248,7 @@ mod tests {
             .await
             .unwrap();
         let with_flat_fallback = search_ids(&dataset, None, 4).await;
-        let fallback_ids = with_flat_fallback["id"]
-            .as_primitive::<arrow::datatypes::Int32Type>();
+        let fallback_ids = with_flat_fallback["id"].as_primitive::<arrow::datatypes::Int32Type>();
         let appended_position = fallback_ids
             .values()
             .iter()

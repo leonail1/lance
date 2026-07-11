@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arrow::array::AsArray;
-use arrow::datatypes::Float32Type;
+use arrow::datatypes::{Float32Type, UInt64Type};
 use arrow_array::{Array, Float32Array, RecordBatch, UInt64Array};
 use arrow_schema::SchemaRef;
 use datafusion::common::stats::Precision;
@@ -26,20 +26,23 @@ use datafusion::physical_plan::{
 use datafusion_physical_expr::EquivalenceProperties;
 use futures::stream;
 use lance_arrow::RecordBatchExt;
+use lance_core::ROW_ID;
 use lance_core::utils::tokio::spawn_cpu;
 use lance_datafusion::utils::ExecutionPlanMetricsSetExt;
 use lance_index::prefilter::PreFilter;
 use lance_index::vector::Query;
+use lance_select::{RowAddrMask, RowAddrTreeMap};
 use lance_table::format::IndexMetadata;
 use ndarray::{ArrayView1, ArrayView2};
 
 use super::knn::KNN_INDEX_SCHEMA;
 use super::utils::{IndexMetrics, PreFilterSource, build_prefilter};
+use crate::dataset::rowids::get_row_id_index;
 use crate::dataset::{Dataset, ProjectionRequest, TakeBuilder};
 use crate::index::DatasetIndexInternalExt;
 use crate::index::plaid::{
-    PLAID_DEFAULT_DECOMPRESS_DOCUMENTS, PlaidVectorIndex, is_plaid_index_metadata,
-    maxsim_distance, query_to_array,
+    PLAID_DEFAULT_DECOMPRESS_DOCUMENTS, PlaidVectorIndex, is_plaid_index_metadata, maxsim_distance,
+    query_to_array,
 };
 use crate::{Error, Result};
 
@@ -324,7 +327,7 @@ async fn execute_search(
         .max(1);
     let requested_candidates = query.k.saturating_mul(refine).max(query.k);
     let candidate_limit = requested_candidates.max(PLAID_DEFAULT_DECOMPRESS_DOCUMENTS);
-    let mask = prefilter.mask();
+    let mask = plaid_address_mask(dataset.as_ref(), prefilter.mask()).await?;
     let candidate_started = Instant::now();
     let mut candidates = HashMap::<u64, f32>::new();
 
@@ -417,19 +420,14 @@ async fn execute_search(
         .map(|(row_address, _)| *row_address)
         .collect::<Vec<_>>();
     let projection = Arc::new(
-        ProjectionRequest::Schema(Arc::new(
-            dataset.schema().project(&[query.column.as_str()])?,
-        ))
-        .into_projection_plan(dataset.clone())?,
+        ProjectionRequest::from_columns([query.column.as_str(), ROW_ID], dataset.schema())
+            .into_projection_plan(dataset.clone())?,
     );
     let raw_fetch_started = Instant::now();
-    let batch = TakeBuilder::try_new_from_addresses(
-        dataset.clone(),
-        row_addresses.clone(),
-        projection,
-    )?
-    .execute()
-    .await?;
+    let batch =
+        TakeBuilder::try_new_from_addresses(dataset.clone(), row_addresses.clone(), projection)?
+            .execute()
+            .await?;
     metrics.raw_fetch.add_duration(raw_fetch_started.elapsed());
     metrics.raw_rows_count.add(batch.num_rows());
     if batch.num_rows() != row_addresses.len() {
@@ -440,13 +438,19 @@ async fn execute_search(
         )));
     }
 
+    let result_row_ids = batch
+        .column_by_name(ROW_ID)
+        .ok_or_else(|| Error::internal("PLAID address take did not return _rowid".to_string()))?
+        .as_primitive::<UInt64Type>()
+        .values()
+        .to_vec();
     let exact_started = Instant::now();
     let column = query.column.clone();
     let query_for_cpu = query_tokens.clone();
     let mut exact = spawn_cpu(move || exact_scores(&batch, &column, query_for_cpu.view())).await?;
     metrics.exact.add_duration(exact_started.elapsed());
-    for (hit, row_address) in exact.iter_mut().zip(row_addresses) {
-        hit.row_address = row_address;
+    for (hit, row_id) in exact.iter_mut().zip(result_row_ids) {
+        hit.row_address = row_id;
     }
 
     let sort_started = Instant::now();
@@ -470,6 +474,38 @@ async fn execute_search(
     )?;
     metrics.baseline.record_output(batch.num_rows());
     Ok(batch)
+}
+
+async fn plaid_address_mask(dataset: &Dataset, mask: Arc<RowAddrMask>) -> Result<Arc<RowAddrMask>> {
+    if !dataset.manifest().uses_stable_row_ids() {
+        return Ok(mask);
+    }
+    let row_id_index = get_row_id_index(dataset)
+        .await?
+        .ok_or_else(|| Error::internal("stable-row-id dataset has no row-id index".to_string()))?;
+    let translate = |row_ids: &RowAddrTreeMap| -> Result<RowAddrTreeMap> {
+        let row_ids = row_ids
+            .row_addrs()
+            .ok_or_else(|| {
+                Error::not_supported(
+                    "PLAID cannot translate a full-fragment stable-row-id mask".to_string(),
+                )
+            })?
+            .map(u64::from)
+            .collect::<Vec<_>>();
+        Ok(RowAddrTreeMap::from_iter(
+            row_id_index
+                .get_many(&row_ids)
+                .into_iter()
+                .flatten()
+                .map(u64::from),
+        ))
+    };
+    let translated = match mask.as_ref() {
+        RowAddrMask::AllowList(row_ids) => RowAddrMask::from_allowed(translate(row_ids)?),
+        RowAddrMask::BlockList(row_ids) => RowAddrMask::from_block(translate(row_ids)?),
+    };
+    Ok(Arc::new(translated))
 }
 
 struct ExactHit {
@@ -573,16 +609,12 @@ mod tests {
             None,
         )
         .unwrap();
-        let batch = RecordBatch::try_from_iter([(
-            "mv",
-            Arc::new(documents.clone()) as ArrayRef,
-        )])
-        .unwrap();
+        let batch =
+            RecordBatch::try_from_iter([("mv", Arc::new(documents.clone()) as ArrayRef)]).unwrap();
         let query = array![[1.0_f32, 0.0, 0.0, 0.0]];
         let actual = exact_scores(&batch, "mv", query.view()).unwrap();
         let query_values = Float32Array::from(query.iter().copied().collect::<Vec<_>>());
-        let expected =
-            multivec_distance(&query_values, &documents, DistanceType::Dot).unwrap();
+        let expected = multivec_distance(&query_values, &documents, DistanceType::Dot).unwrap();
         let actual = actual.iter().map(|hit| hit.distance).collect::<Vec<_>>();
         assert_eq!(actual.len(), expected.len());
         for (actual, expected) in actual.iter().zip(expected) {

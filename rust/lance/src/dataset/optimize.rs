@@ -799,13 +799,11 @@ impl CompactionPlanner for DefaultCompactionPlanner {
             all_tasks
         };
 
-        refuse_plaid_compaction(
-            dataset,
-            tasks
-                .iter()
-                .flat_map(|task| task.fragments.iter().map(|fragment| fragment.id)),
-        )
-        .await?;
+        let affected_fragments = tasks
+            .iter()
+            .flat_map(|task| task.fragments.iter().map(|fragment| fragment.id))
+            .collect::<Vec<_>>();
+        refuse_plaid_compaction(dataset, affected_fragments).await?;
 
         let mut compaction_plan =
             CompactionPlan::new(dataset.manifest.version, self.options.clone());
@@ -1372,11 +1370,13 @@ impl CompactionTask {
         } else {
             Cow::Owned(dataset.checkout_version(self.read_version).await?)
         };
-        refuse_plaid_compaction(
-            dataset.as_ref(),
-            self.task.fragments.iter().map(|fragment| fragment.id),
-        )
-        .await?;
+        let affected_fragments = self
+            .task
+            .fragments
+            .iter()
+            .map(|fragment| fragment.id)
+            .collect::<Vec<_>>();
+        refuse_plaid_compaction(dataset.as_ref(), affected_fragments).await?;
         rewrite_files(dataset, self.task.clone(), &self.options).await
     }
 }
@@ -2012,15 +2012,11 @@ pub async fn commit_compaction(
     if completed_tasks.is_empty() {
         return Ok(CompactionMetrics::default());
     }
-    refuse_plaid_compaction(
-        dataset,
-        completed_tasks.iter().flat_map(|task| {
-            task.original_fragments
-                .iter()
-                .map(|fragment| fragment.id)
-        }),
-    )
-    .await?;
+    let affected_fragments = completed_tasks
+        .iter()
+        .flat_map(|task| task.original_fragments.iter().map(|fragment| fragment.id))
+        .collect::<Vec<_>>();
+    refuse_plaid_compaction(dataset, affected_fragments).await?;
 
     // If we aren't using stable row ids, then we need to remap indices.
     let needs_remapping = !dataset.manifest.uses_stable_row_ids() && !options.defer_index_remap;

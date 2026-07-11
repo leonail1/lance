@@ -159,5 +159,9 @@ fn versioned_bytes_reject_unbounded_header_counts_before_allocation() {
     let valid_bytes = index.to_bytes().unwrap();
     let truncated = &valid_bytes[..47];
     let error = PlaidIndex::read_from_bytes(truncated).unwrap_err();
-    assert!(error.to_string().contains("shorter than the 48-byte header"));
+    assert!(
+        error
+            .to_string()
+            .contains("shorter than the 48-byte header")
+    );
 }

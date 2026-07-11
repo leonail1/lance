@@ -225,8 +225,10 @@ fn validate_encoded_len(bytes: &[u8]) -> Result<()> {
     }
 
     let dimension = usize_len(u64::from(reader.read_u32::<LittleEndian>()?), "dimension")?;
-    let num_centroids =
-        usize_len(u64::from(reader.read_u32::<LittleEndian>()?), "centroid count")?;
+    let num_centroids = usize_len(
+        u64::from(reader.read_u32::<LittleEndian>()?),
+        "centroid count",
+    )?;
     let num_documents = usize_len(reader.read_u64::<LittleEndian>()?, "document count")?;
     let num_tokens = usize_len(reader.read_u64::<LittleEndian>()?, "token count")?;
     let num_postings = usize_len(reader.read_u64::<LittleEndian>()?, "posting count")?;
@@ -296,12 +298,7 @@ fn validate_encoded_len(bytes: &[u8]) -> Result<()> {
         std::mem::size_of::<u32>(),
         "token codes",
     )?;
-    expected = checked_section_len(
-        expected,
-        num_tokens,
-        residual_bits / 8,
-        "packed residuals",
-    )?;
+    expected = checked_section_len(expected, num_tokens, residual_bits / 8, "packed residuals")?;
     expected = checked_section_len(
         expected,
         num_centroids
@@ -325,12 +322,7 @@ fn validate_encoded_len(bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn checked_section_len(
-    current: usize,
-    count: usize,
-    width: usize,
-    name: &str,
-) -> Result<usize> {
+fn checked_section_len(current: usize, count: usize, width: usize, name: &str) -> Result<usize> {
     let bytes = count
         .checked_mul(width)
         .ok_or_else(|| Error::CorruptFile(format!("{name} byte length overflow")))?;
