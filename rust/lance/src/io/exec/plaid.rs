@@ -10,8 +10,9 @@ use std::time::{Duration, Instant};
 
 use arrow::array::AsArray;
 use arrow::datatypes::UInt64Type;
-use arrow_array::{Array, Float32Array, RecordBatch, UInt64Array};
-use arrow_schema::SchemaRef;
+use arrow_array::{Array, ArrayRef, Float32Array, RecordBatch, UInt32Array, UInt64Array};
+use arrow_schema::{Schema as ArrowSchema, SchemaRef};
+use arrow_select::take::take_record_batch;
 use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
@@ -27,10 +28,11 @@ use datafusion_physical_expr::EquivalenceProperties;
 use futures::stream;
 use lance_arrow::RecordBatchExt;
 use lance_core::ROW_ID;
+use lance_core::datatypes::{OnMissing, Projection};
 use lance_core::utils::tokio::spawn_cpu;
 use lance_datafusion::utils::ExecutionPlanMetricsSetExt;
 use lance_index::prefilter::PreFilter;
-use lance_index::vector::Query;
+use lance_index::vector::{DIST_COL, Query};
 use lance_linalg::distance::dot_f32;
 use lance_plaid::{EligibleCentroidDecision, PlaidSearchParams};
 use lance_select::{RowAddrMask, RowAddrTreeMap};
@@ -38,6 +40,7 @@ use lance_table::format::IndexMetadata;
 use ndarray::ArrayView2;
 
 use super::knn::KNN_INDEX_SCHEMA;
+use super::take::TakeExec;
 use super::utils::{IndexMetrics, PreFilterSource, build_prefilter};
 use crate::dataset::rowids::get_row_id_index;
 use crate::dataset::{Dataset, ProjectionRequest, TakeBuilder};
@@ -122,10 +125,122 @@ const DIRECT_RESIDUAL_BUDGET_MISMATCH_COUNT: &str =
     "plaid_direct_residual_skipped_budget_mismatch_segments";
 const DIRECT_RESIDUAL_EMPTY_TOKENS_COUNT: &str =
     "plaid_direct_residual_skipped_empty_tokens_segments";
+const FUSED_FINAL_TAKE_TIME: &str = "plaid_fused_final_take_time";
+const FUSED_FINAL_TAKE_QUERY_COUNT: &str = "plaid_fused_final_take_queries";
+const FUSED_FINAL_TAKE_CANDIDATE_ROWS_COUNT: &str = "plaid_fused_final_take_candidate_rows";
+const FUSED_FINAL_TAKE_OUTPUT_ROWS_COUNT: &str = "plaid_fused_final_take_output_rows";
+const FUSED_FINAL_TAKE_OUTPUT_BYTES_COUNT: &str = "plaid_fused_final_take_output_batch_bytes";
+// This is a nested sub-time of PLAID_SORT_TIME, not an additive phase.
+const SORTED_RAW_TAKE_TIME: &str = "plaid_sorted_raw_take_sub_time";
+const SORTED_RAW_TAKE_QUERY_COUNT: &str = "plaid_sorted_raw_take_queries";
+const SORTED_RAW_TAKE_ROWS_COUNT: &str = "plaid_sorted_raw_take_rows";
+const RAW_VECTOR_BYTES_COUNT: &str = "plaid_raw_vector_batch_bytes";
 
 const DIRECT_RESIDUAL_ENABLED_ENV: &str = "LANCE_PLAID_DIRECT_RESIDUAL_ENABLED";
 const DIRECT_RESIDUAL_MAX_DOCUMENTS_ENV: &str = "LANCE_PLAID_DIRECT_RESIDUAL_MAX_DOCUMENTS";
 const DEFAULT_DIRECT_RESIDUAL_MAX_DOCUMENTS: usize = 1024;
+const FUSED_FINAL_TAKE_ENABLED_ENV: &str = "LANCE_PLAID_FUSED_FINAL_TAKE_ENABLED";
+const SORTED_RAW_TAKE_ENABLED_ENV: &str = "LANCE_PLAID_SORTED_RAW_TAKE_ENABLED";
+
+#[cfg(test)]
+thread_local! {
+    static TAKE_OPT_TEST_OVERRIDE: std::cell::Cell<Option<(bool, bool)>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(crate) struct PlaidTakeOptimizationTestGuard {
+    previous: Option<(bool, bool)>,
+}
+
+#[cfg(test)]
+impl PlaidTakeOptimizationTestGuard {
+    pub(crate) fn new(fused: bool, sorted: bool) -> Self {
+        let previous = TAKE_OPT_TEST_OVERRIDE.replace(Some((fused, sorted)));
+        Self { previous }
+    }
+}
+
+#[cfg(test)]
+impl Drop for PlaidTakeOptimizationTestGuard {
+    fn drop(&mut self) {
+        TAKE_OPT_TEST_OVERRIDE.set(self.previous);
+    }
+}
+
+#[cfg(test)]
+fn take_optimization_test_override() -> Option<(bool, bool)> {
+    TAKE_OPT_TEST_OVERRIDE.get()
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct FusedFinalTakeConfig {
+    enabled: bool,
+}
+
+impl FusedFinalTakeConfig {
+    fn from_env() -> Result<Self> {
+        #[cfg(test)]
+        if let Some((enabled, _)) = take_optimization_test_override() {
+            return Ok(Self { enabled });
+        }
+        let enabled = read_utf8_env(FUSED_FINAL_TAKE_ENABLED_ENV)?;
+        Self::from_value(enabled.as_deref())
+    }
+
+    fn from_value(enabled: Option<&str>) -> Result<Self> {
+        let enabled = enabled
+            .map(|value| {
+                parse_bool(value).ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "invalid {FUSED_FINAL_TAKE_ENABLED_ENV}={value:?}; expected true/false"
+                    ))
+                })
+            })
+            .transpose()?
+            .unwrap_or(false);
+        Ok(Self { enabled })
+    }
+
+    fn mode_name(self) -> &'static str {
+        if self.enabled { "enabled" } else { "disabled" }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SortedRawTakeConfig {
+    enabled: bool,
+}
+
+impl SortedRawTakeConfig {
+    fn from_env() -> Result<Self> {
+        #[cfg(test)]
+        if let Some((_, enabled)) = take_optimization_test_override() {
+            return Ok(Self { enabled });
+        }
+        let enabled = read_utf8_env(SORTED_RAW_TAKE_ENABLED_ENV)?;
+        Self::from_value(enabled.as_deref())
+    }
+
+    fn from_value(enabled: Option<&str>) -> Result<Self> {
+        let enabled = enabled
+            .map(|value| {
+                parse_bool(value).ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "invalid {SORTED_RAW_TAKE_ENABLED_ENV}={value:?}; expected true/false"
+                    ))
+                })
+            })
+            .transpose()?
+            .unwrap_or(false);
+        Ok(Self { enabled })
+    }
+
+    fn mode_name(self) -> &'static str {
+        if self.enabled { "enabled" } else { "disabled" }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct DirectResidualConfig {
@@ -328,6 +443,10 @@ pub struct PlaidSearchExec {
     query: Query,
     mode: PlaidExecutionMode,
     direct_residual_config: DirectResidualConfig,
+    fused_final_take_config: FusedFinalTakeConfig,
+    sorted_raw_take_config: SortedRawTakeConfig,
+    fused_output_projection: Option<Projection>,
+    output_schema: SchemaRef,
     prefilter_source: PreFilterSource,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
@@ -340,21 +459,27 @@ impl PlaidSearchExec {
         query: Query,
         prefilter_source: PreFilterSource,
     ) -> Result<Self> {
-        Self::try_new_with_direct_residual_config(
+        Self::try_new_with_configs(
             dataset,
             indices,
             query,
             prefilter_source,
             DirectResidualConfig::from_env()?,
+            FusedFinalTakeConfig::from_env()?,
+            SortedRawTakeConfig::from_env()?,
+            None,
         )
     }
 
-    fn try_new_with_direct_residual_config(
+    fn try_new_with_configs(
         dataset: Arc<Dataset>,
         indices: Vec<IndexMetadata>,
         query: Query,
         prefilter_source: PreFilterSource,
         direct_residual_config: DirectResidualConfig,
+        fused_final_take_config: FusedFinalTakeConfig,
+        sorted_raw_take_config: SortedRawTakeConfig,
+        fused_output_projection: Option<Projection>,
     ) -> Result<Self> {
         if indices.is_empty() {
             return Err(Error::invalid_input(
@@ -367,8 +492,31 @@ impl PlaidSearchExec {
             ));
         }
         let mode = PlaidExecutionMode::try_from_query(&query)?;
+        if fused_output_projection.is_some()
+            && (!fused_final_take_config.enabled
+                || !matches!(mode, PlaidExecutionMode::Exact { .. }))
+        {
+            return Err(Error::invalid_input(
+                "PLAID fused final take requires enabled exact refinement".to_string(),
+            ));
+        }
+        let output_schema = if let Some(projection) = fused_output_projection.as_ref() {
+            // Match TakeExec exactly: fields already produced by PLAID (most
+            // importantly _rowid) must not be added a second time.
+            let missing_projection = projection
+                .clone()
+                .subtract_arrow_schema(KNN_INDEX_SCHEMA.as_ref(), OnMissing::Ignore)?;
+            let output_schema = TakeExec::calculate_output_schema(
+                dataset.schema(),
+                KNN_INDEX_SCHEMA.as_ref(),
+                &missing_projection,
+            );
+            Arc::new(ArrowSchema::from(&output_schema))
+        } else {
+            KNN_INDEX_SCHEMA.clone()
+        };
         let properties = Arc::new(PlanProperties::new(
-            EquivalenceProperties::new(KNN_INDEX_SCHEMA.clone()),
+            EquivalenceProperties::new(output_schema.clone()),
             Partitioning::RoundRobinBatch(1),
             EmissionType::Final,
             Boundedness::Bounded,
@@ -379,10 +527,39 @@ impl PlaidSearchExec {
             query,
             mode,
             direct_residual_config,
+            fused_final_take_config,
+            sorted_raw_take_config,
+            fused_output_projection,
+            output_schema,
             prefilter_source,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         })
+    }
+
+    /// Return an exact-search operator that carries dataset output columns in
+    /// the existing raw-vector take. Index-only queries and the default-off
+    /// control path keep the ordinary outer [`TakeExec`].
+    pub(crate) fn try_with_fused_output_projection(
+        &self,
+        projection: Projection,
+    ) -> Result<Option<Self>> {
+        if !self.fused_final_take_config.enabled
+            || !matches!(self.mode, PlaidExecutionMode::Exact { .. })
+            || !projection.has_data_fields()
+        {
+            return Ok(None);
+        }
+        Ok(Some(Self::try_new_with_configs(
+            self.dataset.clone(),
+            self.indices.clone(),
+            self.query.clone(),
+            self.prefilter_source.clone(),
+            self.direct_residual_config,
+            self.fused_final_take_config,
+            self.sorted_raw_take_config,
+            Some(projection),
+        )?))
     }
 }
 
@@ -395,7 +572,7 @@ impl DisplayAs for PlaidSearchExec {
         match format {
             DisplayFormatType::Default | DisplayFormatType::Verbose => write!(
                 formatter,
-                "PlaidSearch: name={}, k={}, segments={}, mode={}, core_residual_budget={}, raw_refinement_budget={}, filter_exact_fallback=enabled, direct_residual_mode={}, direct_residual_max_documents={}",
+                "PlaidSearch: name={}, k={}, segments={}, mode={}, core_residual_budget={}, raw_refinement_budget={}, filter_exact_fallback=enabled, direct_residual_mode={}, direct_residual_max_documents={}, sorted_raw_take_mode={}, fused_final_take_mode={}, fused_output_fields={}",
                 self.indices[0].name,
                 self.query.k,
                 self.indices.len(),
@@ -406,10 +583,16 @@ impl DisplayAs for PlaidSearchExec {
                 self.mode.raw_refinement_budget(),
                 self.direct_residual_config.mode_name(),
                 self.direct_residual_config.max_documents,
+                self.sorted_raw_take_config.mode_name(),
+                self.fused_final_take_config.mode_name(),
+                self.fused_output_projection
+                    .as_ref()
+                    .map(|projection| projection.to_bare_schema().fields.len())
+                    .unwrap_or(0),
             ),
             DisplayFormatType::TreeRender => write!(
                 formatter,
-                "PlaidSearch\nname={}\nk={}\nsegments={}\nmode={}\ncore_residual_budget={}\nraw_refinement_budget={}\nfilter_exact_fallback=enabled\ndirect_residual_mode={}\ndirect_residual_max_documents={}",
+                "PlaidSearch\nname={}\nk={}\nsegments={}\nmode={}\ncore_residual_budget={}\nraw_refinement_budget={}\nfilter_exact_fallback=enabled\ndirect_residual_mode={}\ndirect_residual_max_documents={}\nsorted_raw_take_mode={}\nfused_final_take_mode={}\nfused_output_fields={}",
                 self.indices[0].name,
                 self.query.k,
                 self.indices.len(),
@@ -420,6 +603,12 @@ impl DisplayAs for PlaidSearchExec {
                 self.mode.raw_refinement_budget(),
                 self.direct_residual_config.mode_name(),
                 self.direct_residual_config.max_documents,
+                self.sorted_raw_take_config.mode_name(),
+                self.fused_final_take_config.mode_name(),
+                self.fused_output_projection
+                    .as_ref()
+                    .map(|projection| projection.to_bare_schema().fields.len())
+                    .unwrap_or(0),
             ),
         }
     }
@@ -435,7 +624,7 @@ impl ExecutionPlan for PlaidSearchExec {
     }
 
     fn schema(&self) -> SchemaRef {
-        KNN_INDEX_SCHEMA.clone()
+        self.output_schema.clone()
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -476,12 +665,15 @@ impl ExecutionPlan for PlaidSearchExec {
                 ));
             }
         };
-        Ok(Arc::new(Self::try_new_with_direct_residual_config(
+        Ok(Arc::new(Self::try_new_with_configs(
             self.dataset.clone(),
             self.indices.clone(),
             self.query.clone(),
             prefilter_source,
             self.direct_residual_config,
+            self.fused_final_take_config,
+            self.sorted_raw_take_config,
+            self.fused_output_projection.clone(),
         )?))
     }
 
@@ -503,6 +695,9 @@ impl ExecutionPlan for PlaidSearchExec {
         let query = self.query.clone();
         let mode = self.mode;
         let direct_residual_config = self.direct_residual_config;
+        let sorted_raw_take_config = self.sorted_raw_take_config;
+        let fused_output_projection = self.fused_output_projection.clone();
+        let output_schema = self.output_schema.clone();
         let stream = stream::once(async move {
             let total_started = Instant::now();
             let result = execute_search(
@@ -511,6 +706,9 @@ impl ExecutionPlan for PlaidSearchExec {
                 query,
                 mode,
                 direct_residual_config,
+                sorted_raw_take_config,
+                fused_output_projection,
+                output_schema,
                 prefilter,
                 metrics.clone(),
             )
@@ -559,6 +757,8 @@ struct PlaidExecMetrics {
     row_id_fetch: Time,
     raw_vector_fetch: Time,
     exact: Time,
+    sorted_raw_take: Time,
+    fused_final_take: Time,
     sort: Time,
     total: Time,
     postings_count: Count,
@@ -572,6 +772,7 @@ struct PlaidExecMetrics {
     filter_exact_documents_count: Count,
     row_id_rows_count: Count,
     raw_vector_rows_count: Count,
+    raw_vector_bytes_count: Count,
     index_only_query_count: Count,
     exact_query_count: Count,
     empty_filter_query_count: Count,
@@ -609,6 +810,12 @@ struct PlaidExecMetrics {
     direct_residual_over_limit_count: Count,
     direct_residual_budget_mismatch_count: Count,
     direct_residual_empty_tokens_count: Count,
+    fused_final_take_query_count: Count,
+    fused_final_take_candidate_rows_count: Count,
+    fused_final_take_output_rows_count: Count,
+    fused_final_take_output_bytes_count: Count,
+    sorted_raw_take_query_count: Count,
+    sorted_raw_take_rows_count: Count,
 }
 
 impl PlaidExecMetrics {
@@ -632,6 +839,8 @@ impl PlaidExecMetrics {
             row_id_fetch: metrics.new_time(ROW_ID_FETCH_TIME, partition),
             raw_vector_fetch: metrics.new_time(RAW_VECTOR_FETCH_TIME, partition),
             exact: metrics.new_time(EXACT_TIME, partition),
+            sorted_raw_take: metrics.new_time(SORTED_RAW_TAKE_TIME, partition),
+            fused_final_take: metrics.new_time(FUSED_FINAL_TAKE_TIME, partition),
             sort: metrics.new_time(SORT_TIME, partition),
             total: metrics.new_time(TOTAL_TIME, partition),
             postings_count: metrics.new_count(POSTINGS_COUNT, partition),
@@ -647,6 +856,7 @@ impl PlaidExecMetrics {
                 .new_count(FILTER_EXACT_DOCUMENTS_COUNT, partition),
             row_id_rows_count: metrics.new_count(ROW_ID_ROWS_COUNT, partition),
             raw_vector_rows_count: metrics.new_count(RAW_VECTOR_ROWS_COUNT, partition),
+            raw_vector_bytes_count: metrics.new_count(RAW_VECTOR_BYTES_COUNT, partition),
             index_only_query_count: metrics.new_count(INDEX_ONLY_QUERY_COUNT, partition),
             exact_query_count: metrics.new_count(EXACT_QUERY_COUNT, partition),
             empty_filter_query_count: metrics.new_count(EMPTY_FILTER_QUERY_COUNT, partition),
@@ -706,6 +916,16 @@ impl PlaidExecMetrics {
                 .new_count(DIRECT_RESIDUAL_BUDGET_MISMATCH_COUNT, partition),
             direct_residual_empty_tokens_count: metrics
                 .new_count(DIRECT_RESIDUAL_EMPTY_TOKENS_COUNT, partition),
+            fused_final_take_query_count: metrics
+                .new_count(FUSED_FINAL_TAKE_QUERY_COUNT, partition),
+            fused_final_take_candidate_rows_count: metrics
+                .new_count(FUSED_FINAL_TAKE_CANDIDATE_ROWS_COUNT, partition),
+            fused_final_take_output_rows_count: metrics
+                .new_count(FUSED_FINAL_TAKE_OUTPUT_ROWS_COUNT, partition),
+            fused_final_take_output_bytes_count: metrics
+                .new_count(FUSED_FINAL_TAKE_OUTPUT_BYTES_COUNT, partition),
+            sorted_raw_take_query_count: metrics.new_count(SORTED_RAW_TAKE_QUERY_COUNT, partition),
+            sorted_raw_take_rows_count: metrics.new_count(SORTED_RAW_TAKE_ROWS_COUNT, partition),
         }
     }
 
@@ -968,10 +1188,16 @@ async fn execute_search(
     query: Query,
     mode: PlaidExecutionMode,
     direct_residual_config: DirectResidualConfig,
+    sorted_raw_take_config: SortedRawTakeConfig,
+    fused_output_projection: Option<Projection>,
+    output_schema: SchemaRef,
     prefilter: Arc<crate::index::prefilter::DatasetPreFilter>,
     metrics: Arc<PlaidExecMetrics>,
 ) -> Result<RecordBatch> {
     metrics.record_mode(mode);
+    if fused_output_projection.is_some() {
+        metrics.fused_final_take_query_count.add(1);
+    }
     let filter_started = Instant::now();
     prefilter.wait_for_ready().await?;
     metrics.filter.add_duration(filter_started.elapsed());
@@ -990,7 +1216,7 @@ async fn execute_search(
             .direct_residual_empty_segment_count
             .add(indices.len());
         metrics.candidate.add_duration(candidate_started.elapsed());
-        let batch = RecordBatch::new_empty(KNN_INDEX_SCHEMA.clone());
+        let batch = RecordBatch::new_empty(output_schema.clone());
         metrics.baseline.record_output(0);
         return Ok(batch);
     }
@@ -1194,7 +1420,7 @@ async fn execute_search(
     metrics.candidate.add_duration(candidate_started.elapsed());
 
     if candidates.is_empty() {
-        let batch = RecordBatch::new_empty(KNN_INDEX_SCHEMA.clone());
+        let batch = RecordBatch::new_empty(output_schema.clone());
         metrics.baseline.record_output(0);
         return Ok(batch);
     }
@@ -1205,6 +1431,7 @@ async fn execute_search(
             .map(|(row_address, score)| ExactHit {
                 row_address,
                 distance: maxsim_distance(score),
+                batch_index: 0,
             })
             .collect::<Vec<_>>();
         let sort_started = Instant::now();
@@ -1245,16 +1472,38 @@ async fn execute_search(
         });
         candidates.truncate(requested_candidates.min(candidates.len()));
     }
+    // Exact fallback already established physical-address order above.
+    if sorted_raw_take_config.enabled && !exact_fallback {
+        let sorted_take_started = Instant::now();
+        candidates.sort_unstable_by_key(|(row_address, _)| *row_address);
+        metrics
+            .sorted_raw_take
+            .add_duration(sorted_take_started.elapsed());
+        metrics.sorted_raw_take_query_count.add(1);
+        metrics.sorted_raw_take_rows_count.add(candidates.len());
+    }
     metrics.sort.add_duration(sort_started.elapsed());
 
     let row_addresses = candidates
         .iter()
         .map(|(row_address, _)| *row_address)
         .collect::<Vec<_>>();
-    let projection = Arc::new(
-        ProjectionRequest::from_columns([query.column.as_str(), ROW_ID], dataset.schema())
-            .into_projection_plan(dataset.clone())?,
-    );
+    // Exact refinement already performs one address-based read for every raw
+    // candidate.  In the opt-in fused mode carry the final/filter data fields
+    // through that same read, then select the winning rows in memory.  This
+    // removes the second database TakeExec without changing candidate search.
+    let raw_projection = fused_output_projection
+        .clone()
+        .unwrap_or_else(|| dataset.empty_projection())
+        .union_column(&query.column, OnMissing::Error)?
+        .with_row_id();
+    let mut projection = ProjectionRequest::from_schema(raw_projection.to_schema())
+        .into_projection_plan(dataset.clone())?;
+    // ProjectionRequest is schema based and would otherwise reset non-schema
+    // read policy such as BlobHandling.  Preserve the scanner's physical
+    // projection contract in the consolidated read.
+    projection.physical_projection = raw_projection;
+    let projection = Arc::new(projection);
     let raw_vector_fetch_started = Instant::now();
     let batch =
         TakeBuilder::try_new_from_addresses(dataset.clone(), row_addresses.clone(), projection)?
@@ -1264,6 +1513,14 @@ async fn execute_search(
         .raw_vector_fetch
         .add_duration(raw_vector_fetch_started.elapsed());
     metrics.raw_vector_rows_count.add(batch.num_rows());
+    metrics
+        .raw_vector_bytes_count
+        .add(batch.get_array_memory_size());
+    if fused_output_projection.is_some() {
+        metrics
+            .fused_final_take_candidate_rows_count
+            .add(batch.num_rows());
+    }
     if batch.num_rows() != row_addresses.len() {
         return Err(Error::internal(format!(
             "PLAID raw-vector take returned {} rows for {} candidates",
@@ -1281,17 +1538,36 @@ async fn execute_search(
     let exact_started = Instant::now();
     let column = query.column.clone();
     let query_for_cpu = query_tokens.clone();
-    let mut hits = spawn_cpu(move || exact_scores(&batch, &column, query_for_cpu.view())).await?;
+    let scoring_batch = batch.clone();
+    let mut hits =
+        spawn_cpu(move || exact_scores(&scoring_batch, &column, query_for_cpu.view())).await?;
     metrics.exact.add_duration(exact_started.elapsed());
     for (hit, row_id) in hits.iter_mut().zip(result_row_ids) {
         hit.row_address = row_id;
     }
 
     let sort_started = Instant::now();
-    let batch = finalize_hits(hits, &query)?;
+    rank_hits(&mut hits, &query);
     metrics.sort.add_duration(sort_started.elapsed());
-    metrics.baseline.record_output(batch.num_rows());
-    Ok(batch)
+
+    let output_batch = if fused_output_projection.is_some() {
+        let fused_started = Instant::now();
+        let output_batch = fused_hits_to_batch(&hits, &batch, output_schema)?;
+        metrics
+            .fused_final_take
+            .add_duration(fused_started.elapsed());
+        metrics
+            .fused_final_take_output_rows_count
+            .add(output_batch.num_rows());
+        metrics
+            .fused_final_take_output_bytes_count
+            .add(output_batch.get_array_memory_size());
+        output_batch
+    } else {
+        hits_to_batch(&hits)?
+    };
+    metrics.baseline.record_output(output_batch.num_rows());
+    Ok(output_batch)
 }
 
 async fn index_only_result_row_ids(
@@ -1353,9 +1629,59 @@ fn hits_to_batch(hits: &[ExactHit]) -> Result<RecordBatch> {
     )?)
 }
 
-fn finalize_hits(mut hits: Vec<ExactHit>, query: &Query) -> Result<RecordBatch> {
-    rank_hits(&mut hits, query);
-    hits_to_batch(&hits)
+fn fused_hits_to_batch(
+    hits: &[ExactHit],
+    candidate_batch: &RecordBatch,
+    output_schema: SchemaRef,
+) -> Result<RecordBatch> {
+    if hits.is_empty() {
+        return Ok(RecordBatch::new_empty(output_schema));
+    }
+    let indices = hits
+        .iter()
+        .map(|hit| {
+            u32::try_from(hit.batch_index).map_err(|_| {
+                Error::internal(format!(
+                    "PLAID fused final take candidate index {} exceeds u32",
+                    hit.batch_index
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let selected = take_record_batch(candidate_batch, &UInt32Array::from(indices))?;
+    // The raw projection is a union of vector, filter, and final fields.  For
+    // nested columns that can make the selected top-level StructArray wider
+    // than the final output (for example payload.{mv,lang} vs payload.lang).
+    // Apply the final nested projection before assembling the KNN metadata.
+    let selected_output_schema = ArrowSchema::new(
+        output_schema
+            .fields()
+            .iter()
+            .filter(|field| field.name() != DIST_COL && field.name() != ROW_ID)
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
+    let selected = selected.project_by_schema(&selected_output_schema)?;
+    let distances: ArrayRef = Arc::new(Float32Array::from(
+        hits.iter().map(|hit| hit.distance).collect::<Vec<_>>(),
+    ));
+    let row_ids: ArrayRef = Arc::new(UInt64Array::from(
+        hits.iter().map(|hit| hit.row_address).collect::<Vec<_>>(),
+    ));
+    let columns = output_schema
+        .fields()
+        .iter()
+        .map(|field| match field.name().as_str() {
+            DIST_COL => Ok(distances.clone()),
+            ROW_ID => Ok(row_ids.clone()),
+            name => selected.column_by_name(name).cloned().ok_or_else(|| {
+                Error::internal(format!(
+                    "PLAID fused final take batch is missing output field {name}"
+                ))
+            }),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(RecordBatch::try_new(output_schema, columns)?)
 }
 
 async fn plaid_address_mask(dataset: &Dataset, mask: Arc<RowAddrMask>) -> Result<Arc<RowAddrMask>> {
@@ -1406,6 +1732,7 @@ async fn plaid_address_mask(dataset: &Dataset, mask: Arc<RowAddrMask>) -> Result
 struct ExactHit {
     row_address: u64,
     distance: f32,
+    batch_index: usize,
 }
 
 fn exact_scores(
@@ -1431,6 +1758,7 @@ fn exact_scores(
         hits.push(ExactHit {
             row_address: 0,
             distance: maxsim_distance(score),
+            batch_index: row_index,
         });
     }
     Ok(hits)
@@ -1558,9 +1886,10 @@ mod tests {
     use arrow_array::types::Float32Type;
     use arrow_array::{
         ArrayRef, FixedSizeListArray, Float32Array, Int32Array, ListArray, RecordBatchIterator,
+        StringArray, StructArray,
     };
     use arrow_buffer::{NullBuffer, OffsetBuffer};
-    use arrow_schema::Field;
+    use arrow_schema::{DataType, Field};
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::utils::address::RowAddress;
     use lance_linalg::distance::{DistanceType, multivec_distance};
@@ -1624,6 +1953,156 @@ mod tests {
                     .contains("invalid LANCE_PLAID_DIRECT_RESIDUAL")
             );
         }
+    }
+
+    #[test]
+    fn take_optimization_configs_default_off_and_fail_closed() {
+        assert_eq!(
+            FusedFinalTakeConfig::from_value(None).unwrap(),
+            FusedFinalTakeConfig::default()
+        );
+        assert_eq!(
+            SortedRawTakeConfig::from_value(None).unwrap(),
+            SortedRawTakeConfig::default()
+        );
+        for enabled in ["1", "true", "YES", "on"] {
+            assert_eq!(
+                FusedFinalTakeConfig::from_value(Some(enabled)).unwrap(),
+                FusedFinalTakeConfig { enabled: true }
+            );
+            assert_eq!(
+                SortedRawTakeConfig::from_value(Some(enabled)).unwrap(),
+                SortedRawTakeConfig { enabled: true }
+            );
+        }
+        for disabled in ["0", "false", "No", "OFF"] {
+            assert_eq!(
+                FusedFinalTakeConfig::from_value(Some(disabled)).unwrap(),
+                FusedFinalTakeConfig { enabled: false }
+            );
+            assert_eq!(
+                SortedRawTakeConfig::from_value(Some(disabled)).unwrap(),
+                SortedRawTakeConfig { enabled: false }
+            );
+        }
+        assert!(
+            FusedFinalTakeConfig::from_value(Some("maybe"))
+                .unwrap_err()
+                .to_string()
+                .contains(FUSED_FINAL_TAKE_ENABLED_ENV)
+        );
+        assert!(
+            SortedRawTakeConfig::from_value(Some("maybe"))
+                .unwrap_err()
+                .to_string()
+                .contains(SORTED_RAW_TAKE_ENABLED_ENV)
+        );
+    }
+
+    #[test]
+    fn fused_hits_select_candidate_rows_and_preserve_ranked_metadata() {
+        let candidate_batch = RecordBatch::try_from_iter([
+            (
+                "doc_id",
+                Arc::new(Int32Array::from(vec![10, 20, 30])) as ArrayRef,
+            ),
+            (
+                ROW_ID,
+                Arc::new(UInt64Array::from(vec![100, 200, 300])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let output_schema = Arc::new(ArrowSchema::new(vec![
+            Arc::new(Field::new(DIST_COL, DataType::Float32, false)),
+            Arc::new(Field::new(ROW_ID, DataType::UInt64, false)),
+            Arc::new(Field::new("doc_id", DataType::Int32, false)),
+        ]));
+        let hits = vec![
+            ExactHit {
+                row_address: 3_000,
+                distance: -3.0,
+                batch_index: 2,
+            },
+            ExactHit {
+                row_address: 1_000,
+                distance: -1.0,
+                batch_index: 0,
+            },
+        ];
+        let actual = fused_hits_to_batch(&hits, &candidate_batch, output_schema.clone()).unwrap();
+        assert_eq!(actual.schema(), output_schema);
+        assert_eq!(
+            actual
+                .column_by_name(DIST_COL)
+                .unwrap()
+                .as_primitive::<Float32Type>()
+                .values(),
+            &[-3.0, -1.0]
+        );
+        assert_eq!(
+            actual
+                .column_by_name(ROW_ID)
+                .unwrap()
+                .as_primitive::<UInt64Type>()
+                .values(),
+            &[3_000, 1_000]
+        );
+        assert_eq!(
+            actual
+                .column_by_name("doc_id")
+                .unwrap()
+                .as_primitive::<arrow_array::types::Int32Type>()
+                .values(),
+            &[30, 10]
+        );
+
+        let empty = fused_hits_to_batch(&[], &candidate_batch, actual.schema()).unwrap();
+        assert_eq!(empty.num_rows(), 0);
+        assert_eq!(empty.schema(), actual.schema());
+    }
+
+    #[test]
+    fn fused_hits_apply_nested_output_projection() {
+        let mv_field = Arc::new(Field::new("mv", DataType::Int32, false));
+        let lang_field = Arc::new(Field::new("lang", DataType::Utf8, false));
+        let payload = StructArray::from(vec![
+            (
+                mv_field,
+                Arc::new(Int32Array::from(vec![10, 20])) as ArrayRef,
+            ),
+            (
+                lang_field.clone(),
+                Arc::new(StringArray::from(vec!["en", "zh"])) as ArrayRef,
+            ),
+        ]);
+        let candidate_batch = RecordBatch::try_from_iter([
+            ("payload", Arc::new(payload) as ArrayRef),
+            (
+                ROW_ID,
+                Arc::new(UInt64Array::from(vec![100, 200])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let output_schema = Arc::new(ArrowSchema::new(vec![
+            Arc::new(Field::new(DIST_COL, DataType::Float32, false)),
+            Arc::new(Field::new(ROW_ID, DataType::UInt64, false)),
+            Arc::new(Field::new(
+                "payload",
+                DataType::Struct(vec![lang_field].into()),
+                false,
+            )),
+        ]));
+        let hits = [ExactHit {
+            row_address: 2_000,
+            distance: -2.0,
+            batch_index: 1,
+        }];
+        let actual = fused_hits_to_batch(&hits, &candidate_batch, output_schema.clone()).unwrap();
+        assert_eq!(actual.schema(), output_schema);
+        let payload = actual.column_by_name("payload").unwrap().as_struct();
+        assert_eq!(payload.num_columns(), 1);
+        assert_eq!(payload.fields()[0].name(), "lang");
+        assert_eq!(payload.column(0).as_string::<i32>().value(0), "zh");
     }
 
     #[test]
@@ -2231,14 +2710,17 @@ mod tests {
             ExactHit {
                 row_address: 9,
                 distance: maxsim_distance(first),
+                batch_index: 0,
             },
             ExactHit {
                 row_address: 3,
                 distance: maxsim_distance(second),
+                batch_index: 1,
             },
             ExactHit {
                 row_address: 7,
                 distance: maxsim_distance(first),
+                batch_index: 2,
             },
         ];
         let query = Query {

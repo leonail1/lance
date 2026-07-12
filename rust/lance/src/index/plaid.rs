@@ -1060,7 +1060,8 @@ mod tests {
     use super::*;
 
     use arrow_array::builder::{FixedSizeListBuilder, Float32Builder, ListBuilder};
-    use arrow_array::{ArrayRef, Int32Array, RecordBatchIterator};
+    use arrow_array::{ArrayRef, Int32Array, RecordBatchIterator, StructArray};
+    use arrow_schema::Field;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_index::metrics::NoOpMetricsCollector;
     use lance_index::optimize::OptimizeOptions;
@@ -1069,6 +1070,8 @@ mod tests {
     use crate::dataset::WriteParams;
     use crate::dataset::optimize::{CompactionOptions, compact_files};
     use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
+    use crate::io::exec::TakeExec;
+    use crate::io::exec::plaid::PlaidTakeOptimizationTestGuard;
     use crate::session::Session;
     use lance_index::vector::DIST_COL;
 
@@ -1089,12 +1092,48 @@ mod tests {
         .unwrap()
     }
 
+    fn make_nested_batch(
+        ids: Vec<i32>,
+        languages: Vec<i32>,
+        groups: Vec<i32>,
+        documents: Vec<Vec<[f32; 4]>>,
+    ) -> RecordBatch {
+        let flat = make_batch(ids, documents);
+        let payload = StructArray::new(
+            vec![
+                Arc::new(Field::new("lang", DataType::Int32, false)),
+                Arc::new(Field::new("group", DataType::Int32, false)),
+            ]
+            .into(),
+            vec![
+                Arc::new(Int32Array::from(languages)) as ArrayRef,
+                Arc::new(Int32Array::from(groups)) as ArrayRef,
+            ],
+            None,
+        );
+        RecordBatch::try_from_iter([
+            ("id", flat["id"].clone()),
+            ("mv", flat["mv"].clone()),
+            ("payload", Arc::new(payload) as ArrayRef),
+        ])
+        .unwrap()
+    }
+
     fn query() -> FixedSizeListArray {
         FixedSizeListArray::try_new_from_values(
             Float32Array::from(vec![1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0]),
             4,
         )
         .unwrap()
+    }
+
+    fn count_take_execs(plan: &dyn datafusion::physical_plan::ExecutionPlan) -> usize {
+        usize::from(plan.as_any().is::<TakeExec>())
+            + plan
+                .children()
+                .into_iter()
+                .map(|child| count_take_execs(child.as_ref()))
+                .sum::<usize>()
     }
 
     async fn search_ids(dataset: &Dataset, filter: Option<&str>, k: usize) -> RecordBatch {
@@ -1438,6 +1477,221 @@ mod tests {
                 .as_primitive::<arrow::datatypes::Int32Type>()
                 .values()
                 .contains(&2)
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_take_optimizations_preserve_database_semantics_and_plan_boundaries() {
+        let directory = TempStrDir::default();
+        let batch = make_batch(
+            vec![0, 1, 2, 3, 4, 5],
+            vec![
+                vec![[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]],
+                vec![[0.9, 0.0, 0.0, 0.0], [0.0, 0.9, 0.0, 0.0]],
+                vec![[0.8, 0.0, 0.0, 0.0], [0.0, 0.8, 0.0, 0.0]],
+                vec![[0.7, 0.0, 0.0, 0.0], [0.0, 0.7, 0.0, 0.0]],
+                vec![[0.6, 0.0, 0.0, 0.0], [0.0, 0.6, 0.0, 0.0]],
+                vec![[0.5, 0.0, 0.0, 0.0], [0.0, 0.5, 0.0, 0.0]],
+            ],
+        );
+        let schema = batch.schema();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+            directory.as_ref(),
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["mv"],
+                IndexType::Vector,
+                Some("plaid_idx".to_string()),
+                &PlaidIndexParams {
+                    num_centroids: 4,
+                    nbits: 2,
+                    max_iterations: 3,
+                    sample_rate: 4,
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        dataset.delete("id = 4").await.unwrap();
+
+        let control_config = PlaidTakeOptimizationTestGuard::new(false, false);
+        let mut control_scanner = dataset.scan();
+        control_scanner.prefilter(false);
+        control_scanner.filter("id != 1").unwrap();
+        control_scanner.nearest("mv", &query(), 5).unwrap();
+        control_scanner.refine(2);
+        control_scanner.project(&["id"]).unwrap();
+        let control_plan = control_scanner.create_plan().await.unwrap();
+        assert!(count_take_execs(control_plan.as_ref()) >= 1);
+        let control = control_scanner.try_into_batch().await.unwrap();
+
+        drop(control_config);
+        let _treatment_config = PlaidTakeOptimizationTestGuard::new(true, true);
+        let mut treatment_scanner = dataset.scan();
+        treatment_scanner.prefilter(false);
+        treatment_scanner.filter("id != 1").unwrap();
+        treatment_scanner.nearest("mv", &query(), 5).unwrap();
+        treatment_scanner.refine(2);
+        treatment_scanner.project(&["id"]).unwrap();
+        let treatment_plan = treatment_scanner.create_plan().await.unwrap();
+        assert_eq!(count_take_execs(treatment_plan.as_ref()), 0);
+        let treatment_explain = treatment_scanner.explain_plan(false).await.unwrap();
+        assert!(treatment_explain.contains("sorted_raw_take_mode=enabled"));
+        assert!(treatment_explain.contains("fused_final_take_mode=enabled"));
+        assert!(treatment_explain.contains("fused_output_fields=1"));
+        let treatment_analyzed = treatment_scanner.analyze_plan().await.unwrap();
+        // The deletion mask activates the exact-filter fallback, which already
+        // sorts physical addresses and therefore must not claim a second sort.
+        assert!(!treatment_analyzed.contains("plaid_sorted_raw_take_queries=1"));
+        assert!(treatment_analyzed.contains("plaid_fused_final_take_queries=1"));
+        assert!(treatment_analyzed.contains("plaid_fused_final_take_candidate_rows=5"));
+        assert!(treatment_analyzed.contains("plaid_fused_final_take_output_rows=5"));
+        let treatment = treatment_scanner.try_into_batch().await.unwrap();
+        assert_eq!(control, treatment);
+        let treatment_ids = treatment["id"]
+            .as_primitive::<arrow::datatypes::Int32Type>()
+            .values();
+        assert!(!treatment_ids.contains(&1));
+        assert!(!treatment_ids.contains(&4));
+
+        // Asking for the stable row ID must not duplicate the system field in
+        // the fused output schema.
+        let mut row_id_scanner = dataset.scan();
+        row_id_scanner.nearest("mv", &query(), 3).unwrap();
+        row_id_scanner.refine(2);
+        row_id_scanner.project(&[lance_core::ROW_ID, "id"]).unwrap();
+        let row_id_batch = row_id_scanner.try_into_batch().await.unwrap();
+        assert_eq!(
+            row_id_batch
+                .schema()
+                .fields()
+                .iter()
+                .filter(|field| field.name() == lance_core::ROW_ID)
+                .count(),
+            1
+        );
+
+        // Index-only has no raw-vector Take to consolidate and must retain the
+        // ordinary outer Take even when the experimental env is enabled.
+        let mut index_only_scanner = dataset.scan();
+        index_only_scanner.nearest("mv", &query(), 3).unwrap();
+        index_only_scanner.project(&["id"]).unwrap();
+        let index_only_plan = index_only_scanner.create_plan().await.unwrap();
+        assert!(count_take_execs(index_only_plan.as_ref()) >= 1);
+        let index_only_explain = index_only_scanner.explain_plan(false).await.unwrap();
+        assert!(index_only_explain.contains("mode=index_only"));
+        assert!(index_only_explain.contains("fused_output_fields=0"));
+
+        // An unindexed append wraps PLAID in the stock combined-search tree.
+        // Root-only fusion must decline it so both branches keep one schema.
+        let appended = make_batch(
+            vec![99],
+            vec![vec![[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]]],
+        );
+        dataset
+            .append(RecordBatchIterator::new(vec![Ok(appended)], schema), None)
+            .await
+            .unwrap();
+        let mut append_scanner = dataset.scan();
+        append_scanner.nearest("mv", &query(), 6).unwrap();
+        append_scanner.refine(2);
+        append_scanner.project(&["id"]).unwrap();
+        let append_plan = append_scanner.create_plan().await.unwrap();
+        assert!(count_take_execs(append_plan.as_ref()) >= 1);
+        let append_explain = append_scanner.explain_plan(false).await.unwrap();
+        assert!(append_explain.contains("fused_output_fields=0"));
+        let append_result = append_scanner.try_into_batch().await.unwrap();
+        assert!(
+            append_result["id"]
+                .as_primitive::<arrow::datatypes::Int32Type>()
+                .values()
+                .contains(&99)
+        );
+    }
+
+    #[tokio::test]
+    async fn fused_exact_take_projects_nested_filter_sibling_fields() {
+        let directory = TempStrDir::default();
+        let batch = make_nested_batch(
+            vec![0, 1, 2, 3],
+            vec![10, 20, 30, 40],
+            vec![1, 2, 1, 2],
+            vec![
+                vec![[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]],
+                vec![[0.9, 0.0, 0.0, 0.0], [0.0, 0.9, 0.0, 0.0]],
+                vec![[0.8, 0.0, 0.0, 0.0], [0.0, 0.8, 0.0, 0.0]],
+                vec![[0.7, 0.0, 0.0, 0.0], [0.0, 0.7, 0.0, 0.0]],
+            ],
+        );
+        let schema = batch.schema();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            directory.as_ref(),
+            None,
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["mv"],
+                IndexType::Vector,
+                Some("nested_plaid_idx".to_string()),
+                &PlaidIndexParams {
+                    num_centroids: 4,
+                    nbits: 2,
+                    max_iterations: 3,
+                    sample_rate: 4,
+                },
+                false,
+            )
+            .await
+            .unwrap();
+
+        let control_config = PlaidTakeOptimizationTestGuard::new(false, false);
+        let mut control_scanner = dataset.scan();
+        control_scanner.prefilter(false);
+        control_scanner.filter("payload.group = 1").unwrap();
+        control_scanner.nearest("mv", &query(), 4).unwrap();
+        control_scanner.refine(2);
+        control_scanner.project(&["id", "payload.lang"]).unwrap();
+        let control = control_scanner.try_into_batch().await.unwrap();
+
+        drop(control_config);
+        let _treatment_config = PlaidTakeOptimizationTestGuard::new(true, true);
+        let mut treatment_scanner = dataset.scan();
+        treatment_scanner.prefilter(false);
+        treatment_scanner.filter("payload.group = 1").unwrap();
+        treatment_scanner.nearest("mv", &query(), 4).unwrap();
+        treatment_scanner.refine(2);
+        treatment_scanner.project(&["id", "payload.lang"]).unwrap();
+        let treatment_plan = treatment_scanner.create_plan().await.unwrap();
+        assert_eq!(count_take_execs(treatment_plan.as_ref()), 0);
+        let treatment_analyzed = treatment_scanner.analyze_plan().await.unwrap();
+        assert!(treatment_analyzed.contains("plaid_sorted_raw_take_queries=1"));
+        assert!(treatment_analyzed.contains("plaid_fused_final_take_queries=1"));
+        let treatment = treatment_scanner.try_into_batch().await.unwrap();
+        assert_eq!(control, treatment);
+        assert_eq!(
+            treatment["id"]
+                .as_primitive::<arrow::datatypes::Int32Type>()
+                .values(),
+            &[0, 2]
+        );
+        assert_eq!(
+            treatment
+                .column_by_name("payload.lang")
+                .unwrap()
+                .as_primitive::<arrow::datatypes::Int32Type>()
+                .values(),
+            &[10, 30]
         );
     }
 

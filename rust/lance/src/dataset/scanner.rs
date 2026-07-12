@@ -2661,6 +2661,24 @@ impl Scanner {
             )?;
         }
 
+        // An exact PLAID search already reads every raw candidate by address.
+        // When the experimental fusion is enabled, carry the physical output
+        // and post-filter fields through that read so both this early take and
+        // the final projection take become no-ops.  The PlaidSearchExec method
+        // enforces exact mode and keeps the default/control plan unchanged.
+        if self.aggregate.is_none()
+            && let Some(plaid) = plan.as_any().downcast_ref::<PlaidSearchExec>()
+        {
+            let fused_projection = self
+                .projection_plan
+                .physical_projection
+                .clone()
+                .union_projection(&pre_filter_projection);
+            if let Some(fused_plaid) = plaid.try_with_fused_output_projection(fused_projection)? {
+                plan = Arc::new(fused_plaid);
+            }
+        }
+
         plan = self.take(plan, pre_filter_projection)?;
 
         // Filter
