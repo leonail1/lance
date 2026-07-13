@@ -10,9 +10,8 @@ use std::time::{Duration, Instant};
 
 use arrow::array::AsArray;
 use arrow::datatypes::UInt64Type;
-use arrow_array::{Array, ArrayRef, Float32Array, RecordBatch, UInt32Array, UInt64Array};
+use arrow_array::{Array, ArrayRef, Float32Array, RecordBatch, UInt64Array};
 use arrow_schema::{Schema as ArrowSchema, SchemaRef};
-use arrow_select::take::take_record_batch;
 use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
@@ -27,6 +26,8 @@ use datafusion::physical_plan::{
 use datafusion_physical_expr::EquivalenceProperties;
 use futures::stream;
 use lance_arrow::RecordBatchExt;
+use lance_arrow::interleave_batches;
+use lance_arrow::json::convert_lance_json_to_arrow;
 use lance_core::ROW_ID;
 use lance_core::datatypes::{OnMissing, Projection};
 use lance_core::utils::tokio::spawn_cpu;
@@ -135,29 +136,40 @@ const SORTED_RAW_TAKE_TIME: &str = "plaid_sorted_raw_take_sub_time";
 const SORTED_RAW_TAKE_QUERY_COUNT: &str = "plaid_sorted_raw_take_queries";
 const SORTED_RAW_TAKE_ROWS_COUNT: &str = "plaid_sorted_raw_take_rows";
 const RAW_VECTOR_BYTES_COUNT: &str = "plaid_raw_vector_batch_bytes";
+const GROUPED_REFINEMENT_TIME: &str = "plaid_grouped_refinement_take_sub_time";
+const GROUPED_REFINEMENT_QUERY_COUNT: &str = "plaid_grouped_refinement_queries";
+const GROUPED_REFINEMENT_BATCH_COUNT: &str = "plaid_grouped_refinement_batches";
+const GROUPED_REFINEMENT_ROWS_COUNT: &str = "plaid_grouped_refinement_rows";
+const GROUPED_REFINEMENT_FALLBACK_COUNT: &str = "plaid_grouped_refinement_fallbacks";
 
 const DIRECT_RESIDUAL_ENABLED_ENV: &str = "LANCE_PLAID_DIRECT_RESIDUAL_ENABLED";
 const DIRECT_RESIDUAL_MAX_DOCUMENTS_ENV: &str = "LANCE_PLAID_DIRECT_RESIDUAL_MAX_DOCUMENTS";
 const DEFAULT_DIRECT_RESIDUAL_MAX_DOCUMENTS: usize = 1024;
 const FUSED_FINAL_TAKE_ENABLED_ENV: &str = "LANCE_PLAID_FUSED_FINAL_TAKE_ENABLED";
 const SORTED_RAW_TAKE_ENABLED_ENV: &str = "LANCE_PLAID_SORTED_RAW_TAKE_ENABLED";
+const GROUPED_REFINEMENT_ENABLED_ENV: &str = "LANCE_PLAID_GROUPED_REFINEMENT_ENABLED";
 
 #[cfg(test)]
 thread_local! {
-    static TAKE_OPT_TEST_OVERRIDE: std::cell::Cell<Option<(bool, bool)>> = const {
+    static TAKE_OPT_TEST_OVERRIDE: std::cell::Cell<Option<(bool, bool, bool)>> = const {
         std::cell::Cell::new(None)
     };
 }
 
 #[cfg(test)]
 pub(crate) struct PlaidTakeOptimizationTestGuard {
-    previous: Option<(bool, bool)>,
+    previous: Option<(bool, bool, bool)>,
 }
 
 #[cfg(test)]
 impl PlaidTakeOptimizationTestGuard {
     pub(crate) fn new(fused: bool, sorted: bool) -> Self {
-        let previous = TAKE_OPT_TEST_OVERRIDE.replace(Some((fused, sorted)));
+        let previous = TAKE_OPT_TEST_OVERRIDE.replace(Some((fused, sorted, false)));
+        Self { previous }
+    }
+
+    pub(crate) fn new_with_grouped(fused: bool, sorted: bool, grouped: bool) -> Self {
+        let previous = TAKE_OPT_TEST_OVERRIDE.replace(Some((fused, sorted, grouped)));
         Self { previous }
     }
 }
@@ -170,7 +182,7 @@ impl Drop for PlaidTakeOptimizationTestGuard {
 }
 
 #[cfg(test)]
-fn take_optimization_test_override() -> Option<(bool, bool)> {
+fn take_optimization_test_override() -> Option<(bool, bool, bool)> {
     TAKE_OPT_TEST_OVERRIDE.get()
 }
 
@@ -182,7 +194,7 @@ struct FusedFinalTakeConfig {
 impl FusedFinalTakeConfig {
     fn from_env() -> Result<Self> {
         #[cfg(test)]
-        if let Some((enabled, _)) = take_optimization_test_override() {
+        if let Some((enabled, _, _)) = take_optimization_test_override() {
             return Ok(Self { enabled });
         }
         let enabled = read_utf8_env(FUSED_FINAL_TAKE_ENABLED_ENV)?;
@@ -216,7 +228,7 @@ struct SortedRawTakeConfig {
 impl SortedRawTakeConfig {
     fn from_env() -> Result<Self> {
         #[cfg(test)]
-        if let Some((_, enabled)) = take_optimization_test_override() {
+        if let Some((_, enabled, _)) = take_optimization_test_override() {
             return Ok(Self { enabled });
         }
         let enabled = read_utf8_env(SORTED_RAW_TAKE_ENABLED_ENV)?;
@@ -229,6 +241,40 @@ impl SortedRawTakeConfig {
                 parse_bool(value).ok_or_else(|| {
                     Error::invalid_input(format!(
                         "invalid {SORTED_RAW_TAKE_ENABLED_ENV}={value:?}; expected true/false"
+                    ))
+                })
+            })
+            .transpose()?
+            .unwrap_or(false);
+        Ok(Self { enabled })
+    }
+
+    fn mode_name(self) -> &'static str {
+        if self.enabled { "enabled" } else { "disabled" }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct GroupedRefinementConfig {
+    enabled: bool,
+}
+
+impl GroupedRefinementConfig {
+    fn from_env() -> Result<Self> {
+        #[cfg(test)]
+        if let Some((_, _, enabled)) = take_optimization_test_override() {
+            return Ok(Self { enabled });
+        }
+        let enabled = read_utf8_env(GROUPED_REFINEMENT_ENABLED_ENV)?;
+        Self::from_value(enabled.as_deref())
+    }
+
+    fn from_value(enabled: Option<&str>) -> Result<Self> {
+        let enabled = enabled
+            .map(|value| {
+                parse_bool(value).ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "invalid {GROUPED_REFINEMENT_ENABLED_ENV}={value:?}; expected true/false"
                     ))
                 })
             })
@@ -445,6 +491,7 @@ pub struct PlaidSearchExec {
     direct_residual_config: DirectResidualConfig,
     fused_final_take_config: FusedFinalTakeConfig,
     sorted_raw_take_config: SortedRawTakeConfig,
+    grouped_refinement_config: GroupedRefinementConfig,
     fused_output_projection: Option<Projection>,
     output_schema: SchemaRef,
     prefilter_source: PreFilterSource,
@@ -467,6 +514,7 @@ impl PlaidSearchExec {
             DirectResidualConfig::from_env()?,
             FusedFinalTakeConfig::from_env()?,
             SortedRawTakeConfig::from_env()?,
+            GroupedRefinementConfig::from_env()?,
             None,
         )
     }
@@ -479,6 +527,7 @@ impl PlaidSearchExec {
         direct_residual_config: DirectResidualConfig,
         fused_final_take_config: FusedFinalTakeConfig,
         sorted_raw_take_config: SortedRawTakeConfig,
+        grouped_refinement_config: GroupedRefinementConfig,
         fused_output_projection: Option<Projection>,
     ) -> Result<Self> {
         if indices.is_empty() {
@@ -529,6 +578,7 @@ impl PlaidSearchExec {
             direct_residual_config,
             fused_final_take_config,
             sorted_raw_take_config,
+            grouped_refinement_config,
             fused_output_projection,
             output_schema,
             prefilter_source,
@@ -558,6 +608,7 @@ impl PlaidSearchExec {
             self.direct_residual_config,
             self.fused_final_take_config,
             self.sorted_raw_take_config,
+            self.grouped_refinement_config,
             Some(projection),
         )?))
     }
@@ -572,7 +623,7 @@ impl DisplayAs for PlaidSearchExec {
         match format {
             DisplayFormatType::Default | DisplayFormatType::Verbose => write!(
                 formatter,
-                "PlaidSearch: name={}, k={}, segments={}, mode={}, core_residual_budget={}, raw_refinement_budget={}, filter_exact_fallback=enabled, direct_residual_mode={}, direct_residual_max_documents={}, sorted_raw_take_mode={}, fused_final_take_mode={}, fused_output_fields={}",
+                "PlaidSearch: name={}, k={}, segments={}, mode={}, core_residual_budget={}, raw_refinement_budget={}, filter_exact_fallback=enabled, direct_residual_mode={}, direct_residual_max_documents={}, sorted_raw_take_mode={}, grouped_refinement_mode={}, fused_final_take_mode={}, fused_output_fields={}",
                 self.indices[0].name,
                 self.query.k,
                 self.indices.len(),
@@ -584,6 +635,7 @@ impl DisplayAs for PlaidSearchExec {
                 self.direct_residual_config.mode_name(),
                 self.direct_residual_config.max_documents,
                 self.sorted_raw_take_config.mode_name(),
+                self.grouped_refinement_config.mode_name(),
                 self.fused_final_take_config.mode_name(),
                 self.fused_output_projection
                     .as_ref()
@@ -592,7 +644,7 @@ impl DisplayAs for PlaidSearchExec {
             ),
             DisplayFormatType::TreeRender => write!(
                 formatter,
-                "PlaidSearch\nname={}\nk={}\nsegments={}\nmode={}\ncore_residual_budget={}\nraw_refinement_budget={}\nfilter_exact_fallback=enabled\ndirect_residual_mode={}\ndirect_residual_max_documents={}\nsorted_raw_take_mode={}\nfused_final_take_mode={}\nfused_output_fields={}",
+                "PlaidSearch\nname={}\nk={}\nsegments={}\nmode={}\ncore_residual_budget={}\nraw_refinement_budget={}\nfilter_exact_fallback=enabled\ndirect_residual_mode={}\ndirect_residual_max_documents={}\nsorted_raw_take_mode={}\ngrouped_refinement_mode={}\nfused_final_take_mode={}\nfused_output_fields={}",
                 self.indices[0].name,
                 self.query.k,
                 self.indices.len(),
@@ -604,6 +656,7 @@ impl DisplayAs for PlaidSearchExec {
                 self.direct_residual_config.mode_name(),
                 self.direct_residual_config.max_documents,
                 self.sorted_raw_take_config.mode_name(),
+                self.grouped_refinement_config.mode_name(),
                 self.fused_final_take_config.mode_name(),
                 self.fused_output_projection
                     .as_ref()
@@ -673,6 +726,7 @@ impl ExecutionPlan for PlaidSearchExec {
             self.direct_residual_config,
             self.fused_final_take_config,
             self.sorted_raw_take_config,
+            self.grouped_refinement_config,
             self.fused_output_projection.clone(),
         )?))
     }
@@ -696,6 +750,7 @@ impl ExecutionPlan for PlaidSearchExec {
         let mode = self.mode;
         let direct_residual_config = self.direct_residual_config;
         let sorted_raw_take_config = self.sorted_raw_take_config;
+        let grouped_refinement_config = self.grouped_refinement_config;
         let fused_output_projection = self.fused_output_projection.clone();
         let output_schema = self.output_schema.clone();
         let stream = stream::once(async move {
@@ -707,6 +762,7 @@ impl ExecutionPlan for PlaidSearchExec {
                 mode,
                 direct_residual_config,
                 sorted_raw_take_config,
+                grouped_refinement_config,
                 fused_output_projection,
                 output_schema,
                 prefilter,
@@ -758,6 +814,7 @@ struct PlaidExecMetrics {
     raw_vector_fetch: Time,
     exact: Time,
     sorted_raw_take: Time,
+    grouped_refinement: Time,
     fused_final_take: Time,
     sort: Time,
     total: Time,
@@ -816,6 +873,10 @@ struct PlaidExecMetrics {
     fused_final_take_output_bytes_count: Count,
     sorted_raw_take_query_count: Count,
     sorted_raw_take_rows_count: Count,
+    grouped_refinement_query_count: Count,
+    grouped_refinement_batch_count: Count,
+    grouped_refinement_rows_count: Count,
+    grouped_refinement_fallback_count: Count,
 }
 
 impl PlaidExecMetrics {
@@ -840,6 +901,7 @@ impl PlaidExecMetrics {
             raw_vector_fetch: metrics.new_time(RAW_VECTOR_FETCH_TIME, partition),
             exact: metrics.new_time(EXACT_TIME, partition),
             sorted_raw_take: metrics.new_time(SORTED_RAW_TAKE_TIME, partition),
+            grouped_refinement: metrics.new_time(GROUPED_REFINEMENT_TIME, partition),
             fused_final_take: metrics.new_time(FUSED_FINAL_TAKE_TIME, partition),
             sort: metrics.new_time(SORT_TIME, partition),
             total: metrics.new_time(TOTAL_TIME, partition),
@@ -926,6 +988,14 @@ impl PlaidExecMetrics {
                 .new_count(FUSED_FINAL_TAKE_OUTPUT_BYTES_COUNT, partition),
             sorted_raw_take_query_count: metrics.new_count(SORTED_RAW_TAKE_QUERY_COUNT, partition),
             sorted_raw_take_rows_count: metrics.new_count(SORTED_RAW_TAKE_ROWS_COUNT, partition),
+            grouped_refinement_query_count: metrics
+                .new_count(GROUPED_REFINEMENT_QUERY_COUNT, partition),
+            grouped_refinement_batch_count: metrics
+                .new_count(GROUPED_REFINEMENT_BATCH_COUNT, partition),
+            grouped_refinement_rows_count: metrics
+                .new_count(GROUPED_REFINEMENT_ROWS_COUNT, partition),
+            grouped_refinement_fallback_count: metrics
+                .new_count(GROUPED_REFINEMENT_FALLBACK_COUNT, partition),
         }
     }
 
@@ -1189,6 +1259,7 @@ async fn execute_search(
     mode: PlaidExecutionMode,
     direct_residual_config: DirectResidualConfig,
     sorted_raw_take_config: SortedRawTakeConfig,
+    grouped_refinement_config: GroupedRefinementConfig,
     fused_output_projection: Option<Projection>,
     output_schema: SchemaRef,
     prefilter: Arc<crate::index::prefilter::DatasetPreFilter>,
@@ -1431,6 +1502,7 @@ async fn execute_search(
             .map(|(row_address, score)| ExactHit {
                 row_address,
                 distance: maxsim_distance(score),
+                batch_ordinal: 0,
                 batch_index: 0,
             })
             .collect::<Vec<_>>();
@@ -1504,43 +1576,100 @@ async fn execute_search(
     // projection contract in the consolidated read.
     projection.physical_projection = raw_projection;
     let projection = Arc::new(projection);
+
+    let addresses_are_sorted = row_addresses.windows(2).all(|pair| pair[0] <= pair[1]);
+    let fragment_count = addresses_are_sorted.then(|| {
+        1 + row_addresses
+            .windows(2)
+            .filter(|pair| pair[0] >> 32 != pair[1] >> 32)
+            .count()
+    });
+    // Preserve physical fragment batches and defer logical projection until
+    // top-k only when cross-fragment layout work exists. Keep the ordinary
+    // TakeBuilder path for a single fragment until benchmarks justify otherwise.
+    let grouped_attempt = grouped_refinement_config.enabled
+        && fragment_count.is_some_and(|fragment_count| fragment_count > 1);
     let raw_vector_fetch_started = Instant::now();
-    let batch =
-        TakeBuilder::try_new_from_addresses(dataset.clone(), row_addresses.clone(), projection)?
-            .execute()
-            .await?;
+    let grouped_batches = if grouped_attempt {
+        let grouped_started = Instant::now();
+        let result = TakeBuilder::try_new_from_addresses(
+            dataset.clone(),
+            row_addresses.clone(),
+            projection.clone(),
+        )?
+        .read_sorted_physical_by_fragment()
+        .await?;
+        metrics
+            .grouped_refinement
+            .add_duration(grouped_started.elapsed());
+        result
+    } else {
+        None
+    };
+    let (batches, grouped_physical_batches) = if let Some(batches) = grouped_batches {
+        metrics.grouped_refinement_query_count.add(1);
+        metrics.grouped_refinement_batch_count.add(batches.len());
+        metrics
+            .grouped_refinement_rows_count
+            .add(batches.iter().map(RecordBatch::num_rows).sum());
+        (batches, true)
+    } else {
+        if grouped_refinement_config.enabled {
+            metrics.grouped_refinement_fallback_count.add(1);
+        }
+        (
+            vec![
+                TakeBuilder::try_new_from_addresses(
+                    dataset.clone(),
+                    row_addresses.clone(),
+                    projection.clone(),
+                )?
+                .execute()
+                .await?,
+            ],
+            false,
+        )
+    };
     metrics
         .raw_vector_fetch
         .add_duration(raw_vector_fetch_started.elapsed());
-    metrics.raw_vector_rows_count.add(batch.num_rows());
-    metrics
-        .raw_vector_bytes_count
-        .add(batch.get_array_memory_size());
+    let raw_rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+    let raw_bytes = batches
+        .iter()
+        .map(RecordBatch::get_array_memory_size)
+        .sum::<usize>();
+    metrics.raw_vector_rows_count.add(raw_rows);
+    metrics.raw_vector_bytes_count.add(raw_bytes);
     if fused_output_projection.is_some() {
-        metrics
-            .fused_final_take_candidate_rows_count
-            .add(batch.num_rows());
+        metrics.fused_final_take_candidate_rows_count.add(raw_rows);
     }
-    if batch.num_rows() != row_addresses.len() {
+    if raw_rows != row_addresses.len() {
         return Err(Error::internal(format!(
             "PLAID raw-vector take returned {} rows for {} candidates",
-            batch.num_rows(),
+            raw_rows,
             row_addresses.len()
         )));
     }
 
-    let result_row_ids = batch
-        .column_by_name(ROW_ID)
-        .ok_or_else(|| Error::internal("PLAID address take did not return _rowid".to_string()))?
-        .as_primitive::<UInt64Type>()
-        .values()
-        .to_vec();
+    let mut result_row_ids = Vec::with_capacity(raw_rows);
+    for batch in &batches {
+        result_row_ids.extend_from_slice(
+            batch
+                .column_by_name(ROW_ID)
+                .ok_or_else(|| {
+                    Error::internal("PLAID address take did not return _rowid".to_string())
+                })?
+                .as_primitive::<UInt64Type>()
+                .values(),
+        );
+    }
     let exact_started = Instant::now();
     let column = query.column.clone();
     let query_for_cpu = query_tokens.clone();
-    let scoring_batch = batch.clone();
+    let scoring_batches = batches.clone();
     let mut hits =
-        spawn_cpu(move || exact_scores(&scoring_batch, &column, query_for_cpu.view())).await?;
+        spawn_cpu(move || exact_scores_batches(&scoring_batches, &column, query_for_cpu.view()))
+            .await?;
     metrics.exact.add_duration(exact_started.elapsed());
     for (hit, row_id) in hits.iter_mut().zip(result_row_ids) {
         hit.row_address = row_id;
@@ -1552,7 +1681,22 @@ async fn execute_search(
 
     let output_batch = if fused_output_projection.is_some() {
         let fused_started = Instant::now();
-        let output_batch = fused_hits_to_batch(&hits, &batch, output_schema)?;
+        let output_batch = if hits.is_empty() {
+            RecordBatch::new_empty(output_schema.clone())
+        } else {
+            let selected = select_fused_candidate_rows(&hits, &batches)?;
+            // Grouped take returns physical batches. Apply the consolidated
+            // logical projection and JSON conversion only to selected top-k
+            // rows. The fallback batch already has ordinary TakeBuilder
+            // projection semantics and must not be projected twice.
+            let selected = if grouped_physical_batches {
+                let selected = projection.project_batch(selected).await?;
+                convert_lance_json_to_arrow(&selected)?
+            } else {
+                selected
+            };
+            fused_selected_hits_to_batch(&hits, &selected, output_schema)?
+        };
         metrics
             .fused_final_take
             .add_duration(fused_started.elapsed());
@@ -1629,6 +1773,7 @@ fn hits_to_batch(hits: &[ExactHit]) -> Result<RecordBatch> {
     )?)
 }
 
+#[cfg(test)]
 fn fused_hits_to_batch(
     hits: &[ExactHit],
     candidate_batch: &RecordBatch,
@@ -1637,18 +1782,54 @@ fn fused_hits_to_batch(
     if hits.is_empty() {
         return Ok(RecordBatch::new_empty(output_schema));
     }
+    let selected = select_fused_candidate_rows(hits, std::slice::from_ref(candidate_batch))?;
+    fused_selected_hits_to_batch(hits, &selected, output_schema)
+}
+
+fn select_fused_candidate_rows(
+    hits: &[ExactHit],
+    candidate_batches: &[RecordBatch],
+) -> Result<RecordBatch> {
+    let first_batch = candidate_batches.first().ok_or_else(|| {
+        Error::internal("PLAID fused final take received no candidate batches".to_string())
+    })?;
+    if hits.is_empty() {
+        return Ok(RecordBatch::new_empty(first_batch.schema()));
+    }
     let indices = hits
         .iter()
         .map(|hit| {
-            u32::try_from(hit.batch_index).map_err(|_| {
+            let batch = candidate_batches.get(hit.batch_ordinal).ok_or_else(|| {
                 Error::internal(format!(
-                    "PLAID fused final take candidate index {} exceeds u32",
-                    hit.batch_index
+                    "PLAID fused final take batch ordinal {} exceeds {} candidate batches",
+                    hit.batch_ordinal,
+                    candidate_batches.len()
                 ))
-            })
+            })?;
+            if hit.batch_index >= batch.num_rows() {
+                return Err(Error::internal(format!(
+                    "PLAID fused final take row {} exceeds batch {} length {}",
+                    hit.batch_index,
+                    hit.batch_ordinal,
+                    batch.num_rows()
+                )));
+            }
+            Ok((hit.batch_ordinal, hit.batch_index))
         })
         .collect::<Result<Vec<_>>>()?;
-    let selected = take_record_batch(candidate_batch, &UInt32Array::from(indices))?;
+    // Interleave only the final top-k rows in rank order. Candidate-sized
+    // nested arrays are never concatenated across fragments.
+    interleave_batches(candidate_batches, &indices).map_err(Error::from)
+}
+
+fn fused_selected_hits_to_batch(
+    hits: &[ExactHit],
+    selected: &RecordBatch,
+    output_schema: SchemaRef,
+) -> Result<RecordBatch> {
+    if hits.is_empty() {
+        return Ok(RecordBatch::new_empty(output_schema));
+    }
     // The raw projection is a union of vector, filter, and final fields.  For
     // nested columns that can make the selected top-level StructArray wider
     // than the final output (for example payload.{mv,lang} vs payload.lang).
@@ -1733,33 +1914,47 @@ struct ExactHit {
     row_address: u64,
     distance: f32,
     batch_index: usize,
+    batch_ordinal: usize,
 }
 
+#[cfg(test)]
 fn exact_scores(
     batch: &RecordBatch,
     column: &str,
     query: ArrayView2<'_, f32>,
 ) -> Result<Vec<ExactHit>> {
-    let documents = batch
-        .column_by_qualified_name(column)
-        .ok_or_else(|| Error::internal(format!("PLAID raw batch is missing {column}")))?
-        .as_list::<i32>();
-    let mut hits = Vec::with_capacity(documents.len());
+    exact_scores_batches(std::slice::from_ref(batch), column, query)
+}
+
+fn exact_scores_batches(
+    batches: &[RecordBatch],
+    column: &str,
+    query: ArrayView2<'_, f32>,
+) -> Result<Vec<ExactHit>> {
+    let mut hits = Vec::with_capacity(batches.iter().map(RecordBatch::num_rows).sum());
+    // Validate the query once per database query, not once per fragment.
     let scorer = ExactMaxsimScorer::try_new(query)?;
-    for row_index in 0..documents.len() {
-        if documents.is_null(row_index) {
-            return Err(Error::internal(
-                "PLAID candidate unexpectedly resolved to a null document".to_string(),
-            ));
+    for (batch_ordinal, batch) in batches.iter().enumerate() {
+        let documents = batch
+            .column_by_qualified_name(column)
+            .ok_or_else(|| Error::internal(format!("PLAID raw batch is missing {column}")))?
+            .as_list::<i32>();
+        for batch_index in 0..documents.len() {
+            if documents.is_null(batch_index) {
+                return Err(Error::internal(
+                    "PLAID candidate unexpectedly resolved to a null document".to_string(),
+                ));
+            }
+            let document = documents.value(batch_index);
+            let tokens = document.as_fixed_size_list();
+            let score = scorer.score(tokens)?;
+            hits.push(ExactHit {
+                row_address: 0,
+                distance: maxsim_distance(score),
+                batch_index,
+                batch_ordinal,
+            });
         }
-        let document = documents.value(row_index);
-        let tokens = document.as_fixed_size_list();
-        let score = scorer.score(tokens)?;
-        hits.push(ExactHit {
-            row_address: 0,
-            distance: maxsim_distance(score),
-            batch_index: row_index,
-        });
     }
     Ok(hits)
 }
@@ -1965,6 +2160,10 @@ mod tests {
             SortedRawTakeConfig::from_value(None).unwrap(),
             SortedRawTakeConfig::default()
         );
+        assert_eq!(
+            GroupedRefinementConfig::from_value(None).unwrap(),
+            GroupedRefinementConfig::default()
+        );
         for enabled in ["1", "true", "YES", "on"] {
             assert_eq!(
                 FusedFinalTakeConfig::from_value(Some(enabled)).unwrap(),
@@ -1973,6 +2172,10 @@ mod tests {
             assert_eq!(
                 SortedRawTakeConfig::from_value(Some(enabled)).unwrap(),
                 SortedRawTakeConfig { enabled: true }
+            );
+            assert_eq!(
+                GroupedRefinementConfig::from_value(Some(enabled)).unwrap(),
+                GroupedRefinementConfig { enabled: true }
             );
         }
         for disabled in ["0", "false", "No", "OFF"] {
@@ -1983,6 +2186,10 @@ mod tests {
             assert_eq!(
                 SortedRawTakeConfig::from_value(Some(disabled)).unwrap(),
                 SortedRawTakeConfig { enabled: false }
+            );
+            assert_eq!(
+                GroupedRefinementConfig::from_value(Some(disabled)).unwrap(),
+                GroupedRefinementConfig { enabled: false }
             );
         }
         assert!(
@@ -1996,6 +2203,12 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains(SORTED_RAW_TAKE_ENABLED_ENV)
+        );
+        assert!(
+            GroupedRefinementConfig::from_value(Some("maybe"))
+                .unwrap_err()
+                .to_string()
+                .contains(GROUPED_REFINEMENT_ENABLED_ENV)
         );
     }
 
@@ -2021,11 +2234,13 @@ mod tests {
             ExactHit {
                 row_address: 3_000,
                 distance: -3.0,
+                batch_ordinal: 0,
                 batch_index: 2,
             },
             ExactHit {
                 row_address: 1_000,
                 distance: -1.0,
+                batch_ordinal: 0,
                 batch_index: 0,
             },
         ];
@@ -2062,6 +2277,88 @@ mod tests {
     }
 
     #[test]
+    fn fused_hits_use_batch_ordinal_and_reject_invalid_locations() {
+        let batches = [
+            RecordBatch::try_from_iter([
+                (
+                    "doc_id",
+                    Arc::new(Int32Array::from(vec![10, 11])) as ArrayRef,
+                ),
+                (
+                    ROW_ID,
+                    Arc::new(UInt64Array::from(vec![100, 110])) as ArrayRef,
+                ),
+            ])
+            .unwrap(),
+            RecordBatch::try_from_iter([
+                (
+                    "doc_id",
+                    Arc::new(Int32Array::from(vec![20, 21])) as ArrayRef,
+                ),
+                (
+                    ROW_ID,
+                    Arc::new(UInt64Array::from(vec![200, 210])) as ArrayRef,
+                ),
+            ])
+            .unwrap(),
+        ];
+        let output_schema = Arc::new(ArrowSchema::new(vec![
+            Arc::new(Field::new(DIST_COL, DataType::Float32, false)),
+            Arc::new(Field::new(ROW_ID, DataType::UInt64, false)),
+            Arc::new(Field::new("doc_id", DataType::Int32, false)),
+        ]));
+        let hits = [
+            ExactHit {
+                row_address: 2_100,
+                distance: -3.0,
+                batch_ordinal: 1,
+                batch_index: 1,
+            },
+            ExactHit {
+                row_address: 1_000,
+                distance: -2.0,
+                batch_ordinal: 0,
+                batch_index: 0,
+            },
+            ExactHit {
+                row_address: 2_000,
+                distance: -1.0,
+                batch_ordinal: 1,
+                batch_index: 0,
+            },
+        ];
+        let selected = select_fused_candidate_rows(&hits, &batches).unwrap();
+        let actual = fused_selected_hits_to_batch(&hits, &selected, output_schema).unwrap();
+        assert_eq!(
+            actual["doc_id"]
+                .as_primitive::<arrow_array::types::Int32Type>()
+                .values(),
+            &[21, 10, 20]
+        );
+        assert_eq!(
+            actual[ROW_ID].as_primitive::<UInt64Type>().values(),
+            &[2_100, 1_000, 2_000]
+        );
+
+        let mut invalid = hits;
+        invalid[0].batch_ordinal = 2;
+        assert!(
+            select_fused_candidate_rows(&invalid, &batches)
+                .unwrap_err()
+                .to_string()
+                .contains("batch ordinal")
+        );
+        invalid[0].batch_ordinal = 1;
+        invalid[0].batch_index = 2;
+        assert!(
+            select_fused_candidate_rows(&invalid, &batches)
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds batch")
+        );
+    }
+
+    #[test]
     fn fused_hits_apply_nested_output_projection() {
         let mv_field = Arc::new(Field::new("mv", DataType::Int32, false));
         let lang_field = Arc::new(Field::new("lang", DataType::Utf8, false));
@@ -2095,6 +2392,7 @@ mod tests {
         let hits = [ExactHit {
             row_address: 2_000,
             distance: -2.0,
+            batch_ordinal: 0,
             batch_index: 1,
         }];
         let actual = fused_hits_to_batch(&hits, &candidate_batch, output_schema.clone()).unwrap();
@@ -2672,21 +2970,32 @@ mod tests {
     }
 
     #[test]
-    fn exact_scores_rejects_a_null_document() {
+    fn exact_scores_batches_rejects_a_null_document_in_later_batch() {
         let tokens =
             FixedSizeListArray::try_new_from_values(Float32Array::from(vec![1.0_f32, 2.0]), 2)
                 .unwrap();
         let field = Arc::new(Field::new("item", tokens.data_type().clone(), true));
-        let documents = ListArray::try_new(
+        let valid_documents = ListArray::try_new(
+            field.clone(),
+            OffsetBuffer::from_lengths([1_usize]),
+            Arc::new(tokens.clone()),
+            None,
+        )
+        .unwrap();
+        let valid_batch =
+            RecordBatch::try_from_iter([("mv", Arc::new(valid_documents) as ArrayRef)]).unwrap();
+
+        let null_documents = ListArray::try_new(
             field,
             OffsetBuffer::from_lengths([1_usize]),
             Arc::new(tokens),
             Some(NullBuffer::from(vec![false])),
         )
         .unwrap();
-        let batch = RecordBatch::try_from_iter([("mv", Arc::new(documents) as ArrayRef)]).unwrap();
+        let null_batch =
+            RecordBatch::try_from_iter([("mv", Arc::new(null_documents) as ArrayRef)]).unwrap();
         let query = array![[1.0_f32, 2.0]];
-        let error = match exact_scores(&batch, "mv", query.view()) {
+        let error = match exact_scores_batches(&[valid_batch, null_batch], "mv", query.view()) {
             Ok(_) => panic!("null document unexpectedly produced exact scores"),
             Err(error) => error,
         };
@@ -2710,16 +3019,19 @@ mod tests {
             ExactHit {
                 row_address: 9,
                 distance: maxsim_distance(first),
+                batch_ordinal: 0,
                 batch_index: 0,
             },
             ExactHit {
                 row_address: 3,
                 distance: maxsim_distance(second),
+                batch_ordinal: 0,
                 batch_index: 1,
             },
             ExactHit {
                 row_address: 7,
                 distance: maxsim_distance(first),
+                batch_ordinal: 0,
                 batch_index: 2,
             },
         ];

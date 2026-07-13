@@ -522,6 +522,130 @@ impl TakeBuilder {
         take_rows(self).await
     }
 
+    /// Read a physically sorted, address-based take as one physical batch per
+    /// fragment, without concatenating or logically projecting the batches.
+    ///
+    /// This internal specialization computes dataset row offsets once for the
+    /// complete address list. The caller must apply the builder's logical
+    /// projection after selecting or concatenating rows. `None` means the
+    /// request needs ID translation, address reordering, row-address injection,
+    /// or empty-output schema recovery and must use `execute`.
+    pub(crate) async fn read_sorted_physical_by_fragment(self) -> Result<Option<Vec<RecordBatch>>> {
+        if self.row_ids.is_some() || self.with_row_address {
+            return Ok(None);
+        }
+        let Some(row_addrs) = self.row_addrs.as_ref() else {
+            return Ok(None);
+        };
+        if row_addrs.is_empty() {
+            return Ok(None);
+        }
+        if !check_row_addrs(row_addrs).sorted {
+            return Ok(None);
+        }
+
+        let projection = self.projection.clone();
+        let with_row_id = projection.physical_projection.with_row_id;
+        let with_row_address = projection.physical_projection.with_row_addr;
+        let with_row_created_at_version =
+            projection.physical_projection.with_row_created_at_version;
+        let with_row_last_updated_at_version = projection
+            .physical_projection
+            .with_row_last_updated_at_version;
+        let physical_schema = Arc::new(projection.physical_projection.to_bare_schema());
+
+        // Keep this helper local to make its Send bound explicit while the
+        // independent fragment reads are buffered.
+        #[allow(clippy::manual_async_fn)]
+        fn take_fragment(
+            fragment: FileFragment,
+            row_offsets: Vec<u32>,
+            projection: Arc<Schema>,
+            with_row_id: bool,
+            with_row_address: bool,
+            with_row_created_at_version: bool,
+            with_row_last_updated_at_version: bool,
+        ) -> impl Future<Output = Result<RecordBatch>> + Send {
+            async move {
+                fragment
+                    .take_rows(
+                        &row_offsets,
+                        projection.as_ref(),
+                        with_row_id,
+                        with_row_address,
+                        with_row_created_at_version,
+                        with_row_last_updated_at_version,
+                    )
+                    .await
+            }
+        }
+
+        let mut reads = Vec::new();
+        let mut start = 0;
+        while start < row_addrs.len() {
+            let fragment_id = row_addrs[start] >> 32;
+            let mut end = start + 1;
+            while end < row_addrs.len() && row_addrs[end] >> 32 == fragment_id {
+                end += 1;
+            }
+            let fragment = self
+                .dataset
+                .get_fragment(fragment_id as usize)
+                .ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "rowaddr {} belongs to non-existent fragment: {}",
+                        row_addrs[start], fragment_id
+                    ))
+                })?;
+            let row_offsets = row_addrs[start..end]
+                .iter()
+                .map(|address| *address as u32)
+                .collect();
+            reads.push(take_fragment(
+                fragment,
+                row_offsets,
+                physical_schema.clone(),
+                with_row_id,
+                with_row_address,
+                with_row_created_at_version,
+                with_row_last_updated_at_version,
+            ));
+            start = end;
+        }
+
+        let mut batches = futures::stream::iter(reads)
+            .buffered(self.dataset.object_store.io_parallelism())
+            .try_collect::<Vec<_>>()
+            .await?;
+        if projection.must_add_row_offset {
+            let returned_rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+            if returned_rows != row_addrs.len() {
+                return Err(Error::not_supported_source(format!(
+                    "Expected {} rows, got {}.  A take operation that includes row addresses must not target deleted rows.",
+                    row_addrs.len(),
+                    returned_rows
+                ).into()));
+            }
+            let row_addr_col: ArrayRef = Arc::new(UInt64Array::from(row_addrs.clone()));
+            let row_offset_col =
+                AddRowOffsetExec::compute_row_offset_array(&row_addr_col, self.dataset.clone())
+                    .await?;
+            let mut start = 0;
+            for batch in &mut batches {
+                let len = batch.num_rows();
+                if batch.schema().column_with_name(ROW_OFFSET).is_none() {
+                    *batch = batch.clone().try_with_column(
+                        ArrowField::new(ROW_OFFSET, arrow::datatypes::DataType::UInt64, false),
+                        row_offset_col.slice(start, len),
+                    )?;
+                }
+                start += len;
+            }
+        }
+
+        Ok(Some(batches))
+    }
+
     pub fn is_empty(&self) -> bool {
         match (self.row_ids.as_ref(), self.row_addrs.as_ref()) {
             (Some(ids), _) => ids.is_empty(),
@@ -596,7 +720,7 @@ mod test {
     use arrow_schema::{DataType, Fields, Schema as ArrowSchema};
     use lance_arrow::ARROW_EXT_NAME_KEY;
     use lance_arrow::json::{ARROW_JSON_EXT_NAME, is_arrow_json_field};
-    use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD};
+    use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD, ROW_OFFSET};
     use lance_file::version::LanceFileVersion;
     use pretty_assertions::assert_eq;
     use rstest::rstest;
@@ -785,6 +909,120 @@ mod test {
         assert_nested_arrow_json_schema(&empty);
     }
 
+    #[rstest]
+    #[tokio::test]
+    async fn grouped_physical_take_preserves_system_columns_and_nested_json(
+        #[values(false, true)] enable_stable_row_ids: bool,
+    ) {
+        let data = nested_arrow_json_batch();
+        let schema = data.schema();
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new([Ok(data)], schema),
+                "memory://",
+                Some(WriteParams {
+                    max_rows_per_file: 1,
+                    max_rows_per_group: 1,
+                    enable_stable_row_ids,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(dataset.get_fragments().len(), 2);
+        let addresses = vec![
+            u64::from(RowAddress::new_from_parts(0, 0)),
+            u64::from(RowAddress::new_from_parts(1, 0)),
+        ];
+        let projection = Arc::new(
+            ProjectionRequest::from_columns(
+                ["media", ROW_ID, ROW_ADDR, ROW_OFFSET],
+                dataset.schema(),
+            )
+            .into_projection_plan(dataset.clone())
+            .unwrap(),
+        );
+
+        let control = TakeBuilder::try_new_from_addresses(
+            dataset.clone(),
+            addresses.clone(),
+            projection.clone(),
+        )
+        .unwrap()
+        .execute()
+        .await
+        .unwrap();
+        let physical = TakeBuilder::try_new_from_addresses(
+            dataset.clone(),
+            addresses.clone(),
+            projection.clone(),
+        )
+        .unwrap()
+        .read_sorted_physical_by_fragment()
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(physical.len(), 2);
+        assert!(physical.iter().all(|batch| batch.num_rows() == 1));
+        assert!(physical.iter().all(|batch| {
+            batch.column_by_name(ROW_ID).is_some()
+                && batch.column_by_name(ROW_ADDR).is_some()
+                && batch.column_by_name(ROW_OFFSET).is_some()
+        }));
+        let combined = concat_batches(&physical[0].schema(), &physical).unwrap();
+        let projected = projection.project_batch(combined).await.unwrap();
+        let logical = to_logical_json_batch(projected).unwrap();
+        assert_eq!(logical, control);
+        assert_nested_arrow_json_schema(&logical);
+        assert_first_nested_json_value(&logical);
+        assert_eq!(
+            logical[ROW_OFFSET].as_primitive::<UInt64Type>().values(),
+            &[0, 1]
+        );
+        assert_eq!(
+            logical[ROW_ADDR].as_primitive::<UInt64Type>().values(),
+            addresses.as_slice()
+        );
+
+        let unsorted = vec![addresses[1], addresses[0]];
+        assert!(
+            TakeBuilder::try_new_from_addresses(dataset.clone(), unsorted, projection.clone())
+                .unwrap()
+                .read_sorted_physical_by_fragment()
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            TakeBuilder::try_new_from_addresses(
+                dataset.clone(),
+                addresses.clone(),
+                projection.clone(),
+            )
+            .unwrap()
+            .with_row_address(true)
+            .read_sorted_physical_by_fragment()
+            .await
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            TakeBuilder::try_new_from_addresses(dataset.clone(), Vec::new(), projection.clone(),)
+                .unwrap()
+                .read_sorted_physical_by_fragment()
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let invalid = vec![u64::from(RowAddress::new_from_parts(99, 0))];
+        let error = TakeBuilder::try_new_from_addresses(dataset, invalid, projection)
+            .unwrap()
+            .read_sorted_physical_by_fragment()
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("non-existent fragment"));
+    }
     #[tokio::test]
     async fn test_take_with_deletion() {
         let data = test_batch(0..120);

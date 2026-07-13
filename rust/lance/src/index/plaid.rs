@@ -1060,7 +1060,7 @@ mod tests {
     use super::*;
 
     use arrow_array::builder::{FixedSizeListBuilder, Float32Builder, ListBuilder};
-    use arrow_array::{ArrayRef, Int32Array, RecordBatchIterator, StructArray};
+    use arrow_array::{ArrayRef, Int32Array, RecordBatchIterator, StringArray, StructArray};
     use arrow_schema::Field;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_index::metrics::NoOpMetricsCollector;
@@ -1119,6 +1119,37 @@ mod tests {
         .unwrap()
     }
 
+    fn make_nullable_nested_batch(
+        ids: Vec<i32>,
+        strengths: Vec<f32>,
+        languages: Vec<Option<i32>>,
+        labels: Vec<Option<&'static str>>,
+    ) -> RecordBatch {
+        let documents = strengths
+            .into_iter()
+            .map(|strength| vec![[strength, 0.0, 0.0, 0.0], [0.0, strength, 0.0, 0.0]])
+            .collect();
+        let flat = make_batch(ids, documents);
+        let payload = StructArray::new(
+            vec![
+                Arc::new(Field::new("lang", DataType::Int32, true)),
+                Arc::new(Field::new("label", DataType::Utf8, true)),
+            ]
+            .into(),
+            vec![
+                Arc::new(Int32Array::from(languages)) as ArrayRef,
+                Arc::new(StringArray::from(labels)) as ArrayRef,
+            ],
+            None,
+        );
+        RecordBatch::try_from_iter([
+            ("id", flat["id"].clone()),
+            ("mv", flat["mv"].clone()),
+            ("payload", Arc::new(payload) as ArrayRef),
+        ])
+        .unwrap()
+    }
+
     fn query() -> FixedSizeListArray {
         FixedSizeListArray::try_new_from_values(
             Float32Array::from(vec![1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0]),
@@ -1146,6 +1177,32 @@ mod tests {
         scanner.refine(2);
         scanner.project(&["id"]).unwrap();
         scanner.try_into_batch().await.unwrap()
+    }
+
+    async fn grouped_semantic_search(
+        dataset: &Dataset,
+        fused: bool,
+        grouped: bool,
+        empty_bounds: bool,
+    ) -> (RecordBatch, String, usize) {
+        let _config = PlaidTakeOptimizationTestGuard::new_with_grouped(fused, true, grouped);
+        let mut scanner = dataset.scan();
+        scanner.nearest("mv", &query(), 6).unwrap();
+        scanner.refine(2);
+        if empty_bounds {
+            scanner.distance_range(Some(10.0), None);
+        }
+        scanner
+            .project(&[lance_core::ROW_ID, "id", "payload.lang", "payload.label"])
+            .unwrap();
+        let plan = scanner.create_plan().await.unwrap();
+        let take_execs = count_take_execs(plan.as_ref());
+        let analyzed = scanner.analyze_plan().await.unwrap();
+        (
+            scanner.try_into_batch().await.unwrap(),
+            analyzed,
+            take_execs,
+        )
     }
 
     #[test]
@@ -1534,7 +1591,7 @@ mod tests {
         let control = control_scanner.try_into_batch().await.unwrap();
 
         drop(control_config);
-        let _treatment_config = PlaidTakeOptimizationTestGuard::new(true, true);
+        let _treatment_config = PlaidTakeOptimizationTestGuard::new_with_grouped(true, true, true);
         let mut treatment_scanner = dataset.scan();
         treatment_scanner.prefilter(false);
         treatment_scanner.filter("id != 1").unwrap();
@@ -1545,12 +1602,15 @@ mod tests {
         assert_eq!(count_take_execs(treatment_plan.as_ref()), 0);
         let treatment_explain = treatment_scanner.explain_plan(false).await.unwrap();
         assert!(treatment_explain.contains("sorted_raw_take_mode=enabled"));
+        assert!(treatment_explain.contains("grouped_refinement_mode=enabled"));
         assert!(treatment_explain.contains("fused_final_take_mode=enabled"));
         assert!(treatment_explain.contains("fused_output_fields=1"));
         let treatment_analyzed = treatment_scanner.analyze_plan().await.unwrap();
         // The deletion mask activates the exact-filter fallback, which already
         // sorts physical addresses and therefore must not claim a second sort.
         assert!(!treatment_analyzed.contains("plaid_sorted_raw_take_queries=1"));
+        assert!(!treatment_analyzed.contains("plaid_grouped_refinement_queries=1"));
+        assert!(treatment_analyzed.contains("plaid_grouped_refinement_fallbacks=1"));
         assert!(treatment_analyzed.contains("plaid_fused_final_take_queries=1"));
         assert!(treatment_analyzed.contains("plaid_fused_final_take_candidate_rows=5"));
         assert!(treatment_analyzed.contains("plaid_fused_final_take_output_rows=5"));
@@ -1617,6 +1677,148 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn grouped_refinement_preserves_multifragment_database_semantics() {
+        for enable_stable_row_ids in [false, true] {
+            let directory = TempStrDir::default();
+            let fragments = vec![
+                make_nullable_nested_batch(
+                    vec![0, 1, 2],
+                    vec![0.2, 1.0, 0.5],
+                    vec![Some(10), None, Some(12)],
+                    vec![Some("zero"), Some("one"), Some("two")],
+                ),
+                make_nullable_nested_batch(
+                    vec![3, 4, 5],
+                    vec![1.0, 0.3, 0.5],
+                    vec![Some(13), Some(14), Some(15)],
+                    vec![Some("three"), Some("four"), None],
+                ),
+                make_nullable_nested_batch(
+                    vec![6, 7, 8],
+                    vec![0.9, 0.8, 0.1],
+                    vec![None, Some(17), Some(18)],
+                    vec![Some("six"), Some("seven"), Some("eight")],
+                ),
+            ];
+            let schema = fragments[0].schema();
+            let reader = RecordBatchIterator::new(
+                fragments
+                    .into_iter()
+                    .map(|batch| Ok::<RecordBatch, arrow_schema::ArrowError>(batch)),
+                schema,
+            );
+            let mut dataset = Dataset::write(
+                reader,
+                directory.as_ref(),
+                Some(WriteParams {
+                    max_rows_per_file: 3,
+                    max_rows_per_group: 3,
+                    enable_stable_row_ids,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(dataset.get_fragments().len(), 3);
+            dataset
+                .create_index(
+                    &["mv"],
+                    IndexType::Vector,
+                    Some("grouped_plaid_idx".to_string()),
+                    &PlaidIndexParams {
+                        num_centroids: 4,
+                        nbits: 2,
+                        max_iterations: 3,
+                        sample_rate: 4,
+                    },
+                    false,
+                )
+                .await
+                .unwrap();
+            // Delete one row from the first, middle, and last fragment after
+            // indexing. Every grouped batch must still line up with its public
+            // row IDs and local batch ordinal.
+            dataset.delete("id IN (0, 4, 8)").await.unwrap();
+
+            let (fused_control, _, fused_control_takes) =
+                grouped_semantic_search(&dataset, true, false, false).await;
+            let (fused_grouped, fused_analyzed, fused_grouped_takes) =
+                grouped_semantic_search(&dataset, true, true, false).await;
+            assert_eq!(fused_control_takes, 0);
+            assert_eq!(fused_grouped_takes, 0);
+            assert_eq!(fused_grouped, fused_control);
+            assert!(fused_analyzed.contains("plaid_grouped_refinement_queries=1"));
+            assert!(fused_analyzed.contains("plaid_grouped_refinement_batches=3"));
+            assert!(fused_analyzed.contains("plaid_grouped_refinement_rows=6"));
+            assert!(!fused_analyzed.contains("plaid_grouped_refinement_fallbacks=1"));
+            assert!(fused_analyzed.contains("plaid_fused_final_take_candidate_rows=6"));
+            assert_eq!(
+                fused_grouped
+                    .schema()
+                    .fields()
+                    .iter()
+                    .filter(|field| field.name() == lance_core::ROW_ID)
+                    .count(),
+                1
+            );
+            let ids = fused_grouped["id"]
+                .as_primitive::<arrow::datatypes::Int32Type>()
+                .values();
+            assert_eq!(ids.len(), 6);
+            assert!(ids.iter().all(|id| ![0, 4, 8].contains(id)));
+            assert!(
+                fused_grouped
+                    .column_by_name("payload.lang")
+                    .unwrap()
+                    .null_count()
+                    > 0
+            );
+            assert!(
+                fused_grouped
+                    .column_by_name("payload.label")
+                    .unwrap()
+                    .null_count()
+                    > 0
+            );
+            let distances = fused_grouped[DIST_COL].as_primitive::<Float32Type>();
+            for (actual, expected) in distances
+                .values()
+                .iter()
+                .zip([-1.0_f32, -1.0, -0.8, -0.6, 0.0, 0.0])
+            {
+                assert!(
+                    (*actual - expected).abs() < 1.0e-5,
+                    "actual distance {actual}, expected {expected}"
+                );
+            }
+            let row_ids = fused_grouped[lance_core::ROW_ID].as_primitive::<UInt64Type>();
+            for index in 1..distances.len() {
+                if distances.value(index - 1).to_bits() == distances.value(index).to_bits() {
+                    assert!(row_ids.value(index - 1) < row_ids.value(index));
+                }
+            }
+
+            let (nonfused_control, _, nonfused_control_takes) =
+                grouped_semantic_search(&dataset, false, false, false).await;
+            let (nonfused_grouped, nonfused_analyzed, nonfused_grouped_takes) =
+                grouped_semantic_search(&dataset, false, true, false).await;
+            assert!(nonfused_control_takes >= 1);
+            assert!(nonfused_grouped_takes >= 1);
+            assert_eq!(nonfused_grouped, nonfused_control);
+            assert_eq!(nonfused_grouped, fused_grouped);
+            assert!(nonfused_analyzed.contains("plaid_grouped_refinement_queries=1"));
+            assert!(nonfused_analyzed.contains("plaid_grouped_refinement_batches=3"));
+
+            let (empty, empty_analyzed, empty_takes) =
+                grouped_semantic_search(&dataset, true, true, true).await;
+            assert_eq!(empty_takes, 0);
+            assert_eq!(empty.num_rows(), 0);
+            assert!(empty_analyzed.contains("plaid_grouped_refinement_queries=1"));
+            assert!(empty_analyzed.contains("plaid_grouped_refinement_batches=3"));
+            assert!(empty_analyzed.contains("plaid_grouped_refinement_rows=6"));
+        }
+    }
     #[tokio::test]
     async fn fused_exact_take_projects_nested_filter_sibling_fields() {
         let directory = TempStrDir::default();
