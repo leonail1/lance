@@ -335,25 +335,6 @@ impl PlaidTakeOptimizationTestGuard {
         )));
         Self { previous }
     }
-
-    pub(crate) fn new_with_data_file_reader_cache(
-        fused: bool,
-        sorted: bool,
-        grouped: bool,
-        direct_winner_projection: bool,
-        grouped_shared_scheduler: bool,
-        data_file_reader_cache: bool,
-    ) -> Self {
-        let previous = TAKE_OPT_TEST_OVERRIDE.replace(Some((
-            fused,
-            sorted,
-            grouped,
-            direct_winner_projection,
-            grouped_shared_scheduler,
-            data_file_reader_cache,
-        )));
-        Self { previous }
-    }
 }
 
 #[cfg(test)]

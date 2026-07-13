@@ -1777,7 +1777,7 @@ mod test {
     async fn grouped_data_file_reader_cache_cold_warm_and_fresh_deletions() {
         let test_dir = TempStrDir::default();
         let data = test_batch(0..2_000);
-        let mut dataset = Dataset::write(
+        let dataset = Dataset::write(
             RecordBatchIterator::new([Ok(data.clone())], data.schema()),
             &test_dir,
             Some(WriteParams {
@@ -1875,9 +1875,13 @@ mod test {
                 .into_projection_plan(deleted_dataset.clone())
                 .unwrap(),
         );
+        let live_addresses = vec![
+            u64::from(RowAddress::new_from_parts(0, 1)),
+            u64::from(RowAddress::new_from_parts(1, 0)),
+        ];
         let deleted_control = TakeBuilder::try_new_from_addresses(
             deleted_dataset.clone(),
-            addresses.clone(),
+            live_addresses.clone(),
             deleted_projection.clone(),
         )
         .unwrap()
@@ -1887,8 +1891,8 @@ mod test {
         .unwrap();
         let deleted_cached = TakeBuilder::try_new_from_addresses(
             deleted_dataset.clone(),
-            addresses,
-            deleted_projection,
+            live_addresses.clone(),
+            deleted_projection.clone(),
         )
         .unwrap()
         .read_sorted_physical_by_fragment_with_options(false, true)
@@ -1902,7 +1906,7 @@ mod test {
                 .iter()
                 .map(RecordBatch::num_rows)
                 .sum::<usize>(),
-            1
+            2
         );
         assert_eq!(deleted_cached.stats.reader_cache_hit_files, 2);
         assert_eq!(deleted_cached.stats.reader_cache_miss_open_files, 0);
@@ -1913,10 +1917,52 @@ mod test {
             deleted_combined["i"]
                 .as_primitive::<arrow_array::types::Int32Type>()
                 .values(),
-            &[1_000]
+            &[1, 1_000]
+        );
+        let deleted_address_error = TakeBuilder::try_new_from_addresses(
+            deleted_dataset.clone(),
+            addresses,
+            deleted_projection,
+        )
+        .unwrap()
+        .read_sorted_physical_by_fragment_with_options(false, true)
+        .await
+        .unwrap_err();
+        assert!(
+            deleted_address_error
+                .to_string()
+                .contains("must not target deleted rows")
         );
 
         let first_fragment = deleted_dataset.get_fragment(0).unwrap();
+        let first_data_file = &first_fragment.metadata().files[0];
+        let first_data_path = deleted_dataset
+            .data_file_dir(first_data_file)
+            .unwrap()
+            .join(first_data_file.path.as_str());
+        deleted_dataset
+            .session
+            .data_file_reader_cache
+            .invalidate_store_path(&deleted_dataset.object_store, &first_data_path)
+            .await
+            .unwrap();
+        let after_invalidation = TakeBuilder::try_new_from_addresses(
+            deleted_dataset.clone(),
+            live_addresses,
+            Arc::new(
+                ProjectionRequest::from_columns(["i", "s", ROW_ID], deleted_dataset.schema())
+                    .into_projection_plan(deleted_dataset.clone())
+                    .unwrap(),
+            ),
+        )
+        .unwrap()
+        .read_sorted_physical_by_fragment_with_options(false, true)
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(after_invalidation.stats.reader_cache_hit_files, 1);
+        assert_eq!(after_invalidation.stats.reader_cache_miss_open_files, 1);
+
         let mut unknown_size_metadata = first_fragment.metadata().clone();
         unknown_size_metadata.files[0].file_size_bytes = lance_io::utils::CachedFileSize::unknown();
         assert_eq!(
