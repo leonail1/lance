@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use lance_core::deepsize::{Context, DeepSizeOf};
+use lance_core::utils::file_descriptor_soft_limit;
 use lance_core::{Error, Result};
 use lance_io::object_store::ObjectStore;
 use lance_io::traits::{ByteStream, Reader};
@@ -46,7 +47,7 @@ struct GlobalReaderFdBudget {
 fn global_reader_fd_budget() -> &'static GlobalReaderFdBudget {
     static BUDGET: OnceLock<GlobalReaderFdBudget> = OnceLock::new();
     BUDGET.get_or_init(|| {
-        let fd_soft_limit = fd_soft_limit();
+        let fd_soft_limit = file_descriptor_soft_limit();
         let fd_limited_readers = if fd_soft_limit == u64::MAX {
             DEFAULT_PROCESS_MAX_CACHED_READERS
         } else {
@@ -468,25 +469,4 @@ fn duration_nanos(duration: Duration) -> u64 {
 
 fn elapsed_nanos(started: Instant) -> u64 {
     duration_nanos(started.elapsed())
-}
-
-#[cfg(unix)]
-fn fd_soft_limit() -> u64 {
-    let mut limit = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: `limit` points to writable storage for one `rlimit` value and
-    // `RLIMIT_NOFILE` is valid on every Unix target supported by libc.
-    let status = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) };
-    if status == 0 {
-        u64::try_from(limit.rlim_cur).unwrap_or(u64::MAX)
-    } else {
-        u64::MAX
-    }
-}
-
-#[cfg(not(unix))]
-fn fd_soft_limit() -> u64 {
-    u64::MAX
 }

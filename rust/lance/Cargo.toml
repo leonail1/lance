@@ -89,7 +89,6 @@ datafusion-expr.workspace = true
 either.workspace = true
 snafu = { workspace = true }
 log = { workspace = true }
-libc = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
 permutation = { version = "0.4.0" }
