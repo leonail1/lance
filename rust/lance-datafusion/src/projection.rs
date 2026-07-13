@@ -5,7 +5,10 @@ use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use datafusion::{logical_expr::Expr, physical_plan::projection::ProjectionExec};
 use datafusion_common::{Column, DFSchema};
-use datafusion_physical_expr::PhysicalExpr;
+use datafusion_physical_expr::{
+    PhysicalExpr,
+    projection::{ProjectionExpr, ProjectionExprs},
+};
 use futures::TryStreamExt;
 use std::{
     collections::{HashMap, HashSet},
@@ -402,6 +405,26 @@ impl ProjectionPlan {
         !self.requested_output_expr.is_empty()
     }
 
+    /// True when every requested output is an unqualified, same-name column.
+    ///
+    /// This capability check is intentionally narrower than what the direct
+    /// projector supports. Experimental callers can use it to stage a fast
+    /// path without silently broadening its semantic surface to aliases or
+    /// dynamic expressions.
+    pub fn is_identity_column_projection(&self) -> bool {
+        !self.requested_output_expr.is_empty()
+            && self.requested_output_expr.iter().all(|output| {
+                matches!(
+                    &output.expr,
+                    Expr::Column(Column {
+                        relation: None,
+                        name,
+                        ..
+                    }) if name == &output.name
+                )
+            })
+    }
+
     pub fn output_schema(&self) -> Result<ArrowSchema> {
         let physical_schema = self.physical_projection.to_arrow_schema();
         let exprs = self.to_physical_exprs(&physical_schema)?;
@@ -421,6 +444,37 @@ impl ProjectionPlan {
             fields,
             physical_schema.metadata().clone(),
         ))
+    }
+
+    /// Apply this projection to one in-memory batch without constructing an
+    /// execution plan or stream.
+    ///
+    /// DataFusion's `ProjectionExec` delegates batch evaluation to the same
+    /// `Projector`. Keeping this as a separate API lets experimental database
+    /// operators compare the direct path with the existing execution-plan path
+    /// while preserving expression evaluation and output-schema semantics.
+    #[instrument(skip_all, level = "debug")]
+    pub fn project_batch_direct(&self, batch: RecordBatch) -> Result<RecordBatch> {
+        // Preserve the exact expression-planning schema used by project_batch.
+        // ROW_ADDR and ROW_OFFSET are available to projection expressions even
+        // though they are not ordinary dataset fields.
+        let extra_columns = vec![
+            ArrowField::new(ROW_ADDR, DataType::UInt64, true),
+            ArrowField::new(ROW_OFFSET, DataType::UInt64, true),
+        ];
+        let mut filterable_schema = self.physical_projection.to_schema();
+        filterable_schema = filterable_schema.merge(&ArrowSchema::new(extra_columns))?;
+
+        let physical_exprs = self.to_physical_exprs(&(&filterable_schema).into())?;
+        let projection_exprs = ProjectionExprs::new(
+            physical_exprs
+                .into_iter()
+                .map(|(expr, alias)| ProjectionExpr::new(expr, alias)),
+        );
+        // ProjectionExec::try_new creates this same Projector against the
+        // OneShotExec input schema before its stream evaluates the batch.
+        let projector = projection_exprs.make_projector(batch.schema().as_ref())?;
+        Ok(projector.project_batch(&batch)?)
     }
 
     #[instrument(skip_all, level = "debug")]
@@ -486,7 +540,10 @@ mod tests {
         )
         .unwrap();
 
-        let projected = plan.project_batch(batch).await.unwrap();
+        assert!(!plan.is_identity_column_projection());
+        let legacy = plan.project_batch(batch.clone()).await.unwrap();
+        let projected = plan.project_batch_direct(batch).unwrap();
+        assert_eq!(projected, legacy);
         let foo = projected
             .column(0)
             .as_any()
@@ -496,6 +553,31 @@ mod tests {
             foo.iter().collect::<Vec<_>>(),
             vec![Some(1), Some(20), Some(3), None],
         );
+    }
+
+    #[tokio::test]
+    async fn test_direct_projector_preserves_zero_column_row_count() {
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let base_schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
+        let columns: [(&str, &str); 0] = [];
+        let plan = ProjectionPlan::from_expressions(Arc::new(base_schema), &columns).unwrap();
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3, 4]))],
+        )
+        .unwrap();
+
+        assert!(!plan.has_output_cols());
+        assert!(!plan.is_identity_column_projection());
+        let legacy = plan.project_batch(batch.clone()).await.unwrap();
+        let direct = plan.project_batch_direct(batch).unwrap();
+        assert_eq!(direct, legacy);
+        assert_eq!(direct.num_columns(), 0);
+        assert_eq!(direct.num_rows(), 4);
     }
 
     #[test]
@@ -515,5 +597,6 @@ mod tests {
         let output = plan.output_schema().unwrap();
         let output_field = output.field_with_name("meta").unwrap();
         assert!(is_json_field(output_field));
+        assert!(plan.is_identity_column_projection());
     }
 }

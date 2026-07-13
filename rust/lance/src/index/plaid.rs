@@ -1183,9 +1183,15 @@ mod tests {
         dataset: &Dataset,
         fused: bool,
         grouped: bool,
+        direct_winner_projection: bool,
         empty_bounds: bool,
     ) -> (RecordBatch, String, usize) {
-        let _config = PlaidTakeOptimizationTestGuard::new_with_grouped(fused, true, grouped);
+        let _config = PlaidTakeOptimizationTestGuard::new_with_direct_winner_projection(
+            fused,
+            true,
+            grouped,
+            direct_winner_projection,
+        );
         let mut scanner = dataset.scan();
         scanner.nearest("mv", &query(), 6).unwrap();
         scanner.refine(2);
@@ -1742,12 +1748,25 @@ mod tests {
             dataset.delete("id IN (0, 4, 8)").await.unwrap();
 
             let (fused_control, _, fused_control_takes) =
-                grouped_semantic_search(&dataset, true, false, false).await;
+                grouped_semantic_search(&dataset, true, false, false, false).await;
+            let (fused_grouped_legacy, legacy_analyzed, fused_grouped_legacy_takes) =
+                grouped_semantic_search(&dataset, true, true, false, false).await;
             let (fused_grouped, fused_analyzed, fused_grouped_takes) =
-                grouped_semantic_search(&dataset, true, true, false).await;
+                grouped_semantic_search(&dataset, true, true, true, false).await;
             assert_eq!(fused_control_takes, 0);
+            assert_eq!(fused_grouped_legacy_takes, 0);
             assert_eq!(fused_grouped_takes, 0);
-            assert_eq!(fused_grouped, fused_control);
+            assert_eq!(fused_grouped_legacy, fused_control);
+            assert_eq!(fused_grouped, fused_grouped_legacy);
+            assert!(legacy_analyzed.contains("direct_winner_projection_mode=disabled"));
+            assert!(legacy_analyzed.contains("plaid_fused_final_take_legacy_projection_queries=1"));
+            assert!(legacy_analyzed.contains("plaid_fused_final_take_legacy_projection_sub_time="));
+            assert!(
+                !legacy_analyzed.contains("plaid_fused_final_take_direct_projection_queries=1")
+            );
+            assert!(fused_analyzed.contains("direct_winner_projection_mode=enabled"));
+            assert!(fused_analyzed.contains("plaid_fused_final_take_direct_projection_queries=1"));
+            assert!(!fused_analyzed.contains("plaid_fused_final_take_legacy_projection_queries=1"));
             assert!(fused_analyzed.contains("plaid_grouped_refinement_queries=1"));
             assert!(fused_analyzed.contains("plaid_grouped_refinement_batches=3"));
             assert!(fused_analyzed.contains("plaid_grouped_refinement_rows=6"));
@@ -1755,6 +1774,7 @@ mod tests {
             assert!(fused_analyzed.contains("plaid_fused_final_take_candidate_rows=6"));
             assert!(fused_analyzed.contains("plaid_fused_final_take_select_sub_time="));
             assert!(fused_analyzed.contains("plaid_fused_final_take_logical_projection_sub_time="));
+            assert!(fused_analyzed.contains("plaid_fused_final_take_direct_projection_sub_time="));
             assert!(fused_analyzed.contains("plaid_fused_final_take_json_conversion_sub_time="));
             assert!(fused_analyzed.contains("plaid_fused_final_take_assembly_sub_time="));
             assert_eq!(
@@ -1804,9 +1824,9 @@ mod tests {
             }
 
             let (nonfused_control, _, nonfused_control_takes) =
-                grouped_semantic_search(&dataset, false, false, false).await;
+                grouped_semantic_search(&dataset, false, false, false, false).await;
             let (nonfused_grouped, nonfused_analyzed, nonfused_grouped_takes) =
-                grouped_semantic_search(&dataset, false, true, false).await;
+                grouped_semantic_search(&dataset, false, true, false, false).await;
             assert!(nonfused_control_takes >= 1);
             assert!(nonfused_grouped_takes >= 1);
             assert_eq!(nonfused_grouped, nonfused_control);
@@ -1815,7 +1835,7 @@ mod tests {
             assert!(nonfused_analyzed.contains("plaid_grouped_refinement_batches=3"));
 
             let (empty, empty_analyzed, empty_takes) =
-                grouped_semantic_search(&dataset, true, true, true).await;
+                grouped_semantic_search(&dataset, true, true, true, true).await;
             assert_eq!(empty_takes, 0);
             assert_eq!(empty.num_rows(), 0);
             assert!(empty_analyzed.contains("plaid_grouped_refinement_queries=1"));

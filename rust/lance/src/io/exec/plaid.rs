@@ -31,6 +31,7 @@ use lance_arrow::json::convert_lance_json_to_arrow;
 use lance_core::ROW_ID;
 use lance_core::datatypes::{OnMissing, Projection};
 use lance_core::utils::tokio::spawn_cpu;
+use lance_datafusion::projection::ProjectionPlan;
 use lance_datafusion::utils::ExecutionPlanMetricsSetExt;
 use lance_index::prefilter::PreFilter;
 use lance_index::vector::{DIST_COL, Query};
@@ -130,10 +131,20 @@ const FUSED_FINAL_TAKE_TIME: &str = "plaid_fused_final_take_time";
 const FUSED_FINAL_TAKE_SELECT_TIME: &str = "plaid_fused_final_take_select_sub_time";
 const FUSED_FINAL_TAKE_LOGICAL_PROJECTION_TIME: &str =
     "plaid_fused_final_take_logical_projection_sub_time";
+// Direct and legacy projection timers are mutually exclusive nested sub-times
+// of FUSED_FINAL_TAKE_LOGICAL_PROJECTION_TIME, not additive top-level phases.
+const FUSED_FINAL_TAKE_DIRECT_PROJECTION_TIME: &str =
+    "plaid_fused_final_take_direct_projection_sub_time";
+const FUSED_FINAL_TAKE_LEGACY_PROJECTION_TIME: &str =
+    "plaid_fused_final_take_legacy_projection_sub_time";
 const FUSED_FINAL_TAKE_JSON_CONVERSION_TIME: &str =
     "plaid_fused_final_take_json_conversion_sub_time";
 const FUSED_FINAL_TAKE_ASSEMBLY_TIME: &str = "plaid_fused_final_take_assembly_sub_time";
 const FUSED_FINAL_TAKE_QUERY_COUNT: &str = "plaid_fused_final_take_queries";
+const FUSED_FINAL_TAKE_DIRECT_PROJECTION_QUERY_COUNT: &str =
+    "plaid_fused_final_take_direct_projection_queries";
+const FUSED_FINAL_TAKE_LEGACY_PROJECTION_QUERY_COUNT: &str =
+    "plaid_fused_final_take_legacy_projection_queries";
 const FUSED_FINAL_TAKE_CANDIDATE_ROWS_COUNT: &str = "plaid_fused_final_take_candidate_rows";
 const FUSED_FINAL_TAKE_OUTPUT_ROWS_COUNT: &str = "plaid_fused_final_take_output_rows";
 const FUSED_FINAL_TAKE_OUTPUT_BYTES_COUNT: &str = "plaid_fused_final_take_output_batch_bytes";
@@ -154,28 +165,44 @@ const DEFAULT_DIRECT_RESIDUAL_MAX_DOCUMENTS: usize = 1024;
 const FUSED_FINAL_TAKE_ENABLED_ENV: &str = "LANCE_PLAID_FUSED_FINAL_TAKE_ENABLED";
 const SORTED_RAW_TAKE_ENABLED_ENV: &str = "LANCE_PLAID_SORTED_RAW_TAKE_ENABLED";
 const GROUPED_REFINEMENT_ENABLED_ENV: &str = "LANCE_PLAID_GROUPED_REFINEMENT_ENABLED";
+const DIRECT_WINNER_PROJECTION_ENABLED_ENV: &str = "LANCE_PLAID_DIRECT_WINNER_PROJECTION_ENABLED";
 
 #[cfg(test)]
 thread_local! {
-    static TAKE_OPT_TEST_OVERRIDE: std::cell::Cell<Option<(bool, bool, bool)>> = const {
+    static TAKE_OPT_TEST_OVERRIDE: std::cell::Cell<Option<(bool, bool, bool, bool)>> = const {
         std::cell::Cell::new(None)
     };
 }
 
 #[cfg(test)]
 pub(crate) struct PlaidTakeOptimizationTestGuard {
-    previous: Option<(bool, bool, bool)>,
+    previous: Option<(bool, bool, bool, bool)>,
 }
 
 #[cfg(test)]
 impl PlaidTakeOptimizationTestGuard {
     pub(crate) fn new(fused: bool, sorted: bool) -> Self {
-        let previous = TAKE_OPT_TEST_OVERRIDE.replace(Some((fused, sorted, false)));
+        let previous = TAKE_OPT_TEST_OVERRIDE.replace(Some((fused, sorted, false, false)));
         Self { previous }
     }
 
     pub(crate) fn new_with_grouped(fused: bool, sorted: bool, grouped: bool) -> Self {
-        let previous = TAKE_OPT_TEST_OVERRIDE.replace(Some((fused, sorted, grouped)));
+        let previous = TAKE_OPT_TEST_OVERRIDE.replace(Some((fused, sorted, grouped, false)));
+        Self { previous }
+    }
+
+    pub(crate) fn new_with_direct_winner_projection(
+        fused: bool,
+        sorted: bool,
+        grouped: bool,
+        direct_winner_projection: bool,
+    ) -> Self {
+        let previous = TAKE_OPT_TEST_OVERRIDE.replace(Some((
+            fused,
+            sorted,
+            grouped,
+            direct_winner_projection,
+        )));
         Self { previous }
     }
 }
@@ -188,7 +215,7 @@ impl Drop for PlaidTakeOptimizationTestGuard {
 }
 
 #[cfg(test)]
-fn take_optimization_test_override() -> Option<(bool, bool, bool)> {
+fn take_optimization_test_override() -> Option<(bool, bool, bool, bool)> {
     TAKE_OPT_TEST_OVERRIDE.get()
 }
 
@@ -200,7 +227,7 @@ struct FusedFinalTakeConfig {
 impl FusedFinalTakeConfig {
     fn from_env() -> Result<Self> {
         #[cfg(test)]
-        if let Some((enabled, _, _)) = take_optimization_test_override() {
+        if let Some((enabled, _, _, _)) = take_optimization_test_override() {
             return Ok(Self { enabled });
         }
         let enabled = read_utf8_env(FUSED_FINAL_TAKE_ENABLED_ENV)?;
@@ -234,7 +261,7 @@ struct SortedRawTakeConfig {
 impl SortedRawTakeConfig {
     fn from_env() -> Result<Self> {
         #[cfg(test)]
-        if let Some((_, enabled, _)) = take_optimization_test_override() {
+        if let Some((_, enabled, _, _)) = take_optimization_test_override() {
             return Ok(Self { enabled });
         }
         let enabled = read_utf8_env(SORTED_RAW_TAKE_ENABLED_ENV)?;
@@ -268,7 +295,7 @@ struct GroupedRefinementConfig {
 impl GroupedRefinementConfig {
     fn from_env() -> Result<Self> {
         #[cfg(test)]
-        if let Some((_, _, enabled)) = take_optimization_test_override() {
+        if let Some((_, _, enabled, _)) = take_optimization_test_override() {
             return Ok(Self { enabled });
         }
         let enabled = read_utf8_env(GROUPED_REFINEMENT_ENABLED_ENV)?;
@@ -281,6 +308,40 @@ impl GroupedRefinementConfig {
                 parse_bool(value).ok_or_else(|| {
                     Error::invalid_input(format!(
                         "invalid {GROUPED_REFINEMENT_ENABLED_ENV}={value:?}; expected true/false"
+                    ))
+                })
+            })
+            .transpose()?
+            .unwrap_or(false);
+        Ok(Self { enabled })
+    }
+
+    fn mode_name(self) -> &'static str {
+        if self.enabled { "enabled" } else { "disabled" }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DirectWinnerProjectionConfig {
+    enabled: bool,
+}
+
+impl DirectWinnerProjectionConfig {
+    fn from_env() -> Result<Self> {
+        #[cfg(test)]
+        if let Some((_, _, _, enabled)) = take_optimization_test_override() {
+            return Ok(Self { enabled });
+        }
+        let enabled = read_utf8_env(DIRECT_WINNER_PROJECTION_ENABLED_ENV)?;
+        Self::from_value(enabled.as_deref())
+    }
+
+    fn from_value(enabled: Option<&str>) -> Result<Self> {
+        let enabled = enabled
+            .map(|value| {
+                parse_bool(value).ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "invalid {DIRECT_WINNER_PROJECTION_ENABLED_ENV}={value:?}; expected true/false"
                     ))
                 })
             })
@@ -498,6 +559,7 @@ pub struct PlaidSearchExec {
     fused_final_take_config: FusedFinalTakeConfig,
     sorted_raw_take_config: SortedRawTakeConfig,
     grouped_refinement_config: GroupedRefinementConfig,
+    direct_winner_projection_config: DirectWinnerProjectionConfig,
     fused_output_projection: Option<Projection>,
     output_schema: SchemaRef,
     prefilter_source: PreFilterSource,
@@ -521,6 +583,7 @@ impl PlaidSearchExec {
             FusedFinalTakeConfig::from_env()?,
             SortedRawTakeConfig::from_env()?,
             GroupedRefinementConfig::from_env()?,
+            DirectWinnerProjectionConfig::from_env()?,
             None,
         )
     }
@@ -534,6 +597,7 @@ impl PlaidSearchExec {
         fused_final_take_config: FusedFinalTakeConfig,
         sorted_raw_take_config: SortedRawTakeConfig,
         grouped_refinement_config: GroupedRefinementConfig,
+        direct_winner_projection_config: DirectWinnerProjectionConfig,
         fused_output_projection: Option<Projection>,
     ) -> Result<Self> {
         if indices.is_empty() {
@@ -585,6 +649,7 @@ impl PlaidSearchExec {
             fused_final_take_config,
             sorted_raw_take_config,
             grouped_refinement_config,
+            direct_winner_projection_config,
             fused_output_projection,
             output_schema,
             prefilter_source,
@@ -615,6 +680,7 @@ impl PlaidSearchExec {
             self.fused_final_take_config,
             self.sorted_raw_take_config,
             self.grouped_refinement_config,
+            self.direct_winner_projection_config,
             Some(projection),
         )?))
     }
@@ -629,7 +695,7 @@ impl DisplayAs for PlaidSearchExec {
         match format {
             DisplayFormatType::Default | DisplayFormatType::Verbose => write!(
                 formatter,
-                "PlaidSearch: name={}, k={}, segments={}, mode={}, core_residual_budget={}, raw_refinement_budget={}, filter_exact_fallback=enabled, direct_residual_mode={}, direct_residual_max_documents={}, sorted_raw_take_mode={}, grouped_refinement_mode={}, fused_final_take_mode={}, fused_output_fields={}",
+                "PlaidSearch: name={}, k={}, segments={}, mode={}, core_residual_budget={}, raw_refinement_budget={}, filter_exact_fallback=enabled, direct_residual_mode={}, direct_residual_max_documents={}, sorted_raw_take_mode={}, grouped_refinement_mode={}, fused_final_take_mode={}, direct_winner_projection_mode={}, fused_output_fields={}",
                 self.indices[0].name,
                 self.query.k,
                 self.indices.len(),
@@ -643,6 +709,7 @@ impl DisplayAs for PlaidSearchExec {
                 self.sorted_raw_take_config.mode_name(),
                 self.grouped_refinement_config.mode_name(),
                 self.fused_final_take_config.mode_name(),
+                self.direct_winner_projection_config.mode_name(),
                 self.fused_output_projection
                     .as_ref()
                     .map(|projection| projection.to_bare_schema().fields.len())
@@ -650,7 +717,7 @@ impl DisplayAs for PlaidSearchExec {
             ),
             DisplayFormatType::TreeRender => write!(
                 formatter,
-                "PlaidSearch\nname={}\nk={}\nsegments={}\nmode={}\ncore_residual_budget={}\nraw_refinement_budget={}\nfilter_exact_fallback=enabled\ndirect_residual_mode={}\ndirect_residual_max_documents={}\nsorted_raw_take_mode={}\ngrouped_refinement_mode={}\nfused_final_take_mode={}\nfused_output_fields={}",
+                "PlaidSearch\nname={}\nk={}\nsegments={}\nmode={}\ncore_residual_budget={}\nraw_refinement_budget={}\nfilter_exact_fallback=enabled\ndirect_residual_mode={}\ndirect_residual_max_documents={}\nsorted_raw_take_mode={}\ngrouped_refinement_mode={}\nfused_final_take_mode={}\ndirect_winner_projection_mode={}\nfused_output_fields={}",
                 self.indices[0].name,
                 self.query.k,
                 self.indices.len(),
@@ -664,6 +731,7 @@ impl DisplayAs for PlaidSearchExec {
                 self.sorted_raw_take_config.mode_name(),
                 self.grouped_refinement_config.mode_name(),
                 self.fused_final_take_config.mode_name(),
+                self.direct_winner_projection_config.mode_name(),
                 self.fused_output_projection
                     .as_ref()
                     .map(|projection| projection.to_bare_schema().fields.len())
@@ -733,6 +801,7 @@ impl ExecutionPlan for PlaidSearchExec {
             self.fused_final_take_config,
             self.sorted_raw_take_config,
             self.grouped_refinement_config,
+            self.direct_winner_projection_config,
             self.fused_output_projection.clone(),
         )?))
     }
@@ -757,6 +826,7 @@ impl ExecutionPlan for PlaidSearchExec {
         let direct_residual_config = self.direct_residual_config;
         let sorted_raw_take_config = self.sorted_raw_take_config;
         let grouped_refinement_config = self.grouped_refinement_config;
+        let direct_winner_projection_config = self.direct_winner_projection_config;
         let fused_output_projection = self.fused_output_projection.clone();
         let output_schema = self.output_schema.clone();
         let stream = stream::once(async move {
@@ -769,6 +839,7 @@ impl ExecutionPlan for PlaidSearchExec {
                 direct_residual_config,
                 sorted_raw_take_config,
                 grouped_refinement_config,
+                direct_winner_projection_config,
                 fused_output_projection,
                 output_schema,
                 prefilter,
@@ -824,6 +895,8 @@ struct PlaidExecMetrics {
     fused_final_take: Time,
     fused_final_take_select: Time,
     fused_final_take_logical_projection: Time,
+    fused_final_take_direct_projection: Time,
+    fused_final_take_legacy_projection: Time,
     fused_final_take_json_conversion: Time,
     fused_final_take_assembly: Time,
     sort: Time,
@@ -878,6 +951,8 @@ struct PlaidExecMetrics {
     direct_residual_budget_mismatch_count: Count,
     direct_residual_empty_tokens_count: Count,
     fused_final_take_query_count: Count,
+    fused_final_take_direct_projection_query_count: Count,
+    fused_final_take_legacy_projection_query_count: Count,
     fused_final_take_candidate_rows_count: Count,
     fused_final_take_output_rows_count: Count,
     fused_final_take_output_bytes_count: Count,
@@ -916,6 +991,10 @@ impl PlaidExecMetrics {
             fused_final_take_select: metrics.new_time(FUSED_FINAL_TAKE_SELECT_TIME, partition),
             fused_final_take_logical_projection: metrics
                 .new_time(FUSED_FINAL_TAKE_LOGICAL_PROJECTION_TIME, partition),
+            fused_final_take_direct_projection: metrics
+                .new_time(FUSED_FINAL_TAKE_DIRECT_PROJECTION_TIME, partition),
+            fused_final_take_legacy_projection: metrics
+                .new_time(FUSED_FINAL_TAKE_LEGACY_PROJECTION_TIME, partition),
             fused_final_take_json_conversion: metrics
                 .new_time(FUSED_FINAL_TAKE_JSON_CONVERSION_TIME, partition),
             fused_final_take_assembly: metrics.new_time(FUSED_FINAL_TAKE_ASSEMBLY_TIME, partition),
@@ -996,6 +1075,10 @@ impl PlaidExecMetrics {
                 .new_count(DIRECT_RESIDUAL_EMPTY_TOKENS_COUNT, partition),
             fused_final_take_query_count: metrics
                 .new_count(FUSED_FINAL_TAKE_QUERY_COUNT, partition),
+            fused_final_take_direct_projection_query_count: metrics
+                .new_count(FUSED_FINAL_TAKE_DIRECT_PROJECTION_QUERY_COUNT, partition),
+            fused_final_take_legacy_projection_query_count: metrics
+                .new_count(FUSED_FINAL_TAKE_LEGACY_PROJECTION_QUERY_COUNT, partition),
             fused_final_take_candidate_rows_count: metrics
                 .new_count(FUSED_FINAL_TAKE_CANDIDATE_ROWS_COUNT, partition),
             fused_final_take_output_rows_count: metrics
@@ -1268,6 +1351,20 @@ fn merge_segment_hits(
     }
 }
 
+fn direct_winner_projection_eligible(
+    config: DirectWinnerProjectionConfig,
+    grouped_physical_batches: bool,
+    projection: &ProjectionPlan,
+    batch: &RecordBatch,
+) -> bool {
+    config.enabled
+        && grouped_physical_batches
+        && projection.has_output_cols()
+        && (!projection.must_add_row_offset
+            || batch.column_by_name(lance_core::ROW_OFFSET).is_some())
+        && projection.is_identity_column_projection()
+}
+
 async fn execute_search(
     dataset: Arc<Dataset>,
     indices: Vec<IndexMetadata>,
@@ -1276,6 +1373,7 @@ async fn execute_search(
     direct_residual_config: DirectResidualConfig,
     sorted_raw_take_config: SortedRawTakeConfig,
     grouped_refinement_config: GroupedRefinementConfig,
+    direct_winner_projection_config: DirectWinnerProjectionConfig,
     fused_output_projection: Option<Projection>,
     output_schema: SchemaRef,
     prefilter: Arc<crate::index::prefilter::DatasetPreFilter>,
@@ -1711,7 +1809,32 @@ async fn execute_search(
             // projection semantics and must not be projected twice.
             let selected = if grouped_physical_batches {
                 let projection_started = Instant::now();
-                let selected = projection.project_batch(selected).await?;
+                let selected = if direct_winner_projection_eligible(
+                    direct_winner_projection_config,
+                    grouped_physical_batches,
+                    projection.as_ref(),
+                    &selected,
+                ) {
+                    metrics
+                        .fused_final_take_direct_projection_query_count
+                        .add(1);
+                    let direct_started = Instant::now();
+                    let selected = projection.project_batch_direct(selected)?;
+                    metrics
+                        .fused_final_take_direct_projection
+                        .add_duration(direct_started.elapsed());
+                    selected
+                } else {
+                    metrics
+                        .fused_final_take_legacy_projection_query_count
+                        .add(1);
+                    let legacy_started = Instant::now();
+                    let selected = projection.project_batch(selected).await?;
+                    metrics
+                        .fused_final_take_legacy_projection
+                        .add_duration(legacy_started.elapsed());
+                    selected
+                };
                 metrics
                     .fused_final_take_logical_projection
                     .add_duration(projection_started.elapsed());
@@ -2198,6 +2321,10 @@ mod tests {
             GroupedRefinementConfig::from_value(None).unwrap(),
             GroupedRefinementConfig::default()
         );
+        assert_eq!(
+            DirectWinnerProjectionConfig::from_value(None).unwrap(),
+            DirectWinnerProjectionConfig::default()
+        );
         for enabled in ["1", "true", "YES", "on"] {
             assert_eq!(
                 FusedFinalTakeConfig::from_value(Some(enabled)).unwrap(),
@@ -2210,6 +2337,10 @@ mod tests {
             assert_eq!(
                 GroupedRefinementConfig::from_value(Some(enabled)).unwrap(),
                 GroupedRefinementConfig { enabled: true }
+            );
+            assert_eq!(
+                DirectWinnerProjectionConfig::from_value(Some(enabled)).unwrap(),
+                DirectWinnerProjectionConfig { enabled: true }
             );
         }
         for disabled in ["0", "false", "No", "OFF"] {
@@ -2224,6 +2355,10 @@ mod tests {
             assert_eq!(
                 GroupedRefinementConfig::from_value(Some(disabled)).unwrap(),
                 GroupedRefinementConfig { enabled: false }
+            );
+            assert_eq!(
+                DirectWinnerProjectionConfig::from_value(Some(disabled)).unwrap(),
+                DirectWinnerProjectionConfig { enabled: false }
             );
         }
         assert!(
@@ -2243,6 +2378,12 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains(GROUPED_REFINEMENT_ENABLED_ENV)
+        );
+        assert!(
+            DirectWinnerProjectionConfig::from_value(Some("maybe"))
+                .unwrap_err()
+                .to_string()
+                .contains(DIRECT_WINNER_PROJECTION_ENABLED_ENV)
         );
     }
 
