@@ -5,7 +5,9 @@ use std::{
     collections::BTreeMap, collections::HashMap, ops::Range, pin::Pin, sync::Arc, time::Instant,
 };
 
-use crate::dataset::fragment::{FragReadConfig, FragmentTakePhaseStats};
+use crate::dataset::fragment::{
+    FragReadConfig, FragmentSharedSchedulerEligibility, FragmentTakePhaseStats,
+};
 use crate::dataset::rowids::get_row_id_index;
 use crate::io::exec::AddRowOffsetExec;
 use crate::{Error, Result};
@@ -26,6 +28,7 @@ use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::OffsetMapper;
 use lance_core::{ROW_ADDR, ROW_OFFSET};
 use lance_datafusion::projection::{OutputColumn, ProjectionPlan};
+use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 
 use super::ProjectionRequest;
 use super::{Dataset, fragment::FileFragment, scanner::DatasetRecordBatchStream};
@@ -486,6 +489,14 @@ pub(crate) struct GroupedPhysicalReadStats {
     pub scheduler_scoped_requests: u64,
     pub scheduler_scoped_bytes_read: u64,
     pub scheduler_stats_covered_fragments: usize,
+    pub shared_scheduler_queries: usize,
+    pub shared_scheduler_fragments: usize,
+    pub per_fragment_scheduler_queries: usize,
+    pub per_fragment_scheduler_fragments: usize,
+    pub shared_scheduler_fallback_queries: usize,
+    pub shared_scheduler_fallback_legacy_fragments: usize,
+    pub shared_scheduler_fallback_nonprimary_fragments: usize,
+    pub shared_scheduler_fallback_unsupported_fragments: usize,
 }
 
 #[derive(Debug)]
@@ -498,6 +509,13 @@ struct FragmentTakeOutcome {
     batch: RecordBatch,
     phases: FragmentTakePhaseStats,
     total_elapsed_nanos: u64,
+}
+
+struct FragmentTakePlan {
+    fragment: FileFragment,
+    row_offsets: Vec<u32>,
+    reader_priority: u32,
+    shared_scheduler_eligibility: FragmentSharedSchedulerEligibility,
 }
 
 fn elapsed_nanos(started: Instant) -> u64 {
@@ -589,6 +607,21 @@ impl TakeBuilder {
     pub(crate) async fn read_sorted_physical_by_fragment(
         self,
     ) -> Result<Option<GroupedPhysicalRead>> {
+        self.read_sorted_physical_by_fragment_with_shared_scheduler(false)
+            .await
+    }
+
+    /// Variant of [`Self::read_sorted_physical_by_fragment`] that may share one
+    /// scheduler across the complete grouped read.
+    ///
+    /// The opt-in path is whole-query conservative: all projection-matching
+    /// files in all participating fragments must be default-base V2 files.
+    /// Otherwise no shared scheduler is created and the complete request uses
+    /// the strict per-file control path.
+    pub(crate) async fn read_sorted_physical_by_fragment_with_shared_scheduler(
+        self,
+        shared_scheduler_enabled: bool,
+    ) -> Result<Option<GroupedPhysicalRead>> {
         let parent_started = Instant::now();
         if self.row_ids.is_some() || self.with_row_address {
             return Ok(None);
@@ -622,6 +655,8 @@ impl TakeBuilder {
             fragment: FileFragment,
             row_offsets: Vec<u32>,
             projection: Arc<Schema>,
+            shared_scheduler: Option<Arc<ScanScheduler>>,
+            reader_priority: u32,
             with_row_id: bool,
             with_row_address: bool,
             with_row_created_at_version: bool,
@@ -634,11 +669,16 @@ impl TakeBuilder {
                 // projection-matching default-base V2 data file. The scoped
                 // scheduler fields remain unavailable until the opt-in shared
                 // path supplies an Arc.
-                let read_config = FragReadConfig::default()
+                let mut read_config = FragReadConfig::default()
                     .with_row_id(with_row_id)
                     .with_row_address(with_row_address)
                     .with_row_created_at_version(with_row_created_at_version)
                     .with_row_last_updated_at_version(with_row_last_updated_at_version);
+                if let Some(shared_scheduler) = shared_scheduler {
+                    read_config = read_config
+                        .with_scan_scheduler(shared_scheduler)
+                        .with_reader_priority(reader_priority);
+                }
                 let mut phases = FragmentTakePhaseStats::default();
                 let batch = fragment
                     .take_rows_with_config(
@@ -657,7 +697,7 @@ impl TakeBuilder {
         }
 
         let grouping_started = Instant::now();
-        let mut reads = Vec::new();
+        let mut plans = Vec::new();
         let mut start = 0;
         while start < row_addrs.len() {
             let fragment_id = row_addrs[start] >> 32;
@@ -678,18 +718,75 @@ impl TakeBuilder {
                 .iter()
                 .map(|address| *address as u32)
                 .collect();
-            reads.push(take_fragment(
+            let reader_priority = u32::try_from(plans.len()).unwrap_or(u32::MAX);
+            let mut shared_scheduler_eligibility = FragmentSharedSchedulerEligibility::Eligible;
+            if shared_scheduler_enabled {
+                shared_scheduler_eligibility = fragment
+                    .grouped_shared_scheduler_eligibility(physical_schema.as_ref())
+                    .unwrap_or(FragmentSharedSchedulerEligibility::Unsupported);
+                if reader_priority == u32::MAX && plans.len() != u32::MAX as usize {
+                    shared_scheduler_eligibility = FragmentSharedSchedulerEligibility::Unsupported;
+                }
+            }
+            plans.push(FragmentTakePlan {
                 fragment,
                 row_offsets,
-                physical_schema.clone(),
-                with_row_id,
-                with_row_address,
-                with_row_created_at_version,
-                with_row_last_updated_at_version,
-            ));
+                reader_priority,
+                shared_scheduler_eligibility,
+            });
             start = end;
         }
         let grouping_nanos = elapsed_nanos(grouping_started);
+
+        let shared_scheduler_fallback_legacy_fragments = plans
+            .iter()
+            .filter(|plan| {
+                plan.shared_scheduler_eligibility == FragmentSharedSchedulerEligibility::Legacy
+            })
+            .count();
+        let shared_scheduler_fallback_nonprimary_fragments = plans
+            .iter()
+            .filter(|plan| {
+                plan.shared_scheduler_eligibility
+                    == FragmentSharedSchedulerEligibility::NonPrimaryBase
+            })
+            .count();
+        let shared_scheduler_fallback_unsupported_fragments = plans
+            .iter()
+            .filter(|plan| {
+                plan.shared_scheduler_eligibility == FragmentSharedSchedulerEligibility::Unsupported
+            })
+            .count();
+        let all_fragments_eligible = plans.iter().all(|plan| {
+            plan.shared_scheduler_eligibility == FragmentSharedSchedulerEligibility::Eligible
+        });
+        let use_shared_scheduler = shared_scheduler_enabled && all_fragments_eligible;
+        let scheduler_create_started = use_shared_scheduler.then(Instant::now);
+        let shared_scheduler = use_shared_scheduler.then(|| {
+            let object_store = self.dataset.object_store.clone();
+            ScanScheduler::new(
+                object_store.clone(),
+                SchedulerConfig::max_bandwidth(&object_store),
+            )
+        });
+        let scheduler_create_wall_nanos = scheduler_create_started.map(elapsed_nanos).unwrap_or(0);
+
+        let reads = plans
+            .into_iter()
+            .map(|plan| {
+                take_fragment(
+                    plan.fragment,
+                    plan.row_offsets,
+                    physical_schema.clone(),
+                    shared_scheduler.clone(),
+                    plan.reader_priority,
+                    with_row_id,
+                    with_row_address,
+                    with_row_created_at_version,
+                    with_row_last_updated_at_version,
+                )
+            })
+            .collect::<Vec<_>>();
 
         let io_parallelism = self.dataset.object_store.io_parallelism();
         let fanout_concurrency_limit = reads.len().min(io_parallelism);
@@ -724,10 +821,6 @@ impl TakeBuilder {
             .map(|outcome| outcome.total_elapsed_nanos)
             .max()
             .unwrap_or(0);
-        let scheduler_scoped_iops = 0;
-        let scheduler_scoped_requests = 0;
-        let scheduler_scoped_bytes_read = 0;
-        let scheduler_stats_covered_fragments = 0;
         let mut batches = outcomes
             .into_iter()
             .map(|outcome| outcome.batch)
@@ -768,11 +861,25 @@ impl TakeBuilder {
             .sum::<usize>();
         let rows_per_fragment_min = batches.iter().map(RecordBatch::num_rows).min().unwrap_or(0);
         let rows_per_fragment_max = batches.iter().map(RecordBatch::num_rows).max().unwrap_or(0);
+        // All fragment futures have completed before this snapshot.  The
+        // scheduler remains owned here, so its root cannot be dropped while
+        // any covered reader still has pending I/O.
+        let scoped_scheduler_stats = shared_scheduler
+            .as_ref()
+            .map(|scheduler| scheduler.stats())
+            .unwrap_or_default();
+        let fragments = batches.len();
+        let shared_scheduler_queries = usize::from(use_shared_scheduler);
+        let shared_scheduler_fragments = if use_shared_scheduler { fragments } else { 0 };
+        let per_fragment_scheduler_queries = usize::from(!use_shared_scheduler);
+        let per_fragment_scheduler_fragments = if use_shared_scheduler { 0 } else { fragments };
+        let shared_scheduler_fallback_queries =
+            usize::from(shared_scheduler_enabled && !use_shared_scheduler);
         let stats = GroupedPhysicalReadStats {
             parent_wall_nanos: elapsed_nanos(parent_started),
             plan_nanos,
             grouping_nanos,
-            scheduler_create_wall_nanos: 0,
+            scheduler_create_wall_nanos,
             fragment_open_aggregate_nanos,
             fragment_open_max_nanos,
             fragment_read_aggregate_nanos,
@@ -782,15 +889,23 @@ impl TakeBuilder {
             fanout_collect_wall_nanos,
             fanout_concurrency_limit,
             row_offset_injection_wall_nanos,
-            fragments: batches.len(),
+            fragments,
             rows,
             batch_bytes,
             rows_per_fragment_min,
             rows_per_fragment_max,
-            scheduler_scoped_iops,
-            scheduler_scoped_requests,
-            scheduler_scoped_bytes_read,
-            scheduler_stats_covered_fragments,
+            scheduler_scoped_iops: scoped_scheduler_stats.iops,
+            scheduler_scoped_requests: scoped_scheduler_stats.requests,
+            scheduler_scoped_bytes_read: scoped_scheduler_stats.bytes_read,
+            scheduler_stats_covered_fragments: shared_scheduler_fragments,
+            shared_scheduler_queries,
+            shared_scheduler_fragments,
+            per_fragment_scheduler_queries,
+            per_fragment_scheduler_fragments,
+            shared_scheduler_fallback_queries,
+            shared_scheduler_fallback_legacy_fragments,
+            shared_scheduler_fallback_nonprimary_fragments,
+            shared_scheduler_fallback_unsupported_fragments,
         };
 
         Ok(Some(GroupedPhysicalRead { batches, stats }))
@@ -1125,6 +1240,14 @@ mod test {
         assert_eq!(stats.scheduler_scoped_iops, 0);
         assert_eq!(stats.scheduler_scoped_requests, 0);
         assert_eq!(stats.scheduler_scoped_bytes_read, 0);
+        assert_eq!(stats.shared_scheduler_queries, 0);
+        assert_eq!(stats.shared_scheduler_fragments, 0);
+        assert_eq!(stats.per_fragment_scheduler_queries, 1);
+        assert_eq!(stats.per_fragment_scheduler_fragments, 2);
+        assert_eq!(stats.shared_scheduler_fallback_queries, 0);
+        assert_eq!(stats.shared_scheduler_fallback_legacy_fragments, 0);
+        assert_eq!(stats.shared_scheduler_fallback_nonprimary_fragments, 0);
+        assert_eq!(stats.shared_scheduler_fallback_unsupported_fragments, 0);
         assert!(stats.parent_wall_nanos > 0);
         assert!(stats.plan_nanos > 0);
         assert!(stats.grouping_nanos > 0);
@@ -1140,6 +1263,164 @@ mod test {
         assert!(stats.row_offset_injection_wall_nanos > 0);
         assert!(stats.plan_nanos.saturating_add(stats.grouping_nanos) <= stats.parent_wall_nanos);
         assert!(stats.fragment_total_elapsed_max_nanos <= stats.parent_wall_nanos);
+
+        let first_fragment = dataset.get_fragment(0).unwrap();
+        let physical_projection = projection.physical_projection.to_bare_schema();
+        assert_eq!(
+            first_fragment
+                .grouped_shared_scheduler_eligibility(&physical_projection)
+                .unwrap(),
+            FragmentSharedSchedulerEligibility::Eligible
+        );
+        let mut nonprimary_metadata = first_fragment.metadata().clone();
+        nonprimary_metadata.files[0].base_id = Some(7);
+        let nonprimary_fragment = FileFragment::new(dataset.clone(), nonprimary_metadata);
+        assert_eq!(
+            nonprimary_fragment
+                .grouped_shared_scheduler_eligibility(&physical_projection)
+                .unwrap(),
+            FragmentSharedSchedulerEligibility::NonPrimaryBase
+        );
+        let mut malformed_metadata = first_fragment.metadata().clone();
+        malformed_metadata.files[0].file_major_version = u32::MAX;
+        let malformed_fragment = FileFragment::new(dataset.clone(), malformed_metadata);
+        assert!(
+            malformed_fragment
+                .grouped_shared_scheduler_eligibility(&physical_projection)
+                .is_err()
+        );
+        assert_eq!(
+            first_fragment
+                .grouped_shared_scheduler_eligibility(&Schema::default())
+                .unwrap(),
+            FragmentSharedSchedulerEligibility::Unsupported
+        );
+        let mut old_metadata = first_fragment.metadata().clone();
+        old_metadata.physical_rows = None;
+        let old_fragment = FileFragment::new(dataset.clone(), old_metadata);
+        assert_eq!(
+            old_fragment
+                .grouped_shared_scheduler_eligibility(&physical_projection)
+                .unwrap(),
+            FragmentSharedSchedulerEligibility::Unsupported
+        );
+        let mut old_dataset = dataset.as_ref().clone();
+        Arc::make_mut(&mut old_dataset.manifest).writer_version = None;
+        let old_writer_fragment =
+            FileFragment::new(Arc::new(old_dataset), first_fragment.metadata().clone());
+        assert_eq!(
+            old_writer_fragment
+                .grouped_shared_scheduler_eligibility(&physical_projection)
+                .unwrap(),
+            FragmentSharedSchedulerEligibility::Unsupported
+        );
+
+        let shared = TakeBuilder::try_new_from_addresses(
+            dataset.clone(),
+            addresses.clone(),
+            projection.clone(),
+        )
+        .unwrap()
+        .read_sorted_physical_by_fragment_with_shared_scheduler(true)
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(shared.batches, physical.batches);
+        assert_eq!(shared.stats.shared_scheduler_queries, 1);
+        assert_eq!(shared.stats.shared_scheduler_fragments, 2);
+        assert_eq!(shared.stats.per_fragment_scheduler_queries, 0);
+        assert_eq!(shared.stats.per_fragment_scheduler_fragments, 0);
+        assert_eq!(shared.stats.shared_scheduler_fallback_queries, 0);
+        assert_eq!(shared.stats.scheduler_stats_covered_fragments, 2);
+        assert!(shared.stats.scheduler_create_wall_nanos > 0);
+        assert!(shared.stats.scheduler_scoped_iops > 0);
+        assert!(shared.stats.scheduler_scoped_requests > 0);
+        assert!(shared.stats.scheduler_scoped_bytes_read > 0);
+
+        let system_projection = Arc::new(
+            ProjectionRequest::from_columns([ROW_ID], dataset.schema())
+                .into_projection_plan(dataset.clone())
+                .unwrap(),
+        );
+        let system_control = TakeBuilder::try_new_from_addresses(
+            dataset.clone(),
+            addresses.clone(),
+            system_projection.clone(),
+        )
+        .unwrap()
+        .read_sorted_physical_by_fragment()
+        .await
+        .unwrap()
+        .unwrap();
+        let system_treatment = TakeBuilder::try_new_from_addresses(
+            dataset.clone(),
+            addresses.clone(),
+            system_projection,
+        )
+        .unwrap()
+        .read_sorted_physical_by_fragment_with_shared_scheduler(true)
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(system_treatment.batches, system_control.batches);
+        assert_eq!(system_treatment.stats.shared_scheduler_queries, 0);
+        assert_eq!(system_treatment.stats.shared_scheduler_fragments, 0);
+        assert_eq!(system_treatment.stats.per_fragment_scheduler_queries, 1);
+        assert_eq!(system_treatment.stats.per_fragment_scheduler_fragments, 2);
+        assert_eq!(system_treatment.stats.shared_scheduler_fallback_queries, 1);
+        assert_eq!(
+            system_treatment
+                .stats
+                .shared_scheduler_fallback_unsupported_fragments,
+            2
+        );
+        assert_eq!(system_treatment.stats.scheduler_create_wall_nanos, 0);
+        assert_eq!(system_treatment.stats.scheduler_stats_covered_fragments, 0);
+        assert_eq!(system_treatment.stats.scheduler_scoped_iops, 0);
+        assert_eq!(system_treatment.stats.scheduler_scoped_requests, 0);
+        assert_eq!(system_treatment.stats.scheduler_scoped_bytes_read, 0);
+
+        let mut mixed_dataset = dataset.as_ref().clone();
+        let mixed_manifest = Arc::make_mut(&mut mixed_dataset.manifest);
+        Arc::make_mut(&mut mixed_manifest.fragments)[0].physical_rows = None;
+        let mixed_dataset = Arc::new(mixed_dataset);
+        let mixed_control = TakeBuilder::try_new_from_addresses(
+            mixed_dataset.clone(),
+            addresses.clone(),
+            projection.clone(),
+        )
+        .unwrap()
+        .read_sorted_physical_by_fragment()
+        .await
+        .unwrap()
+        .unwrap();
+        let mixed_treatment = TakeBuilder::try_new_from_addresses(
+            mixed_dataset,
+            addresses.clone(),
+            projection.clone(),
+        )
+        .unwrap()
+        .read_sorted_physical_by_fragment_with_shared_scheduler(true)
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(mixed_treatment.batches, mixed_control.batches);
+        assert_eq!(mixed_treatment.stats.shared_scheduler_queries, 0);
+        assert_eq!(mixed_treatment.stats.shared_scheduler_fragments, 0);
+        assert_eq!(mixed_treatment.stats.per_fragment_scheduler_queries, 1);
+        assert_eq!(mixed_treatment.stats.per_fragment_scheduler_fragments, 2);
+        assert_eq!(mixed_treatment.stats.shared_scheduler_fallback_queries, 1);
+        assert_eq!(
+            mixed_treatment
+                .stats
+                .shared_scheduler_fallback_unsupported_fragments,
+            1
+        );
+        assert_eq!(mixed_treatment.stats.scheduler_create_wall_nanos, 0);
+        assert_eq!(mixed_treatment.stats.scheduler_stats_covered_fragments, 0);
+        assert_eq!(mixed_treatment.stats.scheduler_scoped_iops, 0);
+        assert_eq!(mixed_treatment.stats.scheduler_scoped_requests, 0);
+        assert_eq!(mixed_treatment.stats.scheduler_scoped_bytes_read, 0);
         let physical = physical.batches;
         assert_eq!(physical.len(), 2);
         assert!(physical.iter().all(|batch| batch.num_rows() == 1));
@@ -1172,6 +1453,15 @@ mod test {
                 .unwrap()
                 .is_none()
         );
+        let unsorted = vec![addresses[1], addresses[0]];
+        assert!(
+            TakeBuilder::try_new_from_addresses(dataset.clone(), unsorted, projection.clone())
+                .unwrap()
+                .read_sorted_physical_by_fragment_with_shared_scheduler(true)
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert!(
             TakeBuilder::try_new_from_addresses(
                 dataset.clone(),
@@ -1193,6 +1483,14 @@ mod test {
                 .unwrap()
                 .is_none()
         );
+        assert!(
+            TakeBuilder::try_new_from_addresses(dataset.clone(), Vec::new(), projection.clone(),)
+                .unwrap()
+                .read_sorted_physical_by_fragment_with_shared_scheduler(true)
+                .await
+                .unwrap()
+                .is_none()
+        );
         let invalid = vec![u64::from(RowAddress::new_from_parts(99, 0))];
         let error = TakeBuilder::try_new_from_addresses(dataset, invalid, projection)
             .unwrap()
@@ -1201,6 +1499,133 @@ mod test {
             .unwrap_err();
         assert!(error.to_string().contains("non-existent fragment"));
     }
+
+    #[tokio::test]
+    async fn grouped_shared_scheduler_falls_back_for_legacy_fragments() {
+        let data = test_batch(0..4);
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new([Ok(data.clone())], data.schema()),
+                "memory://",
+                Some(WriteParams {
+                    max_rows_per_file: 2,
+                    max_rows_per_group: 2,
+                    data_storage_version: Some(LanceFileVersion::Legacy),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(dataset.get_fragments().len(), 2);
+        let addresses = vec![
+            u64::from(RowAddress::new_from_parts(0, 0)),
+            u64::from(RowAddress::new_from_parts(1, 0)),
+        ];
+        let projection = Arc::new(
+            ProjectionRequest::from_columns(["i", ROW_ID], dataset.schema())
+                .into_projection_plan(dataset.clone())
+                .unwrap(),
+        );
+        let control = TakeBuilder::try_new_from_addresses(
+            dataset.clone(),
+            addresses.clone(),
+            projection.clone(),
+        )
+        .unwrap()
+        .read_sorted_physical_by_fragment()
+        .await
+        .unwrap()
+        .unwrap();
+        let treatment = TakeBuilder::try_new_from_addresses(dataset, addresses, projection)
+            .unwrap()
+            .read_sorted_physical_by_fragment_with_shared_scheduler(true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(treatment.batches, control.batches);
+        assert_eq!(treatment.stats.shared_scheduler_queries, 0);
+        assert_eq!(treatment.stats.shared_scheduler_fragments, 0);
+        assert_eq!(treatment.stats.per_fragment_scheduler_queries, 1);
+        assert_eq!(treatment.stats.per_fragment_scheduler_fragments, 2);
+        assert_eq!(treatment.stats.shared_scheduler_fallback_queries, 1);
+        assert_eq!(
+            treatment.stats.shared_scheduler_fallback_legacy_fragments,
+            2
+        );
+        assert_eq!(
+            treatment
+                .stats
+                .shared_scheduler_fallback_nonprimary_fragments,
+            0
+        );
+        assert_eq!(
+            treatment
+                .stats
+                .shared_scheduler_fallback_unsupported_fragments,
+            0
+        );
+        assert_eq!(treatment.stats.scheduler_create_wall_nanos, 0);
+        assert_eq!(treatment.stats.scheduler_stats_covered_fragments, 0);
+        assert_eq!(treatment.stats.scheduler_scoped_iops, 0);
+        assert_eq!(treatment.stats.scheduler_scoped_requests, 0);
+        assert_eq!(treatment.stats.scheduler_scoped_bytes_read, 0);
+    }
+
+    #[tokio::test]
+    async fn grouped_shared_scheduler_preserves_deletions_and_stable_row_ids() {
+        let data = test_batch(0..6);
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(data.clone())], data.schema()),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                max_rows_per_group: 2,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.delete("i IN (1, 4)").await.unwrap();
+        let dataset = Arc::new(dataset);
+        assert_eq!(dataset.get_fragments().len(), 3);
+        let addresses = vec![
+            u64::from(RowAddress::new_from_parts(0, 0)),
+            u64::from(RowAddress::new_from_parts(1, 1)),
+            u64::from(RowAddress::new_from_parts(2, 1)),
+        ];
+        let projection = Arc::new(
+            ProjectionRequest::from_columns(["i", ROW_ID, ROW_ADDR, ROW_OFFSET], dataset.schema())
+                .into_projection_plan(dataset.clone())
+                .unwrap(),
+        );
+        let control = TakeBuilder::try_new_from_addresses(
+            dataset.clone(),
+            addresses.clone(),
+            projection.clone(),
+        )
+        .unwrap()
+        .read_sorted_physical_by_fragment()
+        .await
+        .unwrap()
+        .unwrap();
+        let treatment = TakeBuilder::try_new_from_addresses(dataset, addresses, projection)
+            .unwrap()
+            .read_sorted_physical_by_fragment_with_shared_scheduler(true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(treatment.batches, control.batches);
+        assert_eq!(treatment.stats.shared_scheduler_queries, 1);
+        assert_eq!(treatment.stats.shared_scheduler_fragments, 3);
+        assert_eq!(treatment.stats.scheduler_stats_covered_fragments, 3);
+        assert_eq!(treatment.stats.shared_scheduler_fallback_queries, 0);
+        assert!(treatment.stats.scheduler_scoped_iops > 0);
+        assert!(treatment.stats.scheduler_scoped_requests > 0);
+        assert!(treatment.stats.scheduler_scoped_bytes_read > 0);
+    }
+
     #[tokio::test]
     async fn test_take_with_deletion() {
         let data = test_batch(0..120);

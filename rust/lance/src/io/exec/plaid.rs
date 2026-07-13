@@ -205,6 +205,20 @@ const GROUPED_REFINEMENT_SCHEDULER_SCOPED_BYTES_READ_COUNT: &str =
 const GROUPED_REFINEMENT_SCHEDULER_STATS_COVERED_FRAGMENTS_COUNT: &str =
     "plaid_grouped_refinement_scheduler_stats_covered_fragments";
 const GROUPED_REFINEMENT_FALLBACK_COUNT: &str = "plaid_grouped_refinement_fallbacks";
+const GROUPED_SHARED_SCHEDULER_QUERY_COUNT: &str = "plaid_grouped_shared_scheduler_queries";
+const GROUPED_SHARED_SCHEDULER_FRAGMENT_COUNT: &str = "plaid_grouped_shared_scheduler_fragments";
+const GROUPED_PER_FRAGMENT_SCHEDULER_QUERY_COUNT: &str =
+    "plaid_grouped_per_fragment_scheduler_queries";
+const GROUPED_PER_FRAGMENT_SCHEDULER_FRAGMENT_COUNT: &str =
+    "plaid_grouped_per_fragment_scheduler_fragments";
+const GROUPED_SHARED_SCHEDULER_FALLBACK_QUERY_COUNT: &str =
+    "plaid_grouped_shared_scheduler_fallback_queries";
+const GROUPED_SHARED_SCHEDULER_FALLBACK_LEGACY_FRAGMENT_COUNT: &str =
+    "plaid_grouped_shared_scheduler_fallback_legacy_fragments";
+const GROUPED_SHARED_SCHEDULER_FALLBACK_NONPRIMARY_FRAGMENT_COUNT: &str =
+    "plaid_grouped_shared_scheduler_fallback_nonprimary_fragments";
+const GROUPED_SHARED_SCHEDULER_FALLBACK_UNSUPPORTED_FRAGMENT_COUNT: &str =
+    "plaid_grouped_shared_scheduler_fallback_unsupported_fragments";
 
 const DIRECT_RESIDUAL_ENABLED_ENV: &str = "LANCE_PLAID_DIRECT_RESIDUAL_ENABLED";
 const DIRECT_RESIDUAL_MAX_DOCUMENTS_ENV: &str = "LANCE_PLAID_DIRECT_RESIDUAL_MAX_DOCUMENTS";
@@ -212,24 +226,25 @@ const DEFAULT_DIRECT_RESIDUAL_MAX_DOCUMENTS: usize = 1024;
 const FUSED_FINAL_TAKE_ENABLED_ENV: &str = "LANCE_PLAID_FUSED_FINAL_TAKE_ENABLED";
 const SORTED_RAW_TAKE_ENABLED_ENV: &str = "LANCE_PLAID_SORTED_RAW_TAKE_ENABLED";
 const GROUPED_REFINEMENT_ENABLED_ENV: &str = "LANCE_PLAID_GROUPED_REFINEMENT_ENABLED";
+const GROUPED_SHARED_SCHEDULER_ENABLED_ENV: &str = "LANCE_PLAID_GROUPED_SHARED_SCHEDULER_ENABLED";
 const DIRECT_WINNER_PROJECTION_ENABLED_ENV: &str = "LANCE_PLAID_DIRECT_WINNER_PROJECTION_ENABLED";
 
 #[cfg(test)]
 thread_local! {
-    static TAKE_OPT_TEST_OVERRIDE: std::cell::Cell<Option<(bool, bool, bool, bool)>> = const {
+    static TAKE_OPT_TEST_OVERRIDE: std::cell::Cell<Option<(bool, bool, bool, bool, bool)>> = const {
         std::cell::Cell::new(None)
     };
 }
 
 #[cfg(test)]
 pub(crate) struct PlaidTakeOptimizationTestGuard {
-    previous: Option<(bool, bool, bool, bool)>,
+    previous: Option<(bool, bool, bool, bool, bool)>,
 }
 
 #[cfg(test)]
 impl PlaidTakeOptimizationTestGuard {
     pub(crate) fn new(fused: bool, sorted: bool) -> Self {
-        let previous = TAKE_OPT_TEST_OVERRIDE.replace(Some((fused, sorted, false, false)));
+        let previous = TAKE_OPT_TEST_OVERRIDE.replace(Some((fused, sorted, false, false, false)));
         Self { previous }
     }
 
@@ -244,6 +259,24 @@ impl PlaidTakeOptimizationTestGuard {
             sorted,
             grouped,
             direct_winner_projection,
+            false,
+        )));
+        Self { previous }
+    }
+
+    pub(crate) fn new_with_grouped_shared_scheduler(
+        fused: bool,
+        sorted: bool,
+        grouped: bool,
+        direct_winner_projection: bool,
+        grouped_shared_scheduler: bool,
+    ) -> Self {
+        let previous = TAKE_OPT_TEST_OVERRIDE.replace(Some((
+            fused,
+            sorted,
+            grouped,
+            direct_winner_projection,
+            grouped_shared_scheduler,
         )));
         Self { previous }
     }
@@ -257,7 +290,7 @@ impl Drop for PlaidTakeOptimizationTestGuard {
 }
 
 #[cfg(test)]
-fn take_optimization_test_override() -> Option<(bool, bool, bool, bool)> {
+fn take_optimization_test_override() -> Option<(bool, bool, bool, bool, bool)> {
     TAKE_OPT_TEST_OVERRIDE.get()
 }
 
@@ -269,7 +302,7 @@ struct FusedFinalTakeConfig {
 impl FusedFinalTakeConfig {
     fn from_env() -> Result<Self> {
         #[cfg(test)]
-        if let Some((enabled, _, _, _)) = take_optimization_test_override() {
+        if let Some((enabled, _, _, _, _)) = take_optimization_test_override() {
             return Ok(Self { enabled });
         }
         let enabled = read_utf8_env(FUSED_FINAL_TAKE_ENABLED_ENV)?;
@@ -303,7 +336,7 @@ struct SortedRawTakeConfig {
 impl SortedRawTakeConfig {
     fn from_env() -> Result<Self> {
         #[cfg(test)]
-        if let Some((_, enabled, _, _)) = take_optimization_test_override() {
+        if let Some((_, enabled, _, _, _)) = take_optimization_test_override() {
             return Ok(Self { enabled });
         }
         let enabled = read_utf8_env(SORTED_RAW_TAKE_ENABLED_ENV)?;
@@ -337,7 +370,7 @@ struct GroupedRefinementConfig {
 impl GroupedRefinementConfig {
     fn from_env() -> Result<Self> {
         #[cfg(test)]
-        if let Some((_, _, enabled, _)) = take_optimization_test_override() {
+        if let Some((_, _, enabled, _, _)) = take_optimization_test_override() {
             return Ok(Self { enabled });
         }
         let enabled = read_utf8_env(GROUPED_REFINEMENT_ENABLED_ENV)?;
@@ -364,6 +397,40 @@ impl GroupedRefinementConfig {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct GroupedSharedSchedulerConfig {
+    enabled: bool,
+}
+
+impl GroupedSharedSchedulerConfig {
+    fn from_env() -> Result<Self> {
+        #[cfg(test)]
+        if let Some((_, _, _, _, enabled)) = take_optimization_test_override() {
+            return Ok(Self { enabled });
+        }
+        let enabled = read_utf8_env(GROUPED_SHARED_SCHEDULER_ENABLED_ENV)?;
+        Self::from_value(enabled.as_deref())
+    }
+
+    fn from_value(enabled: Option<&str>) -> Result<Self> {
+        let enabled = enabled
+            .map(|value| {
+                parse_bool(value).ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "invalid {GROUPED_SHARED_SCHEDULER_ENABLED_ENV}={value:?}; expected true/false"
+                    ))
+                })
+            })
+            .transpose()?
+            .unwrap_or(false);
+        Ok(Self { enabled })
+    }
+
+    fn mode_name(self) -> &'static str {
+        if self.enabled { "enabled" } else { "disabled" }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct DirectWinnerProjectionConfig {
     enabled: bool,
 }
@@ -371,7 +438,7 @@ struct DirectWinnerProjectionConfig {
 impl DirectWinnerProjectionConfig {
     fn from_env() -> Result<Self> {
         #[cfg(test)]
-        if let Some((_, _, _, enabled)) = take_optimization_test_override() {
+        if let Some((_, _, _, enabled, _)) = take_optimization_test_override() {
             return Ok(Self { enabled });
         }
         let enabled = read_utf8_env(DIRECT_WINNER_PROJECTION_ENABLED_ENV)?;
@@ -601,6 +668,7 @@ pub struct PlaidSearchExec {
     fused_final_take_config: FusedFinalTakeConfig,
     sorted_raw_take_config: SortedRawTakeConfig,
     grouped_refinement_config: GroupedRefinementConfig,
+    grouped_shared_scheduler_config: GroupedSharedSchedulerConfig,
     direct_winner_projection_config: DirectWinnerProjectionConfig,
     fused_output_projection: Option<Projection>,
     output_schema: SchemaRef,
@@ -625,6 +693,7 @@ impl PlaidSearchExec {
             FusedFinalTakeConfig::from_env()?,
             SortedRawTakeConfig::from_env()?,
             GroupedRefinementConfig::from_env()?,
+            GroupedSharedSchedulerConfig::from_env()?,
             DirectWinnerProjectionConfig::from_env()?,
             None,
         )
@@ -639,6 +708,7 @@ impl PlaidSearchExec {
         fused_final_take_config: FusedFinalTakeConfig,
         sorted_raw_take_config: SortedRawTakeConfig,
         grouped_refinement_config: GroupedRefinementConfig,
+        grouped_shared_scheduler_config: GroupedSharedSchedulerConfig,
         direct_winner_projection_config: DirectWinnerProjectionConfig,
         fused_output_projection: Option<Projection>,
     ) -> Result<Self> {
@@ -691,6 +761,7 @@ impl PlaidSearchExec {
             fused_final_take_config,
             sorted_raw_take_config,
             grouped_refinement_config,
+            grouped_shared_scheduler_config,
             direct_winner_projection_config,
             fused_output_projection,
             output_schema,
@@ -722,6 +793,7 @@ impl PlaidSearchExec {
             self.fused_final_take_config,
             self.sorted_raw_take_config,
             self.grouped_refinement_config,
+            self.grouped_shared_scheduler_config,
             self.direct_winner_projection_config,
             Some(projection),
         )?))
@@ -737,7 +809,7 @@ impl DisplayAs for PlaidSearchExec {
         match format {
             DisplayFormatType::Default | DisplayFormatType::Verbose => write!(
                 formatter,
-                "PlaidSearch: name={}, k={}, segments={}, mode={}, core_residual_budget={}, raw_refinement_budget={}, filter_exact_fallback=enabled, direct_residual_mode={}, direct_residual_max_documents={}, sorted_raw_take_mode={}, grouped_refinement_mode={}, fused_final_take_mode={}, direct_winner_projection_mode={}, fused_output_fields={}",
+                "PlaidSearch: name={}, k={}, segments={}, mode={}, core_residual_budget={}, raw_refinement_budget={}, filter_exact_fallback=enabled, direct_residual_mode={}, direct_residual_max_documents={}, sorted_raw_take_mode={}, grouped_refinement_mode={}, grouped_shared_scheduler_mode={}, fused_final_take_mode={}, direct_winner_projection_mode={}, fused_output_fields={}",
                 self.indices[0].name,
                 self.query.k,
                 self.indices.len(),
@@ -750,6 +822,7 @@ impl DisplayAs for PlaidSearchExec {
                 self.direct_residual_config.max_documents,
                 self.sorted_raw_take_config.mode_name(),
                 self.grouped_refinement_config.mode_name(),
+                self.grouped_shared_scheduler_config.mode_name(),
                 self.fused_final_take_config.mode_name(),
                 self.direct_winner_projection_config.mode_name(),
                 self.fused_output_projection
@@ -759,7 +832,7 @@ impl DisplayAs for PlaidSearchExec {
             ),
             DisplayFormatType::TreeRender => write!(
                 formatter,
-                "PlaidSearch\nname={}\nk={}\nsegments={}\nmode={}\ncore_residual_budget={}\nraw_refinement_budget={}\nfilter_exact_fallback=enabled\ndirect_residual_mode={}\ndirect_residual_max_documents={}\nsorted_raw_take_mode={}\ngrouped_refinement_mode={}\nfused_final_take_mode={}\ndirect_winner_projection_mode={}\nfused_output_fields={}",
+                "PlaidSearch\nname={}\nk={}\nsegments={}\nmode={}\ncore_residual_budget={}\nraw_refinement_budget={}\nfilter_exact_fallback=enabled\ndirect_residual_mode={}\ndirect_residual_max_documents={}\nsorted_raw_take_mode={}\ngrouped_refinement_mode={}\ngrouped_shared_scheduler_mode={}\nfused_final_take_mode={}\ndirect_winner_projection_mode={}\nfused_output_fields={}",
                 self.indices[0].name,
                 self.query.k,
                 self.indices.len(),
@@ -772,6 +845,7 @@ impl DisplayAs for PlaidSearchExec {
                 self.direct_residual_config.max_documents,
                 self.sorted_raw_take_config.mode_name(),
                 self.grouped_refinement_config.mode_name(),
+                self.grouped_shared_scheduler_config.mode_name(),
                 self.fused_final_take_config.mode_name(),
                 self.direct_winner_projection_config.mode_name(),
                 self.fused_output_projection
@@ -843,6 +917,7 @@ impl ExecutionPlan for PlaidSearchExec {
             self.fused_final_take_config,
             self.sorted_raw_take_config,
             self.grouped_refinement_config,
+            self.grouped_shared_scheduler_config,
             self.direct_winner_projection_config,
             self.fused_output_projection.clone(),
         )?))
@@ -868,6 +943,7 @@ impl ExecutionPlan for PlaidSearchExec {
         let direct_residual_config = self.direct_residual_config;
         let sorted_raw_take_config = self.sorted_raw_take_config;
         let grouped_refinement_config = self.grouped_refinement_config;
+        let grouped_shared_scheduler_config = self.grouped_shared_scheduler_config;
         let direct_winner_projection_config = self.direct_winner_projection_config;
         let fused_output_projection = self.fused_output_projection.clone();
         let output_schema = self.output_schema.clone();
@@ -881,6 +957,7 @@ impl ExecutionPlan for PlaidSearchExec {
                 direct_residual_config,
                 sorted_raw_take_config,
                 grouped_refinement_config,
+                grouped_shared_scheduler_config,
                 direct_winner_projection_config,
                 fused_output_projection,
                 output_schema,
@@ -1024,6 +1101,14 @@ struct PlaidExecMetrics {
     grouped_refinement_scheduler_scoped_bytes_read_count: Count,
     grouped_refinement_scheduler_stats_covered_fragments_count: Count,
     grouped_refinement_fallback_count: Count,
+    grouped_shared_scheduler_query_count: Count,
+    grouped_shared_scheduler_fragment_count: Count,
+    grouped_per_fragment_scheduler_query_count: Count,
+    grouped_per_fragment_scheduler_fragment_count: Count,
+    grouped_shared_scheduler_fallback_query_count: Count,
+    grouped_shared_scheduler_fallback_legacy_fragment_count: Count,
+    grouped_shared_scheduler_fallback_nonprimary_fragment_count: Count,
+    grouped_shared_scheduler_fallback_unsupported_fragment_count: Count,
 }
 
 impl PlaidExecMetrics {
@@ -1206,6 +1291,28 @@ impl PlaidExecMetrics {
             ),
             grouped_refinement_fallback_count: metrics
                 .new_count(GROUPED_REFINEMENT_FALLBACK_COUNT, partition),
+            grouped_shared_scheduler_query_count: metrics
+                .new_count(GROUPED_SHARED_SCHEDULER_QUERY_COUNT, partition),
+            grouped_shared_scheduler_fragment_count: metrics
+                .new_count(GROUPED_SHARED_SCHEDULER_FRAGMENT_COUNT, partition),
+            grouped_per_fragment_scheduler_query_count: metrics
+                .new_count(GROUPED_PER_FRAGMENT_SCHEDULER_QUERY_COUNT, partition),
+            grouped_per_fragment_scheduler_fragment_count: metrics
+                .new_count(GROUPED_PER_FRAGMENT_SCHEDULER_FRAGMENT_COUNT, partition),
+            grouped_shared_scheduler_fallback_query_count: metrics
+                .new_count(GROUPED_SHARED_SCHEDULER_FALLBACK_QUERY_COUNT, partition),
+            grouped_shared_scheduler_fallback_legacy_fragment_count: metrics.new_count(
+                GROUPED_SHARED_SCHEDULER_FALLBACK_LEGACY_FRAGMENT_COUNT,
+                partition,
+            ),
+            grouped_shared_scheduler_fallback_nonprimary_fragment_count: metrics.new_count(
+                GROUPED_SHARED_SCHEDULER_FALLBACK_NONPRIMARY_FRAGMENT_COUNT,
+                partition,
+            ),
+            grouped_shared_scheduler_fallback_unsupported_fragment_count: metrics.new_count(
+                GROUPED_SHARED_SCHEDULER_FALLBACK_UNSUPPORTED_FRAGMENT_COUNT,
+                partition,
+            ),
         }
     }
 
@@ -1484,6 +1591,7 @@ async fn execute_search(
     direct_residual_config: DirectResidualConfig,
     sorted_raw_take_config: SortedRawTakeConfig,
     grouped_refinement_config: GroupedRefinementConfig,
+    grouped_shared_scheduler_config: GroupedSharedSchedulerConfig,
     direct_winner_projection_config: DirectWinnerProjectionConfig,
     fused_output_projection: Option<Projection>,
     output_schema: SchemaRef,
@@ -1819,13 +1927,18 @@ async fn execute_search(
     // TakeBuilder construction and includes a failed specialization attempt.
     let grouped_started = grouped_attempt.then(Instant::now);
     let grouped_read = if grouped_attempt {
-        TakeBuilder::try_new_from_addresses(
+        let builder = TakeBuilder::try_new_from_addresses(
             dataset.clone(),
             row_addresses.clone(),
             projection.clone(),
-        )?
-        .read_sorted_physical_by_fragment()
-        .await?
+        )?;
+        if grouped_shared_scheduler_config.enabled {
+            builder
+                .read_sorted_physical_by_fragment_with_shared_scheduler(true)
+                .await?
+        } else {
+            builder.read_sorted_physical_by_fragment().await?
+        }
     } else {
         None
     };
@@ -1917,6 +2030,30 @@ async fn execute_search(
         metrics
             .grouped_refinement_scheduler_stats_covered_fragments_count
             .add(grouped_stats.scheduler_stats_covered_fragments);
+        metrics
+            .grouped_shared_scheduler_query_count
+            .add(grouped_stats.shared_scheduler_queries);
+        metrics
+            .grouped_shared_scheduler_fragment_count
+            .add(grouped_stats.shared_scheduler_fragments);
+        metrics
+            .grouped_per_fragment_scheduler_query_count
+            .add(grouped_stats.per_fragment_scheduler_queries);
+        metrics
+            .grouped_per_fragment_scheduler_fragment_count
+            .add(grouped_stats.per_fragment_scheduler_fragments);
+        metrics
+            .grouped_shared_scheduler_fallback_query_count
+            .add(grouped_stats.shared_scheduler_fallback_queries);
+        metrics
+            .grouped_shared_scheduler_fallback_legacy_fragment_count
+            .add(grouped_stats.shared_scheduler_fallback_legacy_fragments);
+        metrics
+            .grouped_shared_scheduler_fallback_nonprimary_fragment_count
+            .add(grouped_stats.shared_scheduler_fallback_nonprimary_fragments);
+        metrics
+            .grouped_shared_scheduler_fallback_unsupported_fragment_count
+            .add(grouped_stats.shared_scheduler_fallback_unsupported_fragments);
         (grouped_read.batches, true)
     } else {
         if grouped_refinement_config.enabled {
@@ -2513,6 +2650,10 @@ mod tests {
             GroupedRefinementConfig::default()
         );
         assert_eq!(
+            GroupedSharedSchedulerConfig::from_value(None).unwrap(),
+            GroupedSharedSchedulerConfig::default()
+        );
+        assert_eq!(
             DirectWinnerProjectionConfig::from_value(None).unwrap(),
             DirectWinnerProjectionConfig::default()
         );
@@ -2528,6 +2669,10 @@ mod tests {
             assert_eq!(
                 GroupedRefinementConfig::from_value(Some(enabled)).unwrap(),
                 GroupedRefinementConfig { enabled: true }
+            );
+            assert_eq!(
+                GroupedSharedSchedulerConfig::from_value(Some(enabled)).unwrap(),
+                GroupedSharedSchedulerConfig { enabled: true }
             );
             assert_eq!(
                 DirectWinnerProjectionConfig::from_value(Some(enabled)).unwrap(),
@@ -2546,6 +2691,10 @@ mod tests {
             assert_eq!(
                 GroupedRefinementConfig::from_value(Some(disabled)).unwrap(),
                 GroupedRefinementConfig { enabled: false }
+            );
+            assert_eq!(
+                GroupedSharedSchedulerConfig::from_value(Some(disabled)).unwrap(),
+                GroupedSharedSchedulerConfig { enabled: false }
             );
             assert_eq!(
                 DirectWinnerProjectionConfig::from_value(Some(disabled)).unwrap(),
@@ -2569,6 +2718,12 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains(GROUPED_REFINEMENT_ENABLED_ENV)
+        );
+        assert!(
+            GroupedSharedSchedulerConfig::from_value(Some("maybe"))
+                .unwrap_err()
+                .to_string()
+                .contains(GROUPED_SHARED_SCHEDULER_ENABLED_ENV)
         );
         assert!(
             DirectWinnerProjectionConfig::from_value(Some("maybe"))

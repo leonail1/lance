@@ -99,6 +99,18 @@ pub(crate) struct FragmentTakePhaseStats {
     pub read_nanos: u64,
 }
 
+/// Conservative eligibility of one fragment for a grouped shared scheduler.
+///
+/// Exactly one reason is returned per fragment so whole-query fallback metrics
+/// remain mutually exclusive and auditable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FragmentSharedSchedulerEligibility {
+    Eligible,
+    Legacy,
+    NonPrimaryBase,
+    Unsupported,
+}
+
 const DEFAULT_BATCH_READ_SIZE: u32 = 1024;
 
 /// A trait for file readers to be implemented by both the v1 and v2 readers
@@ -894,6 +906,51 @@ impl FileFragment {
     /// The number of data files in this fragment.
     pub fn num_data_files(&self) -> usize {
         self.metadata.files.len()
+    }
+
+    /// Classify the data files that actually participate in `projection`.
+    ///
+    /// A shared scheduler is tied to the dataset's default object store. V1
+    /// readers ignore it and non-primary-base V2 readers must use a scheduler
+    /// for their own object store. A fragment with no matching physical file is
+    /// conservatively unsupported even if system columns could be synthesized.
+    pub(crate) fn grouped_shared_scheduler_eligibility(
+        &self,
+        projection: &Schema,
+    ) -> Result<FragmentSharedSchedulerEligibility> {
+        // Old manifests may need `physical_rows()` to open a data file with a
+        // fresh default-config scheduler after the projected readers are open.
+        // That would violate the single-root contract and make scoped stats
+        // incomplete, so the complete grouped request must use the old path.
+        if self.dataset.manifest.writer_version.is_none() || self.metadata.physical_rows.is_none() {
+            return Ok(FragmentSharedSchedulerEligibility::Unsupported);
+        }
+        let mut matched_file = false;
+        let mut has_legacy = false;
+        let mut has_non_primary_base = false;
+        for data_file in &self.metadata.files {
+            let data_file_schema = data_file.schema(self.dataset.schema());
+            let projected = projection.intersection_ignore_types(&data_file_schema)?;
+            if projected.fields.is_empty() {
+                continue;
+            }
+            matched_file = true;
+            let file_version = LanceFileVersion::try_from_major_minor(
+                data_file.file_major_version,
+                data_file.file_minor_version,
+            )?;
+            has_legacy |= file_version == LanceFileVersion::Legacy;
+            has_non_primary_base |= data_file.base_id.is_some();
+        }
+        Ok(if !matched_file {
+            FragmentSharedSchedulerEligibility::Unsupported
+        } else if has_legacy {
+            FragmentSharedSchedulerEligibility::Legacy
+        } else if has_non_primary_base {
+            FragmentSharedSchedulerEligibility::NonPrimaryBase
+        } else {
+            FragmentSharedSchedulerEligibility::Eligible
+        })
     }
 
     /// Gets the data file for a given field
