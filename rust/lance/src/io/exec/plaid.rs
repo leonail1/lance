@@ -219,6 +219,57 @@ const GROUPED_SHARED_SCHEDULER_FALLBACK_NONPRIMARY_FRAGMENT_COUNT: &str =
     "plaid_grouped_shared_scheduler_fallback_nonprimary_fragments";
 const GROUPED_SHARED_SCHEDULER_FALLBACK_UNSUPPORTED_FRAGMENT_COUNT: &str =
     "plaid_grouped_shared_scheduler_fallback_unsupported_fragments";
+const DATA_FILE_READER_CACHE_LOOKUP_SUM_TIME: &str = "plaid_data_file_reader_cache_lookup_sum_time";
+const DATA_FILE_READER_CACHE_GET_OR_OPEN_SUM_TIME: &str =
+    "plaid_data_file_reader_cache_get_or_open_sum_time";
+const DATA_FILE_READER_CACHE_COALESCED_WAIT_SUM_TIME: &str =
+    "plaid_data_file_reader_cache_coalesced_wait_sum_time";
+const DATA_FILE_READER_CACHE_ACQUIRE_SUM_TIME: &str =
+    "plaid_data_file_reader_cache_acquire_sum_time";
+const DATA_FILE_READER_CACHE_PHYSICAL_OPEN_SUM_TIME: &str =
+    "plaid_data_file_reader_cache_physical_open_sum_time";
+const DATA_FILE_READER_CACHE_BIND_SUM_TIME: &str = "plaid_data_file_reader_cache_bind_sum_time";
+const DATA_FILE_READER_CACHE_QUERY_COUNT: &str = "plaid_data_file_reader_cache_queries";
+const DATA_FILE_READER_CACHE_ELIGIBLE_FILE_COUNT: &str =
+    "plaid_data_file_reader_cache_eligible_files";
+const DATA_FILE_READER_CACHE_LOOKUP_FILE_COUNT: &str = "plaid_data_file_reader_cache_lookup_files";
+const DATA_FILE_READER_CACHE_HIT_FILE_COUNT: &str = "plaid_data_file_reader_cache_hit_files";
+const DATA_FILE_READER_CACHE_MISS_OPEN_FILE_COUNT: &str =
+    "plaid_data_file_reader_cache_miss_open_files";
+const DATA_FILE_READER_CACHE_COALESCED_FILE_COUNT: &str =
+    "plaid_data_file_reader_cache_coalesced_files";
+const DATA_FILE_READER_CACHE_BYPASS_FILE_COUNT: &str = "plaid_data_file_reader_cache_bypass_files";
+const DATA_FILE_READER_CACHE_FALLBACK_OPEN_FILE_COUNT: &str =
+    "plaid_data_file_reader_cache_fallback_open_files";
+const DATA_FILE_READER_CACHE_OPEN_FAILURE_COUNT: &str =
+    "plaid_data_file_reader_cache_open_failures";
+const DATA_FILE_READER_CACHE_FD_BUDGET_REJECTION_COUNT: &str =
+    "plaid_data_file_reader_cache_fd_budget_rejections";
+const DATA_FILE_READER_CACHE_RESIDENT_START_COUNT: &str =
+    "plaid_data_file_reader_cache_resident_entries_start_approx";
+const DATA_FILE_READER_CACHE_RESIDENT_END_COUNT: &str =
+    "plaid_data_file_reader_cache_resident_entries_end_approx";
+const DATA_FILE_READER_CACHE_CAPACITY_COUNT: &str = "plaid_data_file_reader_cache_capacity";
+const DATA_FILE_READER_CACHE_FD_SOFT_LIMIT_COUNT: &str =
+    "plaid_data_file_reader_cache_fd_soft_limit";
+const DATA_FILE_READER_CACHE_FALLBACK_QUERY_COUNT: &str =
+    "plaid_data_file_reader_cache_fallback_queries";
+const DATA_FILE_READER_CACHE_PARTIAL_FALLBACK_QUERY_COUNT: &str =
+    "plaid_data_file_reader_cache_partial_fallback_queries";
+const DATA_FILE_READER_CACHE_FALLBACK_LEGACY_FRAGMENT_COUNT: &str =
+    "plaid_data_file_reader_cache_fallback_legacy_fragments";
+const DATA_FILE_READER_CACHE_FALLBACK_NONPRIMARY_FRAGMENT_COUNT: &str =
+    "plaid_data_file_reader_cache_fallback_nonprimary_fragments";
+const DATA_FILE_READER_CACHE_FALLBACK_NONLOCAL_FRAGMENT_COUNT: &str =
+    "plaid_data_file_reader_cache_fallback_nonlocal_fragments";
+const DATA_FILE_READER_CACHE_FALLBACK_UNKNOWN_SIZE_FRAGMENT_COUNT: &str =
+    "plaid_data_file_reader_cache_fallback_unknown_size_fragments";
+const DATA_FILE_READER_CACHE_FALLBACK_SMALL_FILE_FRAGMENT_COUNT: &str =
+    "plaid_data_file_reader_cache_fallback_small_file_fragments";
+const DATA_FILE_READER_CACHE_FALLBACK_UNSUPPORTED_FRAGMENT_COUNT: &str =
+    "plaid_data_file_reader_cache_fallback_unsupported_fragments";
+const DATA_FILE_READER_CACHE_FALLBACK_CAPACITY_QUERY_COUNT: &str =
+    "plaid_data_file_reader_cache_fallback_capacity_queries";
 
 const DIRECT_RESIDUAL_ENABLED_ENV: &str = "LANCE_PLAID_DIRECT_RESIDUAL_ENABLED";
 const DIRECT_RESIDUAL_MAX_DOCUMENTS_ENV: &str = "LANCE_PLAID_DIRECT_RESIDUAL_MAX_DOCUMENTS";
@@ -227,24 +278,26 @@ const FUSED_FINAL_TAKE_ENABLED_ENV: &str = "LANCE_PLAID_FUSED_FINAL_TAKE_ENABLED
 const SORTED_RAW_TAKE_ENABLED_ENV: &str = "LANCE_PLAID_SORTED_RAW_TAKE_ENABLED";
 const GROUPED_REFINEMENT_ENABLED_ENV: &str = "LANCE_PLAID_GROUPED_REFINEMENT_ENABLED";
 const GROUPED_SHARED_SCHEDULER_ENABLED_ENV: &str = "LANCE_PLAID_GROUPED_SHARED_SCHEDULER_ENABLED";
+const DATA_FILE_READER_CACHE_ENABLED_ENV: &str = "LANCE_PLAID_DATA_FILE_READER_CACHE_ENABLED";
 const DIRECT_WINNER_PROJECTION_ENABLED_ENV: &str = "LANCE_PLAID_DIRECT_WINNER_PROJECTION_ENABLED";
 
 #[cfg(test)]
 thread_local! {
-    static TAKE_OPT_TEST_OVERRIDE: std::cell::Cell<Option<(bool, bool, bool, bool, bool)>> = const {
+    static TAKE_OPT_TEST_OVERRIDE: std::cell::Cell<Option<(bool, bool, bool, bool, bool, bool)>> = const {
         std::cell::Cell::new(None)
     };
 }
 
 #[cfg(test)]
 pub(crate) struct PlaidTakeOptimizationTestGuard {
-    previous: Option<(bool, bool, bool, bool, bool)>,
+    previous: Option<(bool, bool, bool, bool, bool, bool)>,
 }
 
 #[cfg(test)]
 impl PlaidTakeOptimizationTestGuard {
     pub(crate) fn new(fused: bool, sorted: bool) -> Self {
-        let previous = TAKE_OPT_TEST_OVERRIDE.replace(Some((fused, sorted, false, false, false)));
+        let previous =
+            TAKE_OPT_TEST_OVERRIDE.replace(Some((fused, sorted, false, false, false, false)));
         Self { previous }
     }
 
@@ -259,6 +312,7 @@ impl PlaidTakeOptimizationTestGuard {
             sorted,
             grouped,
             direct_winner_projection,
+            false,
             false,
         )));
         Self { previous }
@@ -277,6 +331,7 @@ impl PlaidTakeOptimizationTestGuard {
             grouped,
             direct_winner_projection,
             grouped_shared_scheduler,
+            false,
         )));
         Self { previous }
     }
@@ -290,7 +345,7 @@ impl Drop for PlaidTakeOptimizationTestGuard {
 }
 
 #[cfg(test)]
-fn take_optimization_test_override() -> Option<(bool, bool, bool, bool, bool)> {
+fn take_optimization_test_override() -> Option<(bool, bool, bool, bool, bool, bool)> {
     TAKE_OPT_TEST_OVERRIDE.get()
 }
 
@@ -302,7 +357,7 @@ struct FusedFinalTakeConfig {
 impl FusedFinalTakeConfig {
     fn from_env() -> Result<Self> {
         #[cfg(test)]
-        if let Some((enabled, _, _, _, _)) = take_optimization_test_override() {
+        if let Some((enabled, _, _, _, _, _)) = take_optimization_test_override() {
             return Ok(Self { enabled });
         }
         let enabled = read_utf8_env(FUSED_FINAL_TAKE_ENABLED_ENV)?;
@@ -336,7 +391,7 @@ struct SortedRawTakeConfig {
 impl SortedRawTakeConfig {
     fn from_env() -> Result<Self> {
         #[cfg(test)]
-        if let Some((_, enabled, _, _, _)) = take_optimization_test_override() {
+        if let Some((_, enabled, _, _, _, _)) = take_optimization_test_override() {
             return Ok(Self { enabled });
         }
         let enabled = read_utf8_env(SORTED_RAW_TAKE_ENABLED_ENV)?;
@@ -370,7 +425,7 @@ struct GroupedRefinementConfig {
 impl GroupedRefinementConfig {
     fn from_env() -> Result<Self> {
         #[cfg(test)]
-        if let Some((_, _, enabled, _, _)) = take_optimization_test_override() {
+        if let Some((_, _, enabled, _, _, _)) = take_optimization_test_override() {
             return Ok(Self { enabled });
         }
         let enabled = read_utf8_env(GROUPED_REFINEMENT_ENABLED_ENV)?;
@@ -404,7 +459,7 @@ struct GroupedSharedSchedulerConfig {
 impl GroupedSharedSchedulerConfig {
     fn from_env() -> Result<Self> {
         #[cfg(test)]
-        if let Some((_, _, _, _, enabled)) = take_optimization_test_override() {
+        if let Some((_, _, _, _, enabled, _)) = take_optimization_test_override() {
             return Ok(Self { enabled });
         }
         let enabled = read_utf8_env(GROUPED_SHARED_SCHEDULER_ENABLED_ENV)?;
@@ -431,6 +486,40 @@ impl GroupedSharedSchedulerConfig {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DataFileReaderCacheConfig {
+    enabled: bool,
+}
+
+impl DataFileReaderCacheConfig {
+    fn from_env() -> Result<Self> {
+        #[cfg(test)]
+        if let Some((_, _, _, _, _, enabled)) = take_optimization_test_override() {
+            return Ok(Self { enabled });
+        }
+        let enabled = read_utf8_env(DATA_FILE_READER_CACHE_ENABLED_ENV)?;
+        Self::from_value(enabled.as_deref())
+    }
+
+    fn from_value(enabled: Option<&str>) -> Result<Self> {
+        let enabled = enabled
+            .map(|value| {
+                parse_bool(value).ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "invalid {DATA_FILE_READER_CACHE_ENABLED_ENV}={value:?}; expected true/false"
+                    ))
+                })
+            })
+            .transpose()?
+            .unwrap_or(false);
+        Ok(Self { enabled })
+    }
+
+    fn mode_name(self) -> &'static str {
+        if self.enabled { "enabled" } else { "disabled" }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct DirectWinnerProjectionConfig {
     enabled: bool,
 }
@@ -438,7 +527,7 @@ struct DirectWinnerProjectionConfig {
 impl DirectWinnerProjectionConfig {
     fn from_env() -> Result<Self> {
         #[cfg(test)]
-        if let Some((_, _, _, enabled, _)) = take_optimization_test_override() {
+        if let Some((_, _, _, enabled, _, _)) = take_optimization_test_override() {
             return Ok(Self { enabled });
         }
         let enabled = read_utf8_env(DIRECT_WINNER_PROJECTION_ENABLED_ENV)?;
@@ -669,6 +758,7 @@ pub struct PlaidSearchExec {
     sorted_raw_take_config: SortedRawTakeConfig,
     grouped_refinement_config: GroupedRefinementConfig,
     grouped_shared_scheduler_config: GroupedSharedSchedulerConfig,
+    data_file_reader_cache_config: DataFileReaderCacheConfig,
     direct_winner_projection_config: DirectWinnerProjectionConfig,
     fused_output_projection: Option<Projection>,
     output_schema: SchemaRef,
@@ -694,6 +784,7 @@ impl PlaidSearchExec {
             SortedRawTakeConfig::from_env()?,
             GroupedRefinementConfig::from_env()?,
             GroupedSharedSchedulerConfig::from_env()?,
+            DataFileReaderCacheConfig::from_env()?,
             DirectWinnerProjectionConfig::from_env()?,
             None,
         )
@@ -709,6 +800,7 @@ impl PlaidSearchExec {
         sorted_raw_take_config: SortedRawTakeConfig,
         grouped_refinement_config: GroupedRefinementConfig,
         grouped_shared_scheduler_config: GroupedSharedSchedulerConfig,
+        data_file_reader_cache_config: DataFileReaderCacheConfig,
         direct_winner_projection_config: DirectWinnerProjectionConfig,
         fused_output_projection: Option<Projection>,
     ) -> Result<Self> {
@@ -762,6 +854,7 @@ impl PlaidSearchExec {
             sorted_raw_take_config,
             grouped_refinement_config,
             grouped_shared_scheduler_config,
+            data_file_reader_cache_config,
             direct_winner_projection_config,
             fused_output_projection,
             output_schema,
@@ -794,6 +887,7 @@ impl PlaidSearchExec {
             self.sorted_raw_take_config,
             self.grouped_refinement_config,
             self.grouped_shared_scheduler_config,
+            self.data_file_reader_cache_config,
             self.direct_winner_projection_config,
             Some(projection),
         )?))
@@ -809,7 +903,7 @@ impl DisplayAs for PlaidSearchExec {
         match format {
             DisplayFormatType::Default | DisplayFormatType::Verbose => write!(
                 formatter,
-                "PlaidSearch: name={}, k={}, segments={}, mode={}, core_residual_budget={}, raw_refinement_budget={}, filter_exact_fallback=enabled, direct_residual_mode={}, direct_residual_max_documents={}, sorted_raw_take_mode={}, grouped_refinement_mode={}, grouped_shared_scheduler_mode={}, fused_final_take_mode={}, direct_winner_projection_mode={}, fused_output_fields={}",
+                "PlaidSearch: name={}, k={}, segments={}, mode={}, core_residual_budget={}, raw_refinement_budget={}, filter_exact_fallback=enabled, direct_residual_mode={}, direct_residual_max_documents={}, sorted_raw_take_mode={}, grouped_refinement_mode={}, grouped_shared_scheduler_mode={}, data_file_reader_cache_mode={}, fused_final_take_mode={}, direct_winner_projection_mode={}, fused_output_fields={}",
                 self.indices[0].name,
                 self.query.k,
                 self.indices.len(),
@@ -823,6 +917,7 @@ impl DisplayAs for PlaidSearchExec {
                 self.sorted_raw_take_config.mode_name(),
                 self.grouped_refinement_config.mode_name(),
                 self.grouped_shared_scheduler_config.mode_name(),
+                self.data_file_reader_cache_config.mode_name(),
                 self.fused_final_take_config.mode_name(),
                 self.direct_winner_projection_config.mode_name(),
                 self.fused_output_projection
@@ -832,7 +927,7 @@ impl DisplayAs for PlaidSearchExec {
             ),
             DisplayFormatType::TreeRender => write!(
                 formatter,
-                "PlaidSearch\nname={}\nk={}\nsegments={}\nmode={}\ncore_residual_budget={}\nraw_refinement_budget={}\nfilter_exact_fallback=enabled\ndirect_residual_mode={}\ndirect_residual_max_documents={}\nsorted_raw_take_mode={}\ngrouped_refinement_mode={}\ngrouped_shared_scheduler_mode={}\nfused_final_take_mode={}\ndirect_winner_projection_mode={}\nfused_output_fields={}",
+                "PlaidSearch\nname={}\nk={}\nsegments={}\nmode={}\ncore_residual_budget={}\nraw_refinement_budget={}\nfilter_exact_fallback=enabled\ndirect_residual_mode={}\ndirect_residual_max_documents={}\nsorted_raw_take_mode={}\ngrouped_refinement_mode={}\ngrouped_shared_scheduler_mode={}\ndata_file_reader_cache_mode={}\nfused_final_take_mode={}\ndirect_winner_projection_mode={}\nfused_output_fields={}",
                 self.indices[0].name,
                 self.query.k,
                 self.indices.len(),
@@ -846,6 +941,7 @@ impl DisplayAs for PlaidSearchExec {
                 self.sorted_raw_take_config.mode_name(),
                 self.grouped_refinement_config.mode_name(),
                 self.grouped_shared_scheduler_config.mode_name(),
+                self.data_file_reader_cache_config.mode_name(),
                 self.fused_final_take_config.mode_name(),
                 self.direct_winner_projection_config.mode_name(),
                 self.fused_output_projection
@@ -918,6 +1014,7 @@ impl ExecutionPlan for PlaidSearchExec {
             self.sorted_raw_take_config,
             self.grouped_refinement_config,
             self.grouped_shared_scheduler_config,
+            self.data_file_reader_cache_config,
             self.direct_winner_projection_config,
             self.fused_output_projection.clone(),
         )?))
@@ -944,6 +1041,7 @@ impl ExecutionPlan for PlaidSearchExec {
         let sorted_raw_take_config = self.sorted_raw_take_config;
         let grouped_refinement_config = self.grouped_refinement_config;
         let grouped_shared_scheduler_config = self.grouped_shared_scheduler_config;
+        let data_file_reader_cache_config = self.data_file_reader_cache_config;
         let direct_winner_projection_config = self.direct_winner_projection_config;
         let fused_output_projection = self.fused_output_projection.clone();
         let output_schema = self.output_schema.clone();
@@ -958,6 +1056,7 @@ impl ExecutionPlan for PlaidSearchExec {
                 sorted_raw_take_config,
                 grouped_refinement_config,
                 grouped_shared_scheduler_config,
+                data_file_reader_cache_config,
                 direct_winner_projection_config,
                 fused_output_projection,
                 output_schema,
@@ -1023,6 +1122,12 @@ struct PlaidExecMetrics {
     grouped_refinement_fragment_read_max: Time,
     grouped_refinement_fragment_total_elapsed_sum: Time,
     grouped_refinement_fragment_total_elapsed_max: Time,
+    data_file_reader_cache_lookup_sum: Time,
+    data_file_reader_cache_get_or_open_sum: Time,
+    data_file_reader_cache_coalesced_wait_sum: Time,
+    data_file_reader_cache_acquire_sum: Time,
+    data_file_reader_cache_physical_open_sum: Time,
+    data_file_reader_cache_bind_sum: Time,
     fused_final_take: Time,
     fused_final_take_select: Time,
     fused_final_take_logical_projection: Time,
@@ -1109,6 +1214,29 @@ struct PlaidExecMetrics {
     grouped_shared_scheduler_fallback_legacy_fragment_count: Count,
     grouped_shared_scheduler_fallback_nonprimary_fragment_count: Count,
     grouped_shared_scheduler_fallback_unsupported_fragment_count: Count,
+    data_file_reader_cache_query_count: Count,
+    data_file_reader_cache_eligible_file_count: Count,
+    data_file_reader_cache_lookup_file_count: Count,
+    data_file_reader_cache_hit_file_count: Count,
+    data_file_reader_cache_miss_open_file_count: Count,
+    data_file_reader_cache_coalesced_file_count: Count,
+    data_file_reader_cache_bypass_file_count: Count,
+    data_file_reader_cache_fallback_open_file_count: Count,
+    data_file_reader_cache_open_failure_count: Count,
+    data_file_reader_cache_fd_budget_rejection_count: Count,
+    data_file_reader_cache_resident_start_count: Count,
+    data_file_reader_cache_resident_end_count: Count,
+    data_file_reader_cache_capacity_count: Count,
+    data_file_reader_cache_fd_soft_limit_count: Count,
+    data_file_reader_cache_fallback_query_count: Count,
+    data_file_reader_cache_partial_fallback_query_count: Count,
+    data_file_reader_cache_fallback_legacy_fragment_count: Count,
+    data_file_reader_cache_fallback_nonprimary_fragment_count: Count,
+    data_file_reader_cache_fallback_nonlocal_fragment_count: Count,
+    data_file_reader_cache_fallback_unknown_size_fragment_count: Count,
+    data_file_reader_cache_fallback_small_file_fragment_count: Count,
+    data_file_reader_cache_fallback_unsupported_fragment_count: Count,
+    data_file_reader_cache_fallback_capacity_query_count: Count,
 }
 
 impl PlaidExecMetrics {
@@ -1161,6 +1289,18 @@ impl PlaidExecMetrics {
                 GROUPED_REFINEMENT_FRAGMENT_TOTAL_ELAPSED_MAX_TIME,
                 partition,
             ),
+            data_file_reader_cache_lookup_sum: metrics
+                .new_time(DATA_FILE_READER_CACHE_LOOKUP_SUM_TIME, partition),
+            data_file_reader_cache_get_or_open_sum: metrics
+                .new_time(DATA_FILE_READER_CACHE_GET_OR_OPEN_SUM_TIME, partition),
+            data_file_reader_cache_coalesced_wait_sum: metrics
+                .new_time(DATA_FILE_READER_CACHE_COALESCED_WAIT_SUM_TIME, partition),
+            data_file_reader_cache_acquire_sum: metrics
+                .new_time(DATA_FILE_READER_CACHE_ACQUIRE_SUM_TIME, partition),
+            data_file_reader_cache_physical_open_sum: metrics
+                .new_time(DATA_FILE_READER_CACHE_PHYSICAL_OPEN_SUM_TIME, partition),
+            data_file_reader_cache_bind_sum: metrics
+                .new_time(DATA_FILE_READER_CACHE_BIND_SUM_TIME, partition),
             fused_final_take: metrics.new_time(FUSED_FINAL_TAKE_TIME, partition),
             fused_final_take_select: metrics.new_time(FUSED_FINAL_TAKE_SELECT_TIME, partition),
             fused_final_take_logical_projection: metrics
@@ -1311,6 +1451,68 @@ impl PlaidExecMetrics {
             ),
             grouped_shared_scheduler_fallback_unsupported_fragment_count: metrics.new_count(
                 GROUPED_SHARED_SCHEDULER_FALLBACK_UNSUPPORTED_FRAGMENT_COUNT,
+                partition,
+            ),
+            data_file_reader_cache_query_count: metrics
+                .new_count(DATA_FILE_READER_CACHE_QUERY_COUNT, partition),
+            data_file_reader_cache_eligible_file_count: metrics
+                .new_count(DATA_FILE_READER_CACHE_ELIGIBLE_FILE_COUNT, partition),
+            data_file_reader_cache_lookup_file_count: metrics
+                .new_count(DATA_FILE_READER_CACHE_LOOKUP_FILE_COUNT, partition),
+            data_file_reader_cache_hit_file_count: metrics
+                .new_count(DATA_FILE_READER_CACHE_HIT_FILE_COUNT, partition),
+            data_file_reader_cache_miss_open_file_count: metrics
+                .new_count(DATA_FILE_READER_CACHE_MISS_OPEN_FILE_COUNT, partition),
+            data_file_reader_cache_coalesced_file_count: metrics
+                .new_count(DATA_FILE_READER_CACHE_COALESCED_FILE_COUNT, partition),
+            data_file_reader_cache_bypass_file_count: metrics
+                .new_count(DATA_FILE_READER_CACHE_BYPASS_FILE_COUNT, partition),
+            data_file_reader_cache_fallback_open_file_count: metrics
+                .new_count(DATA_FILE_READER_CACHE_FALLBACK_OPEN_FILE_COUNT, partition),
+            data_file_reader_cache_open_failure_count: metrics
+                .new_count(DATA_FILE_READER_CACHE_OPEN_FAILURE_COUNT, partition),
+            data_file_reader_cache_fd_budget_rejection_count: metrics
+                .new_count(DATA_FILE_READER_CACHE_FD_BUDGET_REJECTION_COUNT, partition),
+            data_file_reader_cache_resident_start_count: metrics
+                .new_count(DATA_FILE_READER_CACHE_RESIDENT_START_COUNT, partition),
+            data_file_reader_cache_resident_end_count: metrics
+                .new_count(DATA_FILE_READER_CACHE_RESIDENT_END_COUNT, partition),
+            data_file_reader_cache_capacity_count: metrics
+                .new_count(DATA_FILE_READER_CACHE_CAPACITY_COUNT, partition),
+            data_file_reader_cache_fd_soft_limit_count: metrics
+                .new_count(DATA_FILE_READER_CACHE_FD_SOFT_LIMIT_COUNT, partition),
+            data_file_reader_cache_fallback_query_count: metrics
+                .new_count(DATA_FILE_READER_CACHE_FALLBACK_QUERY_COUNT, partition),
+            data_file_reader_cache_partial_fallback_query_count: metrics.new_count(
+                DATA_FILE_READER_CACHE_PARTIAL_FALLBACK_QUERY_COUNT,
+                partition,
+            ),
+            data_file_reader_cache_fallback_legacy_fragment_count: metrics.new_count(
+                DATA_FILE_READER_CACHE_FALLBACK_LEGACY_FRAGMENT_COUNT,
+                partition,
+            ),
+            data_file_reader_cache_fallback_nonprimary_fragment_count: metrics.new_count(
+                DATA_FILE_READER_CACHE_FALLBACK_NONPRIMARY_FRAGMENT_COUNT,
+                partition,
+            ),
+            data_file_reader_cache_fallback_nonlocal_fragment_count: metrics.new_count(
+                DATA_FILE_READER_CACHE_FALLBACK_NONLOCAL_FRAGMENT_COUNT,
+                partition,
+            ),
+            data_file_reader_cache_fallback_unknown_size_fragment_count: metrics.new_count(
+                DATA_FILE_READER_CACHE_FALLBACK_UNKNOWN_SIZE_FRAGMENT_COUNT,
+                partition,
+            ),
+            data_file_reader_cache_fallback_small_file_fragment_count: metrics.new_count(
+                DATA_FILE_READER_CACHE_FALLBACK_SMALL_FILE_FRAGMENT_COUNT,
+                partition,
+            ),
+            data_file_reader_cache_fallback_unsupported_fragment_count: metrics.new_count(
+                DATA_FILE_READER_CACHE_FALLBACK_UNSUPPORTED_FRAGMENT_COUNT,
+                partition,
+            ),
+            data_file_reader_cache_fallback_capacity_query_count: metrics.new_count(
+                DATA_FILE_READER_CACHE_FALLBACK_CAPACITY_QUERY_COUNT,
                 partition,
             ),
         }
@@ -1592,6 +1794,7 @@ async fn execute_search(
     sorted_raw_take_config: SortedRawTakeConfig,
     grouped_refinement_config: GroupedRefinementConfig,
     grouped_shared_scheduler_config: GroupedSharedSchedulerConfig,
+    data_file_reader_cache_config: DataFileReaderCacheConfig,
     direct_winner_projection_config: DirectWinnerProjectionConfig,
     fused_output_projection: Option<Projection>,
     output_schema: SchemaRef,
@@ -1932,12 +2135,21 @@ async fn execute_search(
             row_addresses.clone(),
             projection.clone(),
         )?;
-        if grouped_shared_scheduler_config.enabled {
-            builder
-                .read_sorted_physical_by_fragment_with_shared_scheduler(true)
-                .await?
-        } else {
-            builder.read_sorted_physical_by_fragment().await?
+        match (
+            grouped_shared_scheduler_config.enabled,
+            data_file_reader_cache_config.enabled,
+        ) {
+            (false, false) => builder.read_sorted_physical_by_fragment().await?,
+            (true, false) => {
+                builder
+                    .read_sorted_physical_by_fragment_with_shared_scheduler(true)
+                    .await?
+            }
+            (shared_scheduler_enabled, true) => {
+                builder
+                    .read_sorted_physical_by_fragment_with_options(shared_scheduler_enabled, true)
+                    .await?
+            }
         }
     } else {
         None
@@ -2054,6 +2266,108 @@ async fn execute_search(
         metrics
             .grouped_shared_scheduler_fallback_unsupported_fragment_count
             .add(grouped_stats.shared_scheduler_fallback_unsupported_fragments);
+        metrics
+            .data_file_reader_cache_lookup_sum
+            .add_duration(Duration::from_nanos(
+                grouped_stats.reader_cache_lookup_nanos,
+            ));
+        metrics
+            .data_file_reader_cache_get_or_open_sum
+            .add_duration(Duration::from_nanos(
+                grouped_stats.reader_cache_get_or_open_nanos,
+            ));
+        metrics
+            .data_file_reader_cache_coalesced_wait_sum
+            .add_duration(Duration::from_nanos(
+                grouped_stats.reader_cache_coalesced_wait_nanos,
+            ));
+        metrics
+            .data_file_reader_cache_acquire_sum
+            .add_duration(Duration::from_nanos(
+                grouped_stats.reader_cache_acquire_nanos,
+            ));
+        metrics
+            .data_file_reader_cache_physical_open_sum
+            .add_duration(Duration::from_nanos(
+                grouped_stats.reader_cache_physical_open_nanos,
+            ));
+        metrics
+            .data_file_reader_cache_bind_sum
+            .add_duration(Duration::from_nanos(grouped_stats.reader_cache_bind_nanos));
+        metrics
+            .data_file_reader_cache_query_count
+            .add(grouped_stats.reader_cache_queries);
+        metrics
+            .data_file_reader_cache_eligible_file_count
+            .add(usize::try_from(grouped_stats.reader_cache_eligible_files).unwrap_or(usize::MAX));
+        metrics
+            .data_file_reader_cache_lookup_file_count
+            .add(usize::try_from(grouped_stats.reader_cache_lookup_files).unwrap_or(usize::MAX));
+        metrics
+            .data_file_reader_cache_hit_file_count
+            .add(usize::try_from(grouped_stats.reader_cache_hit_files).unwrap_or(usize::MAX));
+        metrics
+            .data_file_reader_cache_miss_open_file_count
+            .add(usize::try_from(grouped_stats.reader_cache_miss_open_files).unwrap_or(usize::MAX));
+        metrics
+            .data_file_reader_cache_coalesced_file_count
+            .add(usize::try_from(grouped_stats.reader_cache_coalesced_files).unwrap_or(usize::MAX));
+        metrics
+            .data_file_reader_cache_bypass_file_count
+            .add(usize::try_from(grouped_stats.reader_cache_bypass_files).unwrap_or(usize::MAX));
+        metrics.data_file_reader_cache_fallback_open_file_count.add(
+            usize::try_from(grouped_stats.reader_cache_fallback_open_files).unwrap_or(usize::MAX),
+        );
+        metrics
+            .data_file_reader_cache_open_failure_count
+            .add(usize::try_from(grouped_stats.reader_cache_open_failures).unwrap_or(usize::MAX));
+        metrics
+            .data_file_reader_cache_fd_budget_rejection_count
+            .add(
+                usize::try_from(grouped_stats.reader_cache_fd_budget_rejections)
+                    .unwrap_or(usize::MAX),
+            );
+        metrics.data_file_reader_cache_resident_start_count.add(
+            usize::try_from(grouped_stats.reader_cache_resident_entries_start_approx)
+                .unwrap_or(usize::MAX),
+        );
+        metrics.data_file_reader_cache_resident_end_count.add(
+            usize::try_from(grouped_stats.reader_cache_resident_entries_end_approx)
+                .unwrap_or(usize::MAX),
+        );
+        metrics
+            .data_file_reader_cache_capacity_count
+            .add(usize::try_from(grouped_stats.reader_cache_capacity).unwrap_or(usize::MAX));
+        metrics
+            .data_file_reader_cache_fd_soft_limit_count
+            .add(usize::try_from(grouped_stats.reader_cache_fd_soft_limit).unwrap_or(usize::MAX));
+        metrics
+            .data_file_reader_cache_fallback_query_count
+            .add(grouped_stats.reader_cache_fallback_queries);
+        metrics
+            .data_file_reader_cache_partial_fallback_query_count
+            .add(grouped_stats.reader_cache_partial_fallback_queries);
+        metrics
+            .data_file_reader_cache_fallback_legacy_fragment_count
+            .add(grouped_stats.reader_cache_fallback_legacy_fragments);
+        metrics
+            .data_file_reader_cache_fallback_nonprimary_fragment_count
+            .add(grouped_stats.reader_cache_fallback_nonprimary_fragments);
+        metrics
+            .data_file_reader_cache_fallback_nonlocal_fragment_count
+            .add(grouped_stats.reader_cache_fallback_nonlocal_fragments);
+        metrics
+            .data_file_reader_cache_fallback_unknown_size_fragment_count
+            .add(grouped_stats.reader_cache_fallback_unknown_size_fragments);
+        metrics
+            .data_file_reader_cache_fallback_small_file_fragment_count
+            .add(grouped_stats.reader_cache_fallback_small_file_fragments);
+        metrics
+            .data_file_reader_cache_fallback_unsupported_fragment_count
+            .add(grouped_stats.reader_cache_fallback_unsupported_fragments);
+        metrics
+            .data_file_reader_cache_fallback_capacity_query_count
+            .add(grouped_stats.reader_cache_fallback_capacity_queries);
         (grouped_read.batches, true)
     } else {
         if grouped_refinement_config.enabled {
@@ -2654,6 +2968,10 @@ mod tests {
             GroupedSharedSchedulerConfig::default()
         );
         assert_eq!(
+            DataFileReaderCacheConfig::from_value(None).unwrap(),
+            DataFileReaderCacheConfig::default()
+        );
+        assert_eq!(
             DirectWinnerProjectionConfig::from_value(None).unwrap(),
             DirectWinnerProjectionConfig::default()
         );
@@ -2673,6 +2991,10 @@ mod tests {
             assert_eq!(
                 GroupedSharedSchedulerConfig::from_value(Some(enabled)).unwrap(),
                 GroupedSharedSchedulerConfig { enabled: true }
+            );
+            assert_eq!(
+                DataFileReaderCacheConfig::from_value(Some(enabled)).unwrap(),
+                DataFileReaderCacheConfig { enabled: true }
             );
             assert_eq!(
                 DirectWinnerProjectionConfig::from_value(Some(enabled)).unwrap(),
@@ -2695,6 +3017,10 @@ mod tests {
             assert_eq!(
                 GroupedSharedSchedulerConfig::from_value(Some(disabled)).unwrap(),
                 GroupedSharedSchedulerConfig { enabled: false }
+            );
+            assert_eq!(
+                DataFileReaderCacheConfig::from_value(Some(disabled)).unwrap(),
+                DataFileReaderCacheConfig { enabled: false }
             );
             assert_eq!(
                 DirectWinnerProjectionConfig::from_value(Some(disabled)).unwrap(),
@@ -2724,6 +3050,12 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains(GROUPED_SHARED_SCHEDULER_ENABLED_ENV)
+        );
+        assert!(
+            DataFileReaderCacheConfig::from_value(Some("maybe"))
+                .unwrap_err()
+                .to_string()
+                .contains(DATA_FILE_READER_CACHE_ENABLED_ENV)
         );
         assert!(
             DirectWinnerProjectionConfig::from_value(Some("maybe"))

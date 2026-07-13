@@ -13,11 +13,13 @@ use lance_io::spill::{LocalSpillStore, SpillStore};
 
 use crate::dataset::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
 use crate::session::caches::GlobalMetadataCache;
+use crate::session::data_file_reader_cache::DataFileReaderCache;
 use crate::session::index_caches::GlobalIndexCache;
 
 use self::index_extension::IndexExtension;
 
 pub(crate) mod caches;
+pub(crate) mod data_file_reader_cache;
 pub mod index_caches;
 pub(crate) mod index_extension;
 
@@ -30,10 +32,12 @@ pub(crate) mod index_extension;
 /// This can be used to share caches between multiple datasets, increasing the hit
 /// rate and reducing the amount of memory used.
 ///
-/// A session contains two different caches:
+/// A session contains three different caches:
 ///  - The index cache is used to cache opened indices and will cache index data
 ///  - The metadata cache is used to cache a variety of dataset metadata (more
 ///    details can be found in the [performance guide](https://lance.org/guide/performance/)
+///  - An internal, bounded data-file reader cache supports opt-in PLAID
+///    refinement without retaining query-scoped fragment state
 #[derive(Clone)]
 pub struct Session {
     /// Global cache for opened indices.
@@ -51,6 +55,11 @@ pub struct Session {
     /// This prevents collisions between different datasets.
     pub(crate) metadata_cache: caches::GlobalMetadataCache,
 
+    /// Session-local cache of bare data-file readers used by opt-in grouped
+    /// PLAID refinement.  Query-scoped schedulers and fragment state are never
+    /// retained here.
+    pub(crate) data_file_reader_cache: DataFileReaderCache,
+
     pub(crate) index_extensions: HashMap<(IndexType, String), Arc<dyn IndexExtension>>,
 
     store_registry: Arc<ObjectStoreRegistry>,
@@ -64,6 +73,9 @@ impl DeepSizeOf for Session {
         // Measure the actual cache contents through the wrapper types
         size += self.index_cache.deep_size_of_children(context);
         size += self.metadata_cache.deep_size_of_children(context);
+        // The data-file reader cache owns lightweight open-reader handles.
+        // Do not walk through those trait objects here: their object-store and
+        // I/O tracking state are shared with the session/dataset.
         for ext in self.index_extensions.values() {
             size += ext.deep_size_of_children(context);
         }
@@ -82,6 +94,7 @@ impl std::fmt::Debug for Session {
                 "file_metadata_cache",
                 &format!("LanceCache(items={})", self.metadata_cache.0.approx_size(),),
             )
+            .field("data_file_reader_cache", &self.data_file_reader_cache)
             .field(
                 "index_extensions",
                 &self.index_extensions.keys().collect::<Vec<_>>(),
@@ -108,6 +121,7 @@ impl Session {
         Self {
             index_cache: GlobalIndexCache(LanceCache::with_capacity(index_cache_size)),
             metadata_cache: GlobalMetadataCache(LanceCache::with_capacity(metadata_cache_size)),
+            data_file_reader_cache: DataFileReaderCache::new(),
             index_extensions: HashMap::new(),
             store_registry,
             spill_store: Arc::new(LocalSpillStore::default()),
@@ -126,6 +140,7 @@ impl Session {
         Self {
             index_cache: GlobalIndexCache(LanceCache::with_backend(index_cache_backend)),
             metadata_cache: GlobalMetadataCache(LanceCache::with_capacity(metadata_cache_size)),
+            data_file_reader_cache: DataFileReaderCache::new(),
             index_extensions: HashMap::new(),
             store_registry,
             spill_store: Arc::new(LocalSpillStore::default()),
@@ -218,6 +233,8 @@ impl Session {
         self.index_cache.0.approx_size()
             + self.metadata_cache.0.approx_size()
             + self.index_extensions.len()
+            + usize::try_from(self.data_file_reader_cache.resident_entries_approx())
+                .unwrap_or(usize::MAX)
     }
 
     /// Get the object store registry.
