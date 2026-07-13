@@ -1183,9 +1183,15 @@ mod tests {
         dataset: &Dataset,
         fused: bool,
         grouped: bool,
+        direct_winner_projection: bool,
         empty_bounds: bool,
     ) -> (RecordBatch, String, usize) {
-        let _config = PlaidTakeOptimizationTestGuard::new_with_grouped(fused, true, grouped);
+        let _config = PlaidTakeOptimizationTestGuard::new_with_direct_winner_projection(
+            fused,
+            true,
+            grouped,
+            direct_winner_projection,
+        );
         let mut scanner = dataset.scan();
         scanner.nearest("mv", &query(), 6).unwrap();
         scanner.refine(2);
@@ -1195,6 +1201,50 @@ mod tests {
         scanner
             .project(&[lance_core::ROW_ID, "id", "payload.lang", "payload.label"])
             .unwrap();
+        let plan = scanner.create_plan().await.unwrap();
+        let take_execs = count_take_execs(plan.as_ref());
+        let analyzed = scanner.analyze_plan().await.unwrap();
+        (
+            scanner.try_into_batch().await.unwrap(),
+            analyzed,
+            take_execs,
+        )
+    }
+
+    fn analyzed_metric_count(analyzed: &str, name: &str) -> usize {
+        let needle = format!("{name}=");
+        analyzed
+            .match_indices(&needle)
+            .map(|(start, _)| {
+                analyzed[start + needle.len()..]
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>()
+                    .parse::<usize>()
+                    .unwrap_or(0)
+            })
+            .sum()
+    }
+
+    async fn direct_projection_search(
+        dataset: &Dataset,
+        direct_winner_projection: bool,
+        postfilter: Option<&str>,
+    ) -> (RecordBatch, String, usize) {
+        let _config = PlaidTakeOptimizationTestGuard::new_with_direct_winner_projection(
+            true,
+            true,
+            true,
+            direct_winner_projection,
+        );
+        let mut scanner = dataset.scan();
+        if let Some(filter) = postfilter {
+            scanner.prefilter(false);
+            scanner.filter(filter).unwrap();
+        }
+        scanner.nearest("mv", &query(), 6).unwrap();
+        scanner.refine(2);
+        scanner.project(&[lance_core::ROW_ID, "id"]).unwrap();
         let plan = scanner.create_plan().await.unwrap();
         let take_execs = count_take_execs(plan.as_ref());
         let analyzed = scanner.analyze_plan().await.unwrap();
@@ -1591,7 +1641,9 @@ mod tests {
         let control = control_scanner.try_into_batch().await.unwrap();
 
         drop(control_config);
-        let _treatment_config = PlaidTakeOptimizationTestGuard::new_with_grouped(true, true, true);
+        let _treatment_config = PlaidTakeOptimizationTestGuard::new_with_direct_winner_projection(
+            true, true, true, true,
+        );
         let mut treatment_scanner = dataset.scan();
         treatment_scanner.prefilter(false);
         treatment_scanner.filter("id != 1").unwrap();
@@ -1604,6 +1656,7 @@ mod tests {
         assert!(treatment_explain.contains("sorted_raw_take_mode=enabled"));
         assert!(treatment_explain.contains("grouped_refinement_mode=enabled"));
         assert!(treatment_explain.contains("fused_final_take_mode=enabled"));
+        assert!(treatment_explain.contains("direct_winner_projection_mode=enabled"));
         assert!(treatment_explain.contains("fused_output_fields=1"));
         let treatment_analyzed = treatment_scanner.analyze_plan().await.unwrap();
         // The deletion mask activates the exact-filter fallback, which already
@@ -1614,6 +1667,22 @@ mod tests {
         assert!(treatment_analyzed.contains("plaid_fused_final_take_queries=1"));
         assert!(treatment_analyzed.contains("plaid_fused_final_take_candidate_rows=5"));
         assert!(treatment_analyzed.contains("plaid_fused_final_take_output_rows=5"));
+        // A one-fragment read stays on ordinary TakeBuilder projection even
+        // when the direct winner projector is enabled.
+        assert_eq!(
+            analyzed_metric_count(
+                &treatment_analyzed,
+                "plaid_fused_final_take_direct_projection_queries",
+            ),
+            0
+        );
+        assert_eq!(
+            analyzed_metric_count(
+                &treatment_analyzed,
+                "plaid_fused_final_take_legacy_projection_queries",
+            ),
+            0
+        );
         let treatment = treatment_scanner.try_into_batch().await.unwrap();
         assert_eq!(control, treatment);
         let treatment_ids = treatment["id"]
@@ -1660,17 +1729,34 @@ mod tests {
             .append(RecordBatchIterator::new(vec![Ok(appended)], schema), None)
             .await
             .unwrap();
-        let mut append_scanner = dataset.scan();
-        append_scanner.nearest("mv", &query(), 6).unwrap();
-        append_scanner.refine(2);
-        append_scanner.project(&["id"]).unwrap();
-        let append_plan = append_scanner.create_plan().await.unwrap();
-        assert!(count_take_execs(append_plan.as_ref()) >= 1);
-        let append_explain = append_scanner.explain_plan(false).await.unwrap();
-        assert!(append_explain.contains("fused_output_fields=0"));
-        let append_result = append_scanner.try_into_batch().await.unwrap();
+        let (append_control, append_control_analyzed, append_control_takes) =
+            direct_projection_search(&dataset, false, None).await;
+        let (append_direct, append_direct_analyzed, append_direct_takes) =
+            direct_projection_search(&dataset, true, None).await;
+        assert!(append_control_takes >= 1);
+        assert!(append_direct_takes >= 1);
+        assert!(append_control_analyzed.contains("fused_output_fields=0"));
+        assert!(append_control_analyzed.contains("direct_winner_projection_mode=disabled"));
+        assert!(append_direct_analyzed.contains("fused_output_fields=0"));
+        assert!(append_direct_analyzed.contains("direct_winner_projection_mode=enabled"));
+        for analyzed in [&append_control_analyzed, &append_direct_analyzed] {
+            assert_eq!(
+                analyzed_metric_count(analyzed, "plaid_fused_final_take_queries"),
+                0
+            );
+            assert_eq!(
+                analyzed_metric_count(analyzed, "plaid_fused_final_take_direct_projection_queries",),
+                0
+            );
+            assert_eq!(
+                analyzed_metric_count(analyzed, "plaid_fused_final_take_legacy_projection_queries",),
+                0
+            );
+        }
+        assert_eq!(append_direct.schema(), append_control.schema());
+        assert_eq!(append_direct, append_control);
         assert!(
-            append_result["id"]
+            append_direct["id"]
                 .as_primitive::<arrow::datatypes::Int32Type>()
                 .values()
                 .contains(&99)
@@ -1742,12 +1828,25 @@ mod tests {
             dataset.delete("id IN (0, 4, 8)").await.unwrap();
 
             let (fused_control, _, fused_control_takes) =
-                grouped_semantic_search(&dataset, true, false, false).await;
+                grouped_semantic_search(&dataset, true, false, false, false).await;
+            let (fused_grouped_legacy, legacy_analyzed, fused_grouped_legacy_takes) =
+                grouped_semantic_search(&dataset, true, true, false, false).await;
             let (fused_grouped, fused_analyzed, fused_grouped_takes) =
-                grouped_semantic_search(&dataset, true, true, false).await;
+                grouped_semantic_search(&dataset, true, true, true, false).await;
             assert_eq!(fused_control_takes, 0);
+            assert_eq!(fused_grouped_legacy_takes, 0);
             assert_eq!(fused_grouped_takes, 0);
-            assert_eq!(fused_grouped, fused_control);
+            assert_eq!(fused_grouped_legacy, fused_control);
+            assert_eq!(fused_grouped, fused_grouped_legacy);
+            assert!(legacy_analyzed.contains("direct_winner_projection_mode=disabled"));
+            assert!(legacy_analyzed.contains("plaid_fused_final_take_legacy_projection_queries=1"));
+            assert!(legacy_analyzed.contains("plaid_fused_final_take_legacy_projection_sub_time="));
+            assert!(
+                !legacy_analyzed.contains("plaid_fused_final_take_direct_projection_queries=1")
+            );
+            assert!(fused_analyzed.contains("direct_winner_projection_mode=enabled"));
+            assert!(fused_analyzed.contains("plaid_fused_final_take_direct_projection_queries=1"));
+            assert!(!fused_analyzed.contains("plaid_fused_final_take_legacy_projection_queries=1"));
             assert!(fused_analyzed.contains("plaid_grouped_refinement_queries=1"));
             assert!(fused_analyzed.contains("plaid_grouped_refinement_batches=3"));
             assert!(fused_analyzed.contains("plaid_grouped_refinement_rows=6"));
@@ -1755,6 +1854,7 @@ mod tests {
             assert!(fused_analyzed.contains("plaid_fused_final_take_candidate_rows=6"));
             assert!(fused_analyzed.contains("plaid_fused_final_take_select_sub_time="));
             assert!(fused_analyzed.contains("plaid_fused_final_take_logical_projection_sub_time="));
+            assert!(fused_analyzed.contains("plaid_fused_final_take_direct_projection_sub_time="));
             assert!(fused_analyzed.contains("plaid_fused_final_take_json_conversion_sub_time="));
             assert!(fused_analyzed.contains("plaid_fused_final_take_assembly_sub_time="));
             assert_eq!(
@@ -1803,10 +1903,91 @@ mod tests {
                 }
             }
 
+            // Postfilter runs after PLAID top-k. The filter-only nested field is
+            // carried through the fused read but must be removed from the final
+            // projection; direct and legacy projector paths must be bit-exact.
+            let (postfilter_legacy, postfilter_legacy_analyzed, postfilter_legacy_takes) =
+                direct_projection_search(&dataset, false, Some("payload.lang >= 13")).await;
+            let (postfilter_direct, postfilter_direct_analyzed, postfilter_direct_takes) =
+                direct_projection_search(&dataset, true, Some("payload.lang >= 13")).await;
+            assert_eq!(postfilter_legacy_takes, 0);
+            assert_eq!(postfilter_direct_takes, 0);
+            assert_eq!(
+                analyzed_metric_count(
+                    &postfilter_legacy_analyzed,
+                    "plaid_fused_final_take_legacy_projection_queries",
+                ),
+                1
+            );
+            assert_eq!(
+                analyzed_metric_count(
+                    &postfilter_legacy_analyzed,
+                    "plaid_fused_final_take_direct_projection_queries",
+                ),
+                0
+            );
+            assert_eq!(
+                analyzed_metric_count(
+                    &postfilter_direct_analyzed,
+                    "plaid_fused_final_take_direct_projection_queries",
+                ),
+                1
+            );
+            assert_eq!(
+                analyzed_metric_count(
+                    &postfilter_direct_analyzed,
+                    "plaid_fused_final_take_legacy_projection_queries",
+                ),
+                0
+            );
+            assert_eq!(postfilter_direct.schema(), postfilter_legacy.schema());
+            assert_eq!(
+                postfilter_direct["id"]
+                    .as_primitive::<arrow::datatypes::Int32Type>()
+                    .values(),
+                postfilter_legacy["id"]
+                    .as_primitive::<arrow::datatypes::Int32Type>()
+                    .values()
+            );
+            assert_eq!(
+                postfilter_direct[lance_core::ROW_ID]
+                    .as_primitive::<UInt64Type>()
+                    .values(),
+                postfilter_legacy[lance_core::ROW_ID]
+                    .as_primitive::<UInt64Type>()
+                    .values()
+            );
+            let direct_distance_bits = postfilter_direct[DIST_COL]
+                .as_primitive::<Float32Type>()
+                .values()
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>();
+            let legacy_distance_bits = postfilter_legacy[DIST_COL]
+                .as_primitive::<Float32Type>()
+                .values()
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>();
+            assert_eq!(direct_distance_bits, legacy_distance_bits);
+            assert_eq!(postfilter_direct, postfilter_legacy);
+            assert!(
+                postfilter_direct
+                    .schema()
+                    .field_with_name("payload.lang")
+                    .is_err()
+            );
+            let mut postfilter_ids = postfilter_direct["id"]
+                .as_primitive::<arrow::datatypes::Int32Type>()
+                .values()
+                .to_vec();
+            postfilter_ids.sort_unstable();
+            assert_eq!(postfilter_ids, [3, 5, 7]);
+
             let (nonfused_control, _, nonfused_control_takes) =
-                grouped_semantic_search(&dataset, false, false, false).await;
+                grouped_semantic_search(&dataset, false, false, false, false).await;
             let (nonfused_grouped, nonfused_analyzed, nonfused_grouped_takes) =
-                grouped_semantic_search(&dataset, false, true, false).await;
+                grouped_semantic_search(&dataset, false, true, false, false).await;
             assert!(nonfused_control_takes >= 1);
             assert!(nonfused_grouped_takes >= 1);
             assert_eq!(nonfused_grouped, nonfused_control);
@@ -1815,7 +1996,7 @@ mod tests {
             assert!(nonfused_analyzed.contains("plaid_grouped_refinement_batches=3"));
 
             let (empty, empty_analyzed, empty_takes) =
-                grouped_semantic_search(&dataset, true, true, true).await;
+                grouped_semantic_search(&dataset, true, true, true, true).await;
             assert_eq!(empty_takes, 0);
             assert_eq!(empty.num_rows(), 0);
             assert!(empty_analyzed.contains("plaid_grouped_refinement_queries=1"));
