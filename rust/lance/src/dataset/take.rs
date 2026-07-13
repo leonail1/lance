@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::BTreeMap, collections::HashMap, ops::Range, pin::Pin, sync::Arc};
+use std::{
+    collections::BTreeMap, collections::HashMap, ops::Range, pin::Pin, sync::Arc, time::Instant,
+};
 
-use crate::dataset::fragment::FragReadConfig;
+use crate::dataset::fragment::{FragReadConfig, FragmentTakePhaseStats};
 use crate::dataset::rowids::get_row_id_index;
 use crate::io::exec::AddRowOffsetExec;
 use crate::{Error, Result};
@@ -448,6 +450,60 @@ struct RowAddressStats {
     contiguous: bool,
 }
 
+/// Profile for one successful grouped physical read.
+///
+/// `parent_wall_nanos` encloses the complete helper. Plan, grouping, optional
+/// explicit-scheduler creation, fanout collection, and row-offset injection are
+/// one-time wall-clock phases. Fragment open and read are disjoint within each
+/// fragment but are aggregated across concurrently processed fragments; those
+/// aggregate work timers must not be added to the parent wall time.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct GroupedPhysicalReadStats {
+    pub parent_wall_nanos: u64,
+    pub plan_nanos: u64,
+    pub grouping_nanos: u64,
+    /// One-time wall for an explicitly managed scheduler. The strict control
+    /// leaves scheduler ownership inside fragment open and reports zero.
+    pub scheduler_create_wall_nanos: u64,
+    pub fragment_open_aggregate_nanos: u64,
+    pub fragment_open_max_nanos: u64,
+    pub fragment_read_aggregate_nanos: u64,
+    pub fragment_read_max_nanos: u64,
+    pub fragment_total_elapsed_aggregate_nanos: u64,
+    pub fragment_total_elapsed_max_nanos: u64,
+    pub fanout_collect_wall_nanos: u64,
+    pub fanout_concurrency_limit: usize,
+    pub row_offset_injection_wall_nanos: u64,
+    pub fragments: usize,
+    pub rows: usize,
+    pub batch_bytes: usize,
+    pub rows_per_fragment_min: usize,
+    pub rows_per_fragment_max: usize,
+    /// Post-coalescing physical I/O submitted through explicit schedulers.
+    /// This excludes deletion/stable-row-ID side reads and any legacy or
+    /// non-default-base file whose scheduler is managed internally.
+    pub scheduler_scoped_iops: u64,
+    pub scheduler_scoped_requests: u64,
+    pub scheduler_scoped_bytes_read: u64,
+    pub scheduler_stats_covered_fragments: usize,
+}
+
+#[derive(Debug)]
+pub(crate) struct GroupedPhysicalRead {
+    pub batches: Vec<RecordBatch>,
+    pub stats: GroupedPhysicalReadStats,
+}
+
+struct FragmentTakeOutcome {
+    batch: RecordBatch,
+    phases: FragmentTakePhaseStats,
+    total_elapsed_nanos: u64,
+}
+
+fn elapsed_nanos(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
 fn check_row_addrs(row_addrs: &[u64]) -> RowAddressStats {
     let mut sorted = true;
     let mut contiguous = true;
@@ -530,7 +586,10 @@ impl TakeBuilder {
     /// projection after selecting or concatenating rows. `None` means the
     /// request needs ID translation, address reordering, row-address injection,
     /// or empty-output schema recovery and must use `execute`.
-    pub(crate) async fn read_sorted_physical_by_fragment(self) -> Result<Option<Vec<RecordBatch>>> {
+    pub(crate) async fn read_sorted_physical_by_fragment(
+        self,
+    ) -> Result<Option<GroupedPhysicalRead>> {
+        let parent_started = Instant::now();
         if self.row_ids.is_some() || self.with_row_address {
             return Ok(None);
         }
@@ -553,9 +612,11 @@ impl TakeBuilder {
             .physical_projection
             .with_row_last_updated_at_version;
         let physical_schema = Arc::new(projection.physical_projection.to_bare_schema());
+        let plan_nanos = elapsed_nanos(parent_started);
 
         // Keep this helper local to make its Send bound explicit while the
-        // independent fragment reads are buffered.
+        // independent fragment reads are buffered. `buffered` below preserves
+        // fragment order even when later reads complete first.
         #[allow(clippy::manual_async_fn)]
         fn take_fragment(
             fragment: FileFragment,
@@ -565,21 +626,37 @@ impl TakeBuilder {
             with_row_address: bool,
             with_row_created_at_version: bool,
             with_row_last_updated_at_version: bool,
-        ) -> impl Future<Output = Result<RecordBatch>> + Send {
+        ) -> impl Future<Output = Result<FragmentTakeOutcome>> + Send {
             async move {
-                fragment
-                    .take_rows(
+                let fragment_started = Instant::now();
+                // Keep the control path's scheduler creation exactly where it
+                // was: FileFragment::open creates one internally for each
+                // projection-matching default-base V2 data file. The scoped
+                // scheduler fields remain unavailable until the opt-in shared
+                // path supplies an Arc.
+                let read_config = FragReadConfig::default()
+                    .with_row_id(with_row_id)
+                    .with_row_address(with_row_address)
+                    .with_row_created_at_version(with_row_created_at_version)
+                    .with_row_last_updated_at_version(with_row_last_updated_at_version);
+                let mut phases = FragmentTakePhaseStats::default();
+                let batch = fragment
+                    .take_rows_with_config(
                         &row_offsets,
                         projection.as_ref(),
-                        with_row_id,
-                        with_row_address,
-                        with_row_created_at_version,
-                        with_row_last_updated_at_version,
+                        read_config,
+                        Some(&mut phases),
                     )
-                    .await
+                    .await?;
+                Ok(FragmentTakeOutcome {
+                    batch,
+                    phases,
+                    total_elapsed_nanos: elapsed_nanos(fragment_started),
+                })
             }
         }
 
+        let grouping_started = Instant::now();
         let mut reads = Vec::new();
         let mut start = 0;
         while start < row_addrs.len() {
@@ -612,12 +689,52 @@ impl TakeBuilder {
             ));
             start = end;
         }
+        let grouping_nanos = elapsed_nanos(grouping_started);
 
-        let mut batches = futures::stream::iter(reads)
-            .buffered(self.dataset.object_store.io_parallelism())
+        let io_parallelism = self.dataset.object_store.io_parallelism();
+        let fanout_concurrency_limit = reads.len().min(io_parallelism);
+        let fanout_started = Instant::now();
+        let outcomes = futures::stream::iter(reads)
+            .buffered(io_parallelism)
             .try_collect::<Vec<_>>()
             .await?;
+        let fanout_collect_wall_nanos = elapsed_nanos(fanout_started);
+        let fragment_open_aggregate_nanos = outcomes.iter().fold(0_u64, |total, outcome| {
+            total.saturating_add(outcome.phases.open_nanos)
+        });
+        let fragment_open_max_nanos = outcomes
+            .iter()
+            .map(|outcome| outcome.phases.open_nanos)
+            .max()
+            .unwrap_or(0);
+        let fragment_read_aggregate_nanos = outcomes.iter().fold(0_u64, |total, outcome| {
+            total.saturating_add(outcome.phases.read_nanos)
+        });
+        let fragment_read_max_nanos = outcomes
+            .iter()
+            .map(|outcome| outcome.phases.read_nanos)
+            .max()
+            .unwrap_or(0);
+        let fragment_total_elapsed_aggregate_nanos =
+            outcomes.iter().fold(0_u64, |total, outcome| {
+                total.saturating_add(outcome.total_elapsed_nanos)
+            });
+        let fragment_total_elapsed_max_nanos = outcomes
+            .iter()
+            .map(|outcome| outcome.total_elapsed_nanos)
+            .max()
+            .unwrap_or(0);
+        let scheduler_scoped_iops = 0;
+        let scheduler_scoped_requests = 0;
+        let scheduler_scoped_bytes_read = 0;
+        let scheduler_stats_covered_fragments = 0;
+        let mut batches = outcomes
+            .into_iter()
+            .map(|outcome| outcome.batch)
+            .collect::<Vec<_>>();
+        let mut row_offset_injection_wall_nanos = 0;
         if projection.must_add_row_offset {
+            let row_offset_started = Instant::now();
             let returned_rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
             if returned_rows != row_addrs.len() {
                 return Err(Error::not_supported_source(format!(
@@ -641,9 +758,42 @@ impl TakeBuilder {
                 }
                 start += len;
             }
+            row_offset_injection_wall_nanos = elapsed_nanos(row_offset_started);
         }
 
-        Ok(Some(batches))
+        let rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+        let batch_bytes = batches
+            .iter()
+            .map(RecordBatch::get_array_memory_size)
+            .sum::<usize>();
+        let rows_per_fragment_min = batches.iter().map(RecordBatch::num_rows).min().unwrap_or(0);
+        let rows_per_fragment_max = batches.iter().map(RecordBatch::num_rows).max().unwrap_or(0);
+        let stats = GroupedPhysicalReadStats {
+            parent_wall_nanos: elapsed_nanos(parent_started),
+            plan_nanos,
+            grouping_nanos,
+            scheduler_create_wall_nanos: 0,
+            fragment_open_aggregate_nanos,
+            fragment_open_max_nanos,
+            fragment_read_aggregate_nanos,
+            fragment_read_max_nanos,
+            fragment_total_elapsed_aggregate_nanos,
+            fragment_total_elapsed_max_nanos,
+            fanout_collect_wall_nanos,
+            fanout_concurrency_limit,
+            row_offset_injection_wall_nanos,
+            fragments: batches.len(),
+            rows,
+            batch_bytes,
+            rows_per_fragment_min,
+            rows_per_fragment_max,
+            scheduler_scoped_iops,
+            scheduler_scoped_requests,
+            scheduler_scoped_bytes_read,
+            scheduler_stats_covered_fragments,
+        };
+
+        Ok(Some(GroupedPhysicalRead { batches, stats }))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -963,6 +1113,34 @@ mod test {
         .await
         .unwrap()
         .unwrap();
+        let stats = physical.stats;
+        assert_eq!(stats.fragments, 2);
+        assert_eq!(stats.rows, 2);
+        assert!(stats.batch_bytes > 0);
+        assert_eq!(stats.rows_per_fragment_min, 1);
+        assert_eq!(stats.rows_per_fragment_max, 1);
+        // The strict control keeps scheduler ownership inside Fragment::open,
+        // so no explicit scheduler is available for scoped I/O snapshots.
+        assert_eq!(stats.scheduler_stats_covered_fragments, 0);
+        assert_eq!(stats.scheduler_scoped_iops, 0);
+        assert_eq!(stats.scheduler_scoped_requests, 0);
+        assert_eq!(stats.scheduler_scoped_bytes_read, 0);
+        assert!(stats.parent_wall_nanos > 0);
+        assert!(stats.plan_nanos > 0);
+        assert!(stats.grouping_nanos > 0);
+        assert_eq!(stats.scheduler_create_wall_nanos, 0);
+        assert!(stats.fragment_open_aggregate_nanos > 0);
+        assert!(stats.fragment_open_max_nanos > 0);
+        assert!(stats.fragment_read_aggregate_nanos > 0);
+        assert!(stats.fragment_read_max_nanos > 0);
+        assert!(stats.fragment_total_elapsed_aggregate_nanos > 0);
+        assert!(stats.fragment_total_elapsed_max_nanos > 0);
+        assert!(stats.fanout_collect_wall_nanos > 0);
+        assert_eq!(stats.fanout_concurrency_limit, 2);
+        assert!(stats.row_offset_injection_wall_nanos > 0);
+        assert!(stats.plan_nanos.saturating_add(stats.grouping_nanos) <= stats.parent_wall_nanos);
+        assert!(stats.fragment_total_elapsed_max_nanos <= stats.parent_wall_nanos);
+        let physical = physical.batches;
         assert_eq!(physical.len(), 2);
         assert!(physical.iter().all(|batch| batch.num_rows() == 1));
         assert!(physical.iter().all(|batch| {

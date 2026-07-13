@@ -10,6 +10,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::Instant;
 
 use arrow::compute::concat_batches;
 use arrow_array::cast::as_primitive_array;
@@ -85,6 +86,17 @@ pub struct FileFragment {
     dataset: Arc<Dataset>,
 
     pub(super) metadata: Fragment,
+}
+
+/// Disjoint wall-clock phases within one fragment take.
+///
+/// The open and read intervals never overlap for one fragment.  Callers may
+/// aggregate these values across concurrently-read fragments, in which case
+/// the aggregate is work time and can exceed the parent wall-clock duration.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct FragmentTakePhaseStats {
+    pub open_nanos: u64,
+    pub read_nanos: u64,
 }
 
 const DEFAULT_BATCH_READ_SIZE: u32 = 1024;
@@ -1665,25 +1677,53 @@ impl FileFragment {
         with_row_created_at_version: bool,
         with_row_last_updated_at_version: bool,
     ) -> Result<RecordBatch> {
-        let reader = self
-            .open(
-                projection,
-                FragReadConfig::default()
-                    .with_row_id(with_row_id)
-                    .with_row_address(with_row_address)
-                    .with_row_created_at_version(with_row_created_at_version)
-                    .with_row_last_updated_at_version(with_row_last_updated_at_version),
-            )
-            .await?;
+        self.take_rows_with_config(
+            row_offsets,
+            projection,
+            FragReadConfig::default()
+                .with_row_id(with_row_id)
+                .with_row_address(with_row_address)
+                .with_row_created_at_version(with_row_created_at_version)
+                .with_row_last_updated_at_version(with_row_last_updated_at_version),
+            None,
+        )
+        .await
+    }
 
-        if row_offsets.len() > 1 && Self::row_ids_contiguous(row_offsets) {
+    /// Take rows using an explicit fragment read configuration.
+    ///
+    /// The optional phase sink is deliberately scoped to fragment open and row
+    /// read. The open wall includes the joined deletion-vector and stable-row-ID
+    /// side reads. Those side reads are not, however, submitted through an
+    /// explicitly supplied scan scheduler and therefore do not contribute to
+    /// that scheduler's scoped physical-I/O counters.
+    pub(crate) async fn take_rows_with_config(
+        &self,
+        row_offsets: &[u32],
+        projection: &Schema,
+        read_config: FragReadConfig,
+        mut phase_stats: Option<&mut FragmentTakePhaseStats>,
+    ) -> Result<RecordBatch> {
+        let open_started = phase_stats.is_some().then(Instant::now);
+        let reader = self.open(projection, read_config).await;
+        if let (Some(stats), Some(started)) = (phase_stats.as_mut(), open_started) {
+            stats.open_nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        }
+        let reader = reader?;
+
+        let read_started = phase_stats.is_some().then(Instant::now);
+        let result = if row_offsets.len() > 1 && Self::row_ids_contiguous(row_offsets) {
             let range =
                 (row_offsets[0] as usize)..(row_offsets[row_offsets.len() - 1] as usize + 1);
             reader.legacy_read_range_as_batch(range).await
         } else {
             // FIXME, change this method to streams
             reader.take_as_batch(row_offsets, None).await
+        };
+        if let (Some(stats), Some(started)) = (phase_stats.as_mut(), read_started) {
+            stats.read_nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         }
+        result
     }
 
     fn row_ids_contiguous(row_ids: &[u32]) -> bool {

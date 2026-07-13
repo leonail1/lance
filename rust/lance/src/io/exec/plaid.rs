@@ -154,9 +154,56 @@ const SORTED_RAW_TAKE_QUERY_COUNT: &str = "plaid_sorted_raw_take_queries";
 const SORTED_RAW_TAKE_ROWS_COUNT: &str = "plaid_sorted_raw_take_rows";
 const RAW_VECTOR_BYTES_COUNT: &str = "plaid_raw_vector_batch_bytes";
 const GROUPED_REFINEMENT_TIME: &str = "plaid_grouped_refinement_take_sub_time";
+const GROUPED_REFINEMENT_HELPER_WALL_TIME: &str = "plaid_grouped_refinement_helper_wall_sub_time";
+// The one-time plan and grouping timers are disjoint wall-clock sub-phases of
+// GROUPED_REFINEMENT_TIME. Fanout collection and row-offset injection are also
+// one-time wall sub-phases. Explicit shared-scheduler creation is another
+// one-time wall sub-phase (zero/unavailable for the strict control). The
+// per-fragment open/read/total timers are concurrent child-work sums (plus a
+// max critical-path proxy), so they are not additive with the parent wall.
+// Control open includes its internal per-file scheduler creation; treatment
+// open does not include the separately reported one-time shared creation.
+const GROUPED_REFINEMENT_PLAN_TIME: &str = "plaid_grouped_refinement_plan_sub_time";
+const GROUPED_REFINEMENT_GROUPING_TIME: &str = "plaid_grouped_refinement_grouping_sub_time";
+const GROUPED_REFINEMENT_FANOUT_COLLECT_WALL_TIME: &str =
+    "plaid_grouped_refinement_fanout_collect_wall_sub_time";
+const GROUPED_REFINEMENT_ROW_OFFSET_INJECTION_WALL_TIME: &str =
+    "plaid_grouped_refinement_row_offset_injection_wall_sub_time";
+const GROUPED_REFINEMENT_SCHEDULER_CREATE_WALL_TIME: &str =
+    "plaid_grouped_refinement_scheduler_create_wall_sub_time";
+const GROUPED_REFINEMENT_FRAGMENT_OPEN_SUM_TIME: &str =
+    "plaid_grouped_refinement_fragment_open_sum_time";
+const GROUPED_REFINEMENT_FRAGMENT_OPEN_MAX_TIME: &str =
+    "plaid_grouped_refinement_fragment_open_max_time";
+const GROUPED_REFINEMENT_FRAGMENT_READ_SUM_TIME: &str =
+    "plaid_grouped_refinement_fragment_read_sum_time";
+const GROUPED_REFINEMENT_FRAGMENT_READ_MAX_TIME: &str =
+    "plaid_grouped_refinement_fragment_read_max_time";
+const GROUPED_REFINEMENT_FRAGMENT_TOTAL_ELAPSED_SUM_TIME: &str =
+    "plaid_grouped_refinement_fragment_total_elapsed_sum_time";
+const GROUPED_REFINEMENT_FRAGMENT_TOTAL_ELAPSED_MAX_TIME: &str =
+    "plaid_grouped_refinement_fragment_total_elapsed_max_time";
 const GROUPED_REFINEMENT_QUERY_COUNT: &str = "plaid_grouped_refinement_queries";
 const GROUPED_REFINEMENT_BATCH_COUNT: &str = "plaid_grouped_refinement_batches";
 const GROUPED_REFINEMENT_ROWS_COUNT: &str = "plaid_grouped_refinement_rows";
+const GROUPED_REFINEMENT_FANOUT_CONCURRENCY_LIMIT_COUNT: &str =
+    "plaid_grouped_refinement_fanout_concurrency_limit";
+const GROUPED_REFINEMENT_BATCH_BYTES_COUNT: &str = "plaid_grouped_refinement_batch_bytes";
+const GROUPED_REFINEMENT_ROWS_PER_FRAGMENT_MIN_COUNT: &str =
+    "plaid_grouped_refinement_rows_per_fragment_min_per_query";
+const GROUPED_REFINEMENT_ROWS_PER_FRAGMENT_MAX_COUNT: &str =
+    "plaid_grouped_refinement_rows_per_fragment_max_per_query";
+// Scoped scheduler counters include only physical ranges submitted through
+// the explicit default-base V2 scheduler(s). They exclude stable-row-ID and
+// deletion side reads as well as legacy/non-default-base file I/O.
+const GROUPED_REFINEMENT_SCHEDULER_SCOPED_IOPS_COUNT: &str =
+    "plaid_grouped_refinement_scheduler_scoped_iops";
+const GROUPED_REFINEMENT_SCHEDULER_SCOPED_REQUESTS_COUNT: &str =
+    "plaid_grouped_refinement_scheduler_scoped_requests";
+const GROUPED_REFINEMENT_SCHEDULER_SCOPED_BYTES_READ_COUNT: &str =
+    "plaid_grouped_refinement_scheduler_scoped_bytes_read";
+const GROUPED_REFINEMENT_SCHEDULER_STATS_COVERED_FRAGMENTS_COUNT: &str =
+    "plaid_grouped_refinement_scheduler_stats_covered_fragments";
 const GROUPED_REFINEMENT_FALLBACK_COUNT: &str = "plaid_grouped_refinement_fallbacks";
 
 const DIRECT_RESIDUAL_ENABLED_ENV: &str = "LANCE_PLAID_DIRECT_RESIDUAL_ENABLED";
@@ -887,6 +934,18 @@ struct PlaidExecMetrics {
     exact: Time,
     sorted_raw_take: Time,
     grouped_refinement: Time,
+    grouped_refinement_helper_wall: Time,
+    grouped_refinement_plan: Time,
+    grouped_refinement_grouping: Time,
+    grouped_refinement_fanout_collect_wall: Time,
+    grouped_refinement_row_offset_injection_wall: Time,
+    grouped_refinement_scheduler_create_wall: Time,
+    grouped_refinement_fragment_open_sum: Time,
+    grouped_refinement_fragment_open_max: Time,
+    grouped_refinement_fragment_read_sum: Time,
+    grouped_refinement_fragment_read_max: Time,
+    grouped_refinement_fragment_total_elapsed_sum: Time,
+    grouped_refinement_fragment_total_elapsed_max: Time,
     fused_final_take: Time,
     fused_final_take_select: Time,
     fused_final_take_logical_projection: Time,
@@ -956,6 +1015,14 @@ struct PlaidExecMetrics {
     grouped_refinement_query_count: Count,
     grouped_refinement_batch_count: Count,
     grouped_refinement_rows_count: Count,
+    grouped_refinement_fanout_concurrency_limit_count: Count,
+    grouped_refinement_batch_bytes_count: Count,
+    grouped_refinement_rows_per_fragment_min_count: Count,
+    grouped_refinement_rows_per_fragment_max_count: Count,
+    grouped_refinement_scheduler_scoped_iops_count: Count,
+    grouped_refinement_scheduler_scoped_requests_count: Count,
+    grouped_refinement_scheduler_scoped_bytes_read_count: Count,
+    grouped_refinement_scheduler_stats_covered_fragments_count: Count,
     grouped_refinement_fallback_count: Count,
 }
 
@@ -982,6 +1049,33 @@ impl PlaidExecMetrics {
             exact: metrics.new_time(EXACT_TIME, partition),
             sorted_raw_take: metrics.new_time(SORTED_RAW_TAKE_TIME, partition),
             grouped_refinement: metrics.new_time(GROUPED_REFINEMENT_TIME, partition),
+            grouped_refinement_helper_wall: metrics
+                .new_time(GROUPED_REFINEMENT_HELPER_WALL_TIME, partition),
+            grouped_refinement_plan: metrics.new_time(GROUPED_REFINEMENT_PLAN_TIME, partition),
+            grouped_refinement_grouping: metrics
+                .new_time(GROUPED_REFINEMENT_GROUPING_TIME, partition),
+            grouped_refinement_fanout_collect_wall: metrics
+                .new_time(GROUPED_REFINEMENT_FANOUT_COLLECT_WALL_TIME, partition),
+            grouped_refinement_row_offset_injection_wall: metrics
+                .new_time(GROUPED_REFINEMENT_ROW_OFFSET_INJECTION_WALL_TIME, partition),
+            grouped_refinement_scheduler_create_wall: metrics
+                .new_time(GROUPED_REFINEMENT_SCHEDULER_CREATE_WALL_TIME, partition),
+            grouped_refinement_fragment_open_sum: metrics
+                .new_time(GROUPED_REFINEMENT_FRAGMENT_OPEN_SUM_TIME, partition),
+            grouped_refinement_fragment_open_max: metrics
+                .new_time(GROUPED_REFINEMENT_FRAGMENT_OPEN_MAX_TIME, partition),
+            grouped_refinement_fragment_read_sum: metrics
+                .new_time(GROUPED_REFINEMENT_FRAGMENT_READ_SUM_TIME, partition),
+            grouped_refinement_fragment_read_max: metrics
+                .new_time(GROUPED_REFINEMENT_FRAGMENT_READ_MAX_TIME, partition),
+            grouped_refinement_fragment_total_elapsed_sum: metrics.new_time(
+                GROUPED_REFINEMENT_FRAGMENT_TOTAL_ELAPSED_SUM_TIME,
+                partition,
+            ),
+            grouped_refinement_fragment_total_elapsed_max: metrics.new_time(
+                GROUPED_REFINEMENT_FRAGMENT_TOTAL_ELAPSED_MAX_TIME,
+                partition,
+            ),
             fused_final_take: metrics.new_time(FUSED_FINAL_TAKE_TIME, partition),
             fused_final_take_select: metrics.new_time(FUSED_FINAL_TAKE_SELECT_TIME, partition),
             fused_final_take_logical_projection: metrics
@@ -1088,6 +1182,28 @@ impl PlaidExecMetrics {
                 .new_count(GROUPED_REFINEMENT_BATCH_COUNT, partition),
             grouped_refinement_rows_count: metrics
                 .new_count(GROUPED_REFINEMENT_ROWS_COUNT, partition),
+            grouped_refinement_fanout_concurrency_limit_count: metrics
+                .new_count(GROUPED_REFINEMENT_FANOUT_CONCURRENCY_LIMIT_COUNT, partition),
+            grouped_refinement_batch_bytes_count: metrics
+                .new_count(GROUPED_REFINEMENT_BATCH_BYTES_COUNT, partition),
+            grouped_refinement_rows_per_fragment_min_count: metrics
+                .new_count(GROUPED_REFINEMENT_ROWS_PER_FRAGMENT_MIN_COUNT, partition),
+            grouped_refinement_rows_per_fragment_max_count: metrics
+                .new_count(GROUPED_REFINEMENT_ROWS_PER_FRAGMENT_MAX_COUNT, partition),
+            grouped_refinement_scheduler_scoped_iops_count: metrics
+                .new_count(GROUPED_REFINEMENT_SCHEDULER_SCOPED_IOPS_COUNT, partition),
+            grouped_refinement_scheduler_scoped_requests_count: metrics.new_count(
+                GROUPED_REFINEMENT_SCHEDULER_SCOPED_REQUESTS_COUNT,
+                partition,
+            ),
+            grouped_refinement_scheduler_scoped_bytes_read_count: metrics.new_count(
+                GROUPED_REFINEMENT_SCHEDULER_SCOPED_BYTES_READ_COUNT,
+                partition,
+            ),
+            grouped_refinement_scheduler_stats_covered_fragments_count: metrics.new_count(
+                GROUPED_REFINEMENT_SCHEDULER_STATS_COVERED_FRAGMENTS_COUNT,
+                partition,
+            ),
             grouped_refinement_fallback_count: metrics
                 .new_count(GROUPED_REFINEMENT_FALLBACK_COUNT, partition),
         }
@@ -1699,29 +1815,109 @@ async fn execute_search(
     let grouped_attempt = grouped_refinement_config.enabled
         && fragment_count.is_some_and(|fragment_count| fragment_count > 1);
     let raw_vector_fetch_started = Instant::now();
-    let grouped_batches = if grouped_attempt {
-        let grouped_started = Instant::now();
-        let result = TakeBuilder::try_new_from_addresses(
+    // Preserve the historical grouped timer boundary: it starts before
+    // TakeBuilder construction and includes a failed specialization attempt.
+    let grouped_started = grouped_attempt.then(Instant::now);
+    let grouped_read = if grouped_attempt {
+        TakeBuilder::try_new_from_addresses(
             dataset.clone(),
             row_addresses.clone(),
             projection.clone(),
         )?
         .read_sorted_physical_by_fragment()
-        .await?;
-        metrics
-            .grouped_refinement
-            .add_duration(grouped_started.elapsed());
-        result
+        .await?
     } else {
         None
     };
-    let (batches, grouped_physical_batches) = if let Some(batches) = grouped_batches {
+    if let Some(grouped_started) = grouped_started {
+        metrics
+            .grouped_refinement
+            .add_duration(grouped_started.elapsed());
+    }
+    let (batches, grouped_physical_batches) = if let Some(grouped_read) = grouped_read {
+        let grouped_stats = grouped_read.stats;
+        metrics
+            .grouped_refinement_helper_wall
+            .add_duration(Duration::from_nanos(grouped_stats.parent_wall_nanos));
+        metrics
+            .grouped_refinement_plan
+            .add_duration(Duration::from_nanos(grouped_stats.plan_nanos));
+        metrics
+            .grouped_refinement_grouping
+            .add_duration(Duration::from_nanos(grouped_stats.grouping_nanos));
+        metrics
+            .grouped_refinement_fanout_collect_wall
+            .add_duration(Duration::from_nanos(
+                grouped_stats.fanout_collect_wall_nanos,
+            ));
+        metrics
+            .grouped_refinement_row_offset_injection_wall
+            .add_duration(Duration::from_nanos(
+                grouped_stats.row_offset_injection_wall_nanos,
+            ));
+        metrics
+            .grouped_refinement_scheduler_create_wall
+            .add_duration(Duration::from_nanos(
+                grouped_stats.scheduler_create_wall_nanos,
+            ));
+        metrics
+            .grouped_refinement_fragment_open_sum
+            .add_duration(Duration::from_nanos(
+                grouped_stats.fragment_open_aggregate_nanos,
+            ));
+        metrics
+            .grouped_refinement_fragment_open_max
+            .add_duration(Duration::from_nanos(grouped_stats.fragment_open_max_nanos));
+        metrics
+            .grouped_refinement_fragment_read_sum
+            .add_duration(Duration::from_nanos(
+                grouped_stats.fragment_read_aggregate_nanos,
+            ));
+        metrics
+            .grouped_refinement_fragment_read_max
+            .add_duration(Duration::from_nanos(grouped_stats.fragment_read_max_nanos));
+        metrics
+            .grouped_refinement_fragment_total_elapsed_sum
+            .add_duration(Duration::from_nanos(
+                grouped_stats.fragment_total_elapsed_aggregate_nanos,
+            ));
+        metrics
+            .grouped_refinement_fragment_total_elapsed_max
+            .add_duration(Duration::from_nanos(
+                grouped_stats.fragment_total_elapsed_max_nanos,
+            ));
         metrics.grouped_refinement_query_count.add(1);
-        metrics.grouped_refinement_batch_count.add(batches.len());
+        metrics
+            .grouped_refinement_batch_count
+            .add(grouped_stats.fragments);
         metrics
             .grouped_refinement_rows_count
-            .add(batches.iter().map(RecordBatch::num_rows).sum());
-        (batches, true)
+            .add(grouped_stats.rows);
+        metrics
+            .grouped_refinement_fanout_concurrency_limit_count
+            .add(grouped_stats.fanout_concurrency_limit);
+        metrics
+            .grouped_refinement_batch_bytes_count
+            .add(grouped_stats.batch_bytes);
+        metrics
+            .grouped_refinement_rows_per_fragment_min_count
+            .add(grouped_stats.rows_per_fragment_min);
+        metrics
+            .grouped_refinement_rows_per_fragment_max_count
+            .add(grouped_stats.rows_per_fragment_max);
+        metrics
+            .grouped_refinement_scheduler_scoped_iops_count
+            .add(usize::try_from(grouped_stats.scheduler_scoped_iops).unwrap_or(usize::MAX));
+        metrics
+            .grouped_refinement_scheduler_scoped_requests_count
+            .add(usize::try_from(grouped_stats.scheduler_scoped_requests).unwrap_or(usize::MAX));
+        metrics
+            .grouped_refinement_scheduler_scoped_bytes_read_count
+            .add(usize::try_from(grouped_stats.scheduler_scoped_bytes_read).unwrap_or(usize::MAX));
+        metrics
+            .grouped_refinement_scheduler_stats_covered_fragments_count
+            .add(grouped_stats.scheduler_stats_covered_fragments);
+        (grouped_read.batches, true)
     } else {
         if grouped_refinement_config.enabled {
             metrics.grouped_refinement_fallback_count.add(1);
