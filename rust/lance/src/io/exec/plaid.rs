@@ -220,6 +220,10 @@ const GROUPED_SHARED_SCHEDULER_FALLBACK_NONPRIMARY_FRAGMENT_COUNT: &str =
 const GROUPED_SHARED_SCHEDULER_FALLBACK_UNSUPPORTED_FRAGMENT_COUNT: &str =
     "plaid_grouped_shared_scheduler_fallback_unsupported_fragments";
 const DATA_FILE_READER_CACHE_LOOKUP_SUM_TIME: &str = "plaid_data_file_reader_cache_lookup_sum_time";
+const DATA_FILE_READER_CACHE_GET_OR_OPEN_SUM_TIME: &str =
+    "plaid_data_file_reader_cache_get_or_open_sum_time";
+const DATA_FILE_READER_CACHE_COALESCED_WAIT_SUM_TIME: &str =
+    "plaid_data_file_reader_cache_coalesced_wait_sum_time";
 const DATA_FILE_READER_CACHE_ACQUIRE_SUM_TIME: &str =
     "plaid_data_file_reader_cache_acquire_sum_time";
 const DATA_FILE_READER_CACHE_PHYSICAL_OPEN_SUM_TIME: &str =
@@ -239,6 +243,8 @@ const DATA_FILE_READER_CACHE_FALLBACK_OPEN_FILE_COUNT: &str =
     "plaid_data_file_reader_cache_fallback_open_files";
 const DATA_FILE_READER_CACHE_OPEN_FAILURE_COUNT: &str =
     "plaid_data_file_reader_cache_open_failures";
+const DATA_FILE_READER_CACHE_FD_BUDGET_REJECTION_COUNT: &str =
+    "plaid_data_file_reader_cache_fd_budget_rejections";
 const DATA_FILE_READER_CACHE_RESIDENT_START_COUNT: &str =
     "plaid_data_file_reader_cache_resident_entries_start_approx";
 const DATA_FILE_READER_CACHE_RESIDENT_END_COUNT: &str =
@@ -248,6 +254,8 @@ const DATA_FILE_READER_CACHE_FD_SOFT_LIMIT_COUNT: &str =
     "plaid_data_file_reader_cache_fd_soft_limit";
 const DATA_FILE_READER_CACHE_FALLBACK_QUERY_COUNT: &str =
     "plaid_data_file_reader_cache_fallback_queries";
+const DATA_FILE_READER_CACHE_PARTIAL_FALLBACK_QUERY_COUNT: &str =
+    "plaid_data_file_reader_cache_partial_fallback_queries";
 const DATA_FILE_READER_CACHE_FALLBACK_LEGACY_FRAGMENT_COUNT: &str =
     "plaid_data_file_reader_cache_fallback_legacy_fragments";
 const DATA_FILE_READER_CACHE_FALLBACK_NONPRIMARY_FRAGMENT_COUNT: &str =
@@ -1134,6 +1142,8 @@ struct PlaidExecMetrics {
     grouped_refinement_fragment_total_elapsed_sum: Time,
     grouped_refinement_fragment_total_elapsed_max: Time,
     data_file_reader_cache_lookup_sum: Time,
+    data_file_reader_cache_get_or_open_sum: Time,
+    data_file_reader_cache_coalesced_wait_sum: Time,
     data_file_reader_cache_acquire_sum: Time,
     data_file_reader_cache_physical_open_sum: Time,
     data_file_reader_cache_bind_sum: Time,
@@ -1232,11 +1242,13 @@ struct PlaidExecMetrics {
     data_file_reader_cache_bypass_file_count: Count,
     data_file_reader_cache_fallback_open_file_count: Count,
     data_file_reader_cache_open_failure_count: Count,
+    data_file_reader_cache_fd_budget_rejection_count: Count,
     data_file_reader_cache_resident_start_count: Count,
     data_file_reader_cache_resident_end_count: Count,
     data_file_reader_cache_capacity_count: Count,
     data_file_reader_cache_fd_soft_limit_count: Count,
     data_file_reader_cache_fallback_query_count: Count,
+    data_file_reader_cache_partial_fallback_query_count: Count,
     data_file_reader_cache_fallback_legacy_fragment_count: Count,
     data_file_reader_cache_fallback_nonprimary_fragment_count: Count,
     data_file_reader_cache_fallback_nonlocal_fragment_count: Count,
@@ -1298,6 +1310,10 @@ impl PlaidExecMetrics {
             ),
             data_file_reader_cache_lookup_sum: metrics
                 .new_time(DATA_FILE_READER_CACHE_LOOKUP_SUM_TIME, partition),
+            data_file_reader_cache_get_or_open_sum: metrics
+                .new_time(DATA_FILE_READER_CACHE_GET_OR_OPEN_SUM_TIME, partition),
+            data_file_reader_cache_coalesced_wait_sum: metrics
+                .new_time(DATA_FILE_READER_CACHE_COALESCED_WAIT_SUM_TIME, partition),
             data_file_reader_cache_acquire_sum: metrics
                 .new_time(DATA_FILE_READER_CACHE_ACQUIRE_SUM_TIME, partition),
             data_file_reader_cache_physical_open_sum: metrics
@@ -1474,6 +1490,8 @@ impl PlaidExecMetrics {
                 .new_count(DATA_FILE_READER_CACHE_FALLBACK_OPEN_FILE_COUNT, partition),
             data_file_reader_cache_open_failure_count: metrics
                 .new_count(DATA_FILE_READER_CACHE_OPEN_FAILURE_COUNT, partition),
+            data_file_reader_cache_fd_budget_rejection_count: metrics
+                .new_count(DATA_FILE_READER_CACHE_FD_BUDGET_REJECTION_COUNT, partition),
             data_file_reader_cache_resident_start_count: metrics
                 .new_count(DATA_FILE_READER_CACHE_RESIDENT_START_COUNT, partition),
             data_file_reader_cache_resident_end_count: metrics
@@ -1484,6 +1502,10 @@ impl PlaidExecMetrics {
                 .new_count(DATA_FILE_READER_CACHE_FD_SOFT_LIMIT_COUNT, partition),
             data_file_reader_cache_fallback_query_count: metrics
                 .new_count(DATA_FILE_READER_CACHE_FALLBACK_QUERY_COUNT, partition),
+            data_file_reader_cache_partial_fallback_query_count: metrics.new_count(
+                DATA_FILE_READER_CACHE_PARTIAL_FALLBACK_QUERY_COUNT,
+                partition,
+            ),
             data_file_reader_cache_fallback_legacy_fragment_count: metrics.new_count(
                 DATA_FILE_READER_CACHE_FALLBACK_LEGACY_FRAGMENT_COUNT,
                 partition,
@@ -2269,6 +2291,16 @@ async fn execute_search(
                 grouped_stats.reader_cache_lookup_nanos,
             ));
         metrics
+            .data_file_reader_cache_get_or_open_sum
+            .add_duration(Duration::from_nanos(
+                grouped_stats.reader_cache_get_or_open_nanos,
+            ));
+        metrics
+            .data_file_reader_cache_coalesced_wait_sum
+            .add_duration(Duration::from_nanos(
+                grouped_stats.reader_cache_coalesced_wait_nanos,
+            ));
+        metrics
             .data_file_reader_cache_acquire_sum
             .add_duration(Duration::from_nanos(
                 grouped_stats.reader_cache_acquire_nanos,
@@ -2308,6 +2340,12 @@ async fn execute_search(
         metrics
             .data_file_reader_cache_open_failure_count
             .add(usize::try_from(grouped_stats.reader_cache_open_failures).unwrap_or(usize::MAX));
+        metrics
+            .data_file_reader_cache_fd_budget_rejection_count
+            .add(
+                usize::try_from(grouped_stats.reader_cache_fd_budget_rejections)
+                    .unwrap_or(usize::MAX),
+            );
         metrics.data_file_reader_cache_resident_start_count.add(
             usize::try_from(grouped_stats.reader_cache_resident_entries_start_approx)
                 .unwrap_or(usize::MAX),
@@ -2325,6 +2363,9 @@ async fn execute_search(
         metrics
             .data_file_reader_cache_fallback_query_count
             .add(grouped_stats.reader_cache_fallback_queries);
+        metrics
+            .data_file_reader_cache_partial_fallback_query_count
+            .add(grouped_stats.reader_cache_partial_fallback_queries);
         metrics
             .data_file_reader_cache_fallback_legacy_fragment_count
             .add(grouped_stats.reader_cache_fallback_legacy_fragments);

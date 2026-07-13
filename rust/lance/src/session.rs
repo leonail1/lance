@@ -32,10 +32,12 @@ pub(crate) mod index_extension;
 /// This can be used to share caches between multiple datasets, increasing the hit
 /// rate and reducing the amount of memory used.
 ///
-/// A session contains two different caches:
+/// A session contains three different caches:
 ///  - The index cache is used to cache opened indices and will cache index data
 ///  - The metadata cache is used to cache a variety of dataset metadata (more
 ///    details can be found in the [performance guide](https://lance.org/guide/performance/)
+///  - An internal, bounded data-file reader cache supports opt-in PLAID
+///    refinement without retaining query-scoped fragment state
 #[derive(Clone)]
 pub struct Session {
     /// Global cache for opened indices.

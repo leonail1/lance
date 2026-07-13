@@ -729,10 +729,20 @@ impl<'a> CleanupTask<'a> {
                     all_paths_to_remove.boxed()
                 };
 
+            let reader_cache = self.dataset.session.data_file_reader_cache.clone();
+            let object_store = self.dataset.object_store.clone();
             self.dataset
                 .object_store
                 .remove_stream(paths_to_delete)
-                .try_for_each(|_| future::ready(Ok(())))
+                .try_for_each(|path| {
+                    let reader_cache = reader_cache.clone();
+                    let object_store = object_store.clone();
+                    async move {
+                        reader_cache
+                            .invalidate_store_path(&object_store, &path)
+                            .await
+                    }
+                })
                 .await?;
         } else {
             // Drain the stream to populate stats, but do not call remove_stream.

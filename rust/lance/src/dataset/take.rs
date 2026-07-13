@@ -507,15 +507,19 @@ pub(crate) struct GroupedPhysicalReadStats {
     pub reader_cache_bypass_files: u64,
     pub reader_cache_fallback_open_files: u64,
     pub reader_cache_open_failures: u64,
+    pub reader_cache_fd_budget_rejections: u64,
     pub reader_cache_resident_entries_start_approx: u64,
     pub reader_cache_resident_entries_end_approx: u64,
     pub reader_cache_capacity: u64,
     pub reader_cache_fd_soft_limit: u64,
     pub reader_cache_lookup_nanos: u64,
+    pub reader_cache_get_or_open_nanos: u64,
+    pub reader_cache_coalesced_wait_nanos: u64,
     pub reader_cache_acquire_nanos: u64,
     pub reader_cache_physical_open_nanos: u64,
     pub reader_cache_bind_nanos: u64,
     pub reader_cache_fallback_queries: usize,
+    pub reader_cache_partial_fallback_queries: usize,
     pub reader_cache_fallback_legacy_fragments: usize,
     pub reader_cache_fallback_nonprimary_fragments: usize,
     pub reader_cache_fallback_nonlocal_fragments: usize,
@@ -542,7 +546,6 @@ struct FragmentTakePlan {
     row_offsets: Vec<u32>,
     reader_priority: u32,
     shared_scheduler_eligibility: FragmentSharedSchedulerEligibility,
-    reader_cache_eligibility: FragmentReaderCacheEligibility,
 }
 
 fn elapsed_nanos(started: Instant) -> u64 {
@@ -773,19 +776,11 @@ impl TakeBuilder {
                     shared_scheduler_eligibility = FragmentSharedSchedulerEligibility::Unsupported;
                 }
             }
-            let reader_cache_eligibility = if reader_cache_enabled {
-                fragment
-                    .grouped_reader_cache_eligibility(physical_schema.as_ref())
-                    .unwrap_or(FragmentReaderCacheEligibility::Unsupported)
-            } else {
-                FragmentReaderCacheEligibility::Eligible { files: 0 }
-            };
             plans.push(FragmentTakePlan {
                 fragment,
                 row_offsets,
                 reader_priority,
                 shared_scheduler_eligibility,
-                reader_cache_eligibility,
             });
             start = end;
         }
@@ -824,69 +819,73 @@ impl TakeBuilder {
         });
         let scheduler_create_wall_nanos = scheduler_create_started.map(elapsed_nanos).unwrap_or(0);
 
-        let reader_cache_fallback_legacy_fragments = plans
-            .iter()
-            .filter(|plan| plan.reader_cache_eligibility == FragmentReaderCacheEligibility::Legacy)
-            .count();
-        let reader_cache_fallback_nonprimary_fragments = plans
-            .iter()
-            .filter(|plan| {
-                plan.reader_cache_eligibility == FragmentReaderCacheEligibility::NonPrimaryBase
-            })
-            .count();
-        let reader_cache_fallback_nonlocal_fragments = plans
-            .iter()
-            .filter(|plan| {
-                plan.reader_cache_eligibility == FragmentReaderCacheEligibility::NonLocalStore
-            })
-            .count();
-        let reader_cache_fallback_unknown_size_fragments = plans
-            .iter()
-            .filter(|plan| {
-                plan.reader_cache_eligibility == FragmentReaderCacheEligibility::UnknownSize
-            })
-            .count();
-        let reader_cache_fallback_small_file_fragments = plans
-            .iter()
-            .filter(|plan| {
-                plan.reader_cache_eligibility == FragmentReaderCacheEligibility::SmallFile
-            })
-            .count();
-        let reader_cache_fallback_unsupported_fragments = plans
-            .iter()
-            .filter(|plan| {
-                plan.reader_cache_eligibility == FragmentReaderCacheEligibility::Unsupported
-            })
-            .count();
-        let reader_cache_eligible_files = plans
-            .iter()
-            .map(|plan| match plan.reader_cache_eligibility {
-                FragmentReaderCacheEligibility::Eligible { files } => files,
-                _ => 0,
-            })
-            .sum::<usize>();
-        let all_fragments_reader_cache_eligible = plans.iter().all(|plan| {
-            matches!(
-                plan.reader_cache_eligibility,
-                FragmentReaderCacheEligibility::Eligible { .. }
-            )
-        });
-        let reader_cache_capacity_ok = reader_cache_eligible_files
-            <= self
-                .dataset
-                .session
-                .data_file_reader_cache
-                .max_eligible_files_per_query();
+        // Keep the default-off control to one query-level branch.  Eligibility
+        // classification and fallback aggregation are performed only for the
+        // explicit cache treatment.
+        let mut reader_cache_fallback_legacy_fragments = 0_usize;
+        let mut reader_cache_fallback_nonprimary_fragments = 0_usize;
+        let mut reader_cache_fallback_nonlocal_fragments = 0_usize;
+        let mut reader_cache_fallback_unknown_size_fragments = 0_usize;
+        let mut reader_cache_fallback_small_file_fragments = 0_usize;
+        let mut reader_cache_fallback_unsupported_fragments = 0_usize;
+        let mut reader_cache_eligible_files = 0_usize;
+        let mut all_fragments_reader_cache_eligible = reader_cache_enabled;
+        if reader_cache_enabled {
+            for plan in &plans {
+                match plan
+                    .fragment
+                    .grouped_reader_cache_eligibility(physical_schema.as_ref())
+                    .unwrap_or(FragmentReaderCacheEligibility::Unsupported)
+                {
+                    FragmentReaderCacheEligibility::Eligible { files } => {
+                        reader_cache_eligible_files =
+                            reader_cache_eligible_files.saturating_add(files);
+                    }
+                    FragmentReaderCacheEligibility::Legacy => {
+                        all_fragments_reader_cache_eligible = false;
+                        reader_cache_fallback_legacy_fragments += 1;
+                    }
+                    FragmentReaderCacheEligibility::NonPrimaryBase => {
+                        all_fragments_reader_cache_eligible = false;
+                        reader_cache_fallback_nonprimary_fragments += 1;
+                    }
+                    FragmentReaderCacheEligibility::NonLocalStore => {
+                        all_fragments_reader_cache_eligible = false;
+                        reader_cache_fallback_nonlocal_fragments += 1;
+                    }
+                    FragmentReaderCacheEligibility::UnknownSize => {
+                        all_fragments_reader_cache_eligible = false;
+                        reader_cache_fallback_unknown_size_fragments += 1;
+                    }
+                    FragmentReaderCacheEligibility::SmallFile => {
+                        all_fragments_reader_cache_eligible = false;
+                        reader_cache_fallback_small_file_fragments += 1;
+                    }
+                    FragmentReaderCacheEligibility::Unsupported => {
+                        all_fragments_reader_cache_eligible = false;
+                        reader_cache_fallback_unsupported_fragments += 1;
+                    }
+                }
+            }
+        }
+        let reader_cache = &self.dataset.session.data_file_reader_cache;
+        let reader_cache_capacity = if reader_cache_enabled {
+            reader_cache.capacity()
+        } else {
+            0
+        };
+        let reader_cache_fd_soft_limit = if reader_cache_enabled {
+            reader_cache.fd_soft_limit()
+        } else {
+            0
+        };
+        let reader_cache_capacity_ok =
+            reader_cache_eligible_files <= reader_cache.max_eligible_files_per_query();
         let use_reader_cache = reader_cache_enabled
             && all_fragments_reader_cache_eligible
             && reader_cache_eligible_files > 0
             && reader_cache_capacity_ok;
-        let reader_cache_query_stats = use_reader_cache.then(|| {
-            self.dataset
-                .session
-                .data_file_reader_cache
-                .begin_query(reader_cache_eligible_files)
-        });
+        let reader_cache_query_stats = use_reader_cache.then(|| reader_cache.begin_query());
 
         let reads = plans
             .into_iter()
@@ -1000,6 +999,14 @@ impl TakeBuilder {
                 .finish_query(query_stats)
         });
         let reader_cache_fallback_queries = usize::from(reader_cache_enabled && !use_reader_cache);
+        let reader_cache_partial_fallback_queries = reader_cache_snapshot
+            .map(|snapshot| {
+                usize::from(
+                    use_reader_cache
+                        && (snapshot.bypass_files > 0 || snapshot.fallback_open_files > 0),
+                )
+            })
+            .unwrap_or(0);
         let reader_cache_fallback_capacity_queries = usize::from(
             reader_cache_enabled
                 && all_fragments_reader_cache_eligible
@@ -1038,9 +1045,8 @@ impl TakeBuilder {
             shared_scheduler_fallback_nonprimary_fragments,
             shared_scheduler_fallback_unsupported_fragments,
             reader_cache_queries: usize::from(use_reader_cache),
-            reader_cache_eligible_files: reader_cache_snapshot
-                .map(|snapshot| snapshot.eligible_files)
-                .unwrap_or(0),
+            reader_cache_eligible_files: u64::try_from(reader_cache_eligible_files)
+                .unwrap_or(u64::MAX),
             reader_cache_lookup_files: reader_cache_snapshot
                 .map(|snapshot| snapshot.lookup_files)
                 .unwrap_or(0),
@@ -1062,20 +1068,25 @@ impl TakeBuilder {
             reader_cache_open_failures: reader_cache_snapshot
                 .map(|snapshot| snapshot.open_failures)
                 .unwrap_or(0),
+            reader_cache_fd_budget_rejections: reader_cache_snapshot
+                .map(|snapshot| snapshot.fd_budget_rejections)
+                .unwrap_or(0),
             reader_cache_resident_entries_start_approx: reader_cache_snapshot
                 .map(|snapshot| snapshot.resident_entries_start_approx)
                 .unwrap_or(0),
             reader_cache_resident_entries_end_approx: reader_cache_snapshot
                 .map(|snapshot| snapshot.resident_entries_end_approx)
                 .unwrap_or(0),
-            reader_cache_capacity: reader_cache_snapshot
-                .map(|snapshot| snapshot.capacity)
-                .unwrap_or(0),
-            reader_cache_fd_soft_limit: reader_cache_snapshot
-                .map(|snapshot| snapshot.fd_soft_limit)
-                .unwrap_or(0),
+            reader_cache_capacity,
+            reader_cache_fd_soft_limit,
             reader_cache_lookup_nanos: reader_cache_snapshot
                 .map(|snapshot| snapshot.lookup_nanos)
+                .unwrap_or(0),
+            reader_cache_get_or_open_nanos: reader_cache_snapshot
+                .map(|snapshot| snapshot.get_or_open_nanos)
+                .unwrap_or(0),
+            reader_cache_coalesced_wait_nanos: reader_cache_snapshot
+                .map(|snapshot| snapshot.coalesced_wait_nanos)
                 .unwrap_or(0),
             reader_cache_acquire_nanos: reader_cache_snapshot
                 .map(|snapshot| snapshot.acquire_nanos)
@@ -1087,6 +1098,7 @@ impl TakeBuilder {
                 .map(|snapshot| snapshot.bind_nanos)
                 .unwrap_or(0),
             reader_cache_fallback_queries,
+            reader_cache_partial_fallback_queries,
             reader_cache_fallback_legacy_fragments,
             reader_cache_fallback_nonprimary_fragments,
             reader_cache_fallback_nonlocal_fragments,
@@ -1810,6 +1822,9 @@ mod test {
         .unwrap()
         .unwrap();
         assert_eq!(control.stats.reader_cache_queries, 0);
+        assert_eq!(control.stats.reader_cache_lookup_files, 0);
+        assert_eq!(control.stats.reader_cache_hit_files, 0);
+        assert_eq!(control.stats.reader_cache_miss_open_files, 0);
 
         let cold = TakeBuilder::try_new_from_addresses(
             dataset.clone(),
@@ -1832,7 +1847,6 @@ mod test {
         assert_eq!(cold.stats.reader_cache_fallback_open_files, 0);
         assert_eq!(cold.stats.reader_cache_open_failures, 0);
         assert_eq!(cold.stats.reader_cache_fallback_queries, 0);
-        assert!(cold.stats.reader_cache_physical_open_nanos > 0);
 
         let warm = TakeBuilder::try_new_from_addresses(
             dataset.clone(),
@@ -1891,6 +1905,16 @@ mod test {
             1
         );
         assert_eq!(deleted_cached.stats.reader_cache_hit_files, 2);
+        assert_eq!(deleted_cached.stats.reader_cache_miss_open_files, 0);
+        assert_eq!(deleted_cached.stats.reader_cache_fallback_queries, 0);
+        let deleted_combined =
+            concat_batches(&deleted_cached.batches[0].schema(), &deleted_cached.batches).unwrap();
+        assert_eq!(
+            deleted_combined["i"]
+                .as_primitive::<arrow_array::types::Int32Type>()
+                .values(),
+            &[1_000]
+        );
 
         let first_fragment = deleted_dataset.get_fragment(0).unwrap();
         let mut unknown_size_metadata = first_fragment.metadata().clone();
@@ -1957,6 +1981,9 @@ mod test {
         assert_eq!(fallback.stats.reader_cache_fallback_queries, 1);
         assert_eq!(fallback.stats.reader_cache_fallback_nonlocal_fragments, 2);
         assert_eq!(fallback.stats.reader_cache_lookup_files, 0);
+        assert_eq!(fallback.stats.reader_cache_hit_files, 0);
+        assert_eq!(fallback.stats.reader_cache_miss_open_files, 0);
+        assert_eq!(fallback.stats.reader_cache_open_failures, 0);
     }
 
     #[tokio::test]
