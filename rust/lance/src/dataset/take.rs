@@ -6,7 +6,8 @@ use std::{
 };
 
 use crate::dataset::fragment::{
-    FragReadConfig, FragmentSharedSchedulerEligibility, FragmentTakePhaseStats,
+    FragReadConfig, FragmentReaderCacheEligibility, FragmentSharedSchedulerEligibility,
+    FragmentTakePhaseStats,
 };
 use crate::dataset::rowids::get_row_id_index;
 use crate::io::exec::AddRowOffsetExec;
@@ -497,6 +498,31 @@ pub(crate) struct GroupedPhysicalReadStats {
     pub shared_scheduler_fallback_legacy_fragments: usize,
     pub shared_scheduler_fallback_nonprimary_fragments: usize,
     pub shared_scheduler_fallback_unsupported_fragments: usize,
+    pub reader_cache_queries: usize,
+    pub reader_cache_eligible_files: u64,
+    pub reader_cache_lookup_files: u64,
+    pub reader_cache_hit_files: u64,
+    pub reader_cache_miss_open_files: u64,
+    pub reader_cache_coalesced_files: u64,
+    pub reader_cache_bypass_files: u64,
+    pub reader_cache_fallback_open_files: u64,
+    pub reader_cache_open_failures: u64,
+    pub reader_cache_resident_entries_start: u64,
+    pub reader_cache_resident_entries_end: u64,
+    pub reader_cache_capacity: u64,
+    pub reader_cache_fd_soft_limit: u64,
+    pub reader_cache_lookup_nanos: u64,
+    pub reader_cache_acquire_nanos: u64,
+    pub reader_cache_physical_open_nanos: u64,
+    pub reader_cache_bind_nanos: u64,
+    pub reader_cache_fallback_queries: usize,
+    pub reader_cache_fallback_legacy_fragments: usize,
+    pub reader_cache_fallback_nonprimary_fragments: usize,
+    pub reader_cache_fallback_nonlocal_fragments: usize,
+    pub reader_cache_fallback_unknown_size_fragments: usize,
+    pub reader_cache_fallback_small_file_fragments: usize,
+    pub reader_cache_fallback_unsupported_fragments: usize,
+    pub reader_cache_fallback_capacity_queries: usize,
 }
 
 #[derive(Debug)]
@@ -516,6 +542,7 @@ struct FragmentTakePlan {
     row_offsets: Vec<u32>,
     reader_priority: u32,
     shared_scheduler_eligibility: FragmentSharedSchedulerEligibility,
+    reader_cache_eligibility: FragmentReaderCacheEligibility,
 }
 
 fn elapsed_nanos(started: Instant) -> u64 {
@@ -607,7 +634,7 @@ impl TakeBuilder {
     pub(crate) async fn read_sorted_physical_by_fragment(
         self,
     ) -> Result<Option<GroupedPhysicalRead>> {
-        self.read_sorted_physical_by_fragment_with_shared_scheduler(false)
+        self.read_sorted_physical_by_fragment_with_options(false, false)
             .await
     }
 
@@ -621,6 +648,17 @@ impl TakeBuilder {
     pub(crate) async fn read_sorted_physical_by_fragment_with_shared_scheduler(
         self,
         shared_scheduler_enabled: bool,
+    ) -> Result<Option<GroupedPhysicalRead>> {
+        self.read_sorted_physical_by_fragment_with_options(shared_scheduler_enabled, false)
+            .await
+    }
+
+    /// Internal grouped-read options used by PLAID experiments.  Both
+    /// optimizations are whole-query gated and default off.
+    pub(crate) async fn read_sorted_physical_by_fragment_with_options(
+        self,
+        shared_scheduler_enabled: bool,
+        reader_cache_enabled: bool,
     ) -> Result<Option<GroupedPhysicalRead>> {
         let parent_started = Instant::now();
         if self.row_ids.is_some() || self.with_row_address {
@@ -656,6 +694,9 @@ impl TakeBuilder {
             row_offsets: Vec<u32>,
             projection: Arc<Schema>,
             shared_scheduler: Option<Arc<ScanScheduler>>,
+            reader_cache_query_stats: Option<
+                Arc<crate::session::data_file_reader_cache::ReaderCacheQueryStats>,
+            >,
             reader_priority: u32,
             with_row_id: bool,
             with_row_address: bool,
@@ -678,6 +719,10 @@ impl TakeBuilder {
                     read_config = read_config
                         .with_scan_scheduler(shared_scheduler)
                         .with_reader_priority(reader_priority);
+                }
+                if let Some(reader_cache_query_stats) = reader_cache_query_stats {
+                    read_config =
+                        read_config.with_reader_cache_query_stats(reader_cache_query_stats);
                 }
                 let mut phases = FragmentTakePhaseStats::default();
                 let batch = fragment
@@ -728,11 +773,19 @@ impl TakeBuilder {
                     shared_scheduler_eligibility = FragmentSharedSchedulerEligibility::Unsupported;
                 }
             }
+            let reader_cache_eligibility = if reader_cache_enabled {
+                fragment
+                    .grouped_reader_cache_eligibility(physical_schema.as_ref())
+                    .unwrap_or(FragmentReaderCacheEligibility::Unsupported)
+            } else {
+                FragmentReaderCacheEligibility::Eligible { files: 0 }
+            };
             plans.push(FragmentTakePlan {
                 fragment,
                 row_offsets,
                 reader_priority,
                 shared_scheduler_eligibility,
+                reader_cache_eligibility,
             });
             start = end;
         }
@@ -771,6 +824,70 @@ impl TakeBuilder {
         });
         let scheduler_create_wall_nanos = scheduler_create_started.map(elapsed_nanos).unwrap_or(0);
 
+        let reader_cache_fallback_legacy_fragments = plans
+            .iter()
+            .filter(|plan| plan.reader_cache_eligibility == FragmentReaderCacheEligibility::Legacy)
+            .count();
+        let reader_cache_fallback_nonprimary_fragments = plans
+            .iter()
+            .filter(|plan| {
+                plan.reader_cache_eligibility == FragmentReaderCacheEligibility::NonPrimaryBase
+            })
+            .count();
+        let reader_cache_fallback_nonlocal_fragments = plans
+            .iter()
+            .filter(|plan| {
+                plan.reader_cache_eligibility == FragmentReaderCacheEligibility::NonLocalStore
+            })
+            .count();
+        let reader_cache_fallback_unknown_size_fragments = plans
+            .iter()
+            .filter(|plan| {
+                plan.reader_cache_eligibility == FragmentReaderCacheEligibility::UnknownSize
+            })
+            .count();
+        let reader_cache_fallback_small_file_fragments = plans
+            .iter()
+            .filter(|plan| {
+                plan.reader_cache_eligibility == FragmentReaderCacheEligibility::SmallFile
+            })
+            .count();
+        let reader_cache_fallback_unsupported_fragments = plans
+            .iter()
+            .filter(|plan| {
+                plan.reader_cache_eligibility == FragmentReaderCacheEligibility::Unsupported
+            })
+            .count();
+        let reader_cache_eligible_files = plans
+            .iter()
+            .map(|plan| match plan.reader_cache_eligibility {
+                FragmentReaderCacheEligibility::Eligible { files } => files,
+                _ => 0,
+            })
+            .sum::<usize>();
+        let all_fragments_reader_cache_eligible = plans.iter().all(|plan| {
+            matches!(
+                plan.reader_cache_eligibility,
+                FragmentReaderCacheEligibility::Eligible { .. }
+            )
+        });
+        let reader_cache_capacity_ok = reader_cache_eligible_files
+            <= self
+                .dataset
+                .session
+                .data_file_reader_cache
+                .max_files_per_query();
+        let use_reader_cache = reader_cache_enabled
+            && all_fragments_reader_cache_eligible
+            && reader_cache_eligible_files > 0
+            && reader_cache_capacity_ok;
+        let reader_cache_query_stats = use_reader_cache.then(|| {
+            self.dataset
+                .session
+                .data_file_reader_cache
+                .begin_query(reader_cache_eligible_files)
+        });
+
         let reads = plans
             .into_iter()
             .map(|plan| {
@@ -779,6 +896,7 @@ impl TakeBuilder {
                     plan.row_offsets,
                     physical_schema.clone(),
                     shared_scheduler.clone(),
+                    reader_cache_query_stats.clone(),
                     plan.reader_priority,
                     with_row_id,
                     with_row_address,
@@ -875,6 +993,19 @@ impl TakeBuilder {
         let per_fragment_scheduler_fragments = if use_shared_scheduler { 0 } else { fragments };
         let shared_scheduler_fallback_queries =
             usize::from(shared_scheduler_enabled && !use_shared_scheduler);
+        let reader_cache_snapshot = reader_cache_query_stats.as_ref().map(|query_stats| {
+            self.dataset
+                .session
+                .data_file_reader_cache
+                .finish_query(query_stats)
+        });
+        let reader_cache_fallback_queries = usize::from(reader_cache_enabled && !use_reader_cache);
+        let reader_cache_fallback_capacity_queries = usize::from(
+            reader_cache_enabled
+                && all_fragments_reader_cache_eligible
+                && reader_cache_eligible_files > 0
+                && !reader_cache_capacity_ok,
+        );
         let stats = GroupedPhysicalReadStats {
             parent_wall_nanos: elapsed_nanos(parent_started),
             plan_nanos,
@@ -906,6 +1037,63 @@ impl TakeBuilder {
             shared_scheduler_fallback_legacy_fragments,
             shared_scheduler_fallback_nonprimary_fragments,
             shared_scheduler_fallback_unsupported_fragments,
+            reader_cache_queries: usize::from(use_reader_cache),
+            reader_cache_eligible_files: reader_cache_snapshot
+                .map(|snapshot| snapshot.eligible_files)
+                .unwrap_or(0),
+            reader_cache_lookup_files: reader_cache_snapshot
+                .map(|snapshot| snapshot.lookup_files)
+                .unwrap_or(0),
+            reader_cache_hit_files: reader_cache_snapshot
+                .map(|snapshot| snapshot.hit_files)
+                .unwrap_or(0),
+            reader_cache_miss_open_files: reader_cache_snapshot
+                .map(|snapshot| snapshot.miss_open_files)
+                .unwrap_or(0),
+            reader_cache_coalesced_files: reader_cache_snapshot
+                .map(|snapshot| snapshot.coalesced_files)
+                .unwrap_or(0),
+            reader_cache_bypass_files: reader_cache_snapshot
+                .map(|snapshot| snapshot.bypass_files)
+                .unwrap_or(0),
+            reader_cache_fallback_open_files: reader_cache_snapshot
+                .map(|snapshot| snapshot.fallback_open_files)
+                .unwrap_or(0),
+            reader_cache_open_failures: reader_cache_snapshot
+                .map(|snapshot| snapshot.open_failures)
+                .unwrap_or(0),
+            reader_cache_resident_entries_start: reader_cache_snapshot
+                .map(|snapshot| snapshot.resident_entries_start)
+                .unwrap_or(0),
+            reader_cache_resident_entries_end: reader_cache_snapshot
+                .map(|snapshot| snapshot.resident_entries_end)
+                .unwrap_or(0),
+            reader_cache_capacity: reader_cache_snapshot
+                .map(|snapshot| snapshot.capacity)
+                .unwrap_or(0),
+            reader_cache_fd_soft_limit: reader_cache_snapshot
+                .map(|snapshot| snapshot.fd_soft_limit)
+                .unwrap_or(0),
+            reader_cache_lookup_nanos: reader_cache_snapshot
+                .map(|snapshot| snapshot.lookup_nanos)
+                .unwrap_or(0),
+            reader_cache_acquire_nanos: reader_cache_snapshot
+                .map(|snapshot| snapshot.acquire_nanos)
+                .unwrap_or(0),
+            reader_cache_physical_open_nanos: reader_cache_snapshot
+                .map(|snapshot| snapshot.physical_open_nanos)
+                .unwrap_or(0),
+            reader_cache_bind_nanos: reader_cache_snapshot
+                .map(|snapshot| snapshot.bind_nanos)
+                .unwrap_or(0),
+            reader_cache_fallback_queries,
+            reader_cache_fallback_legacy_fragments,
+            reader_cache_fallback_nonprimary_fragments,
+            reader_cache_fallback_nonlocal_fragments,
+            reader_cache_fallback_unknown_size_fragments,
+            reader_cache_fallback_small_file_fragments,
+            reader_cache_fallback_unsupported_fragments,
+            reader_cache_fallback_capacity_queries,
         };
 
         Ok(Some(GroupedPhysicalRead { batches, stats }))

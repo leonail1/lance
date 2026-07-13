@@ -89,6 +89,7 @@ datafusion-expr.workspace = true
 either.workspace = true
 snafu = { workspace = true }
 log = { workspace = true }
+libc = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
 permutation = { version = "0.4.0" }
@@ -113,7 +114,6 @@ lzma-sys = { version = "0.1" }
 lance-test-macros = { workspace = true }
 lance-datagen = { workspace = true }
 pretty_assertions = { workspace = true }
-libc = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 criterion = { workspace = true }
 approx.workspace = true

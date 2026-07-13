@@ -67,6 +67,7 @@ use super::{NewColumnTransform, WriteParams, schema_evolution};
 use crate::dataset::Dataset;
 use crate::dataset::fragment::session::FragmentSession;
 use crate::io::deletion::read_dataset_deletion_file;
+use crate::session::data_file_reader_cache::{DataFileReaderCacheKey, ReaderCacheQueryStats};
 
 /// Result of [`FileFragment::update_columns_with_offsets`]: updated fragment metadata, modified field ids,
 /// and physical row offsets that matched the join (for stable row-id version metadata).
@@ -108,6 +109,21 @@ pub(crate) enum FragmentSharedSchedulerEligibility {
     Eligible,
     Legacy,
     NonPrimaryBase,
+    Unsupported,
+}
+
+/// Conservative eligibility of one fragment for session-cached bare data-file
+/// readers.  The cache intentionally supports only ordinary local, primary-base
+/// V2 files whose size is already present in the manifest and is large enough
+/// that `ObjectStore::open_with_size` will not retain the complete file bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FragmentReaderCacheEligibility {
+    Eligible { files: usize },
+    Legacy,
+    NonPrimaryBase,
+    NonLocalStore,
+    UnknownSize,
+    SmallFile,
     Unsupported,
 }
 
@@ -698,6 +714,10 @@ pub struct FragReadConfig {
     pub reader_priority: Option<u32>,
     /// File reader options to use when reading data files.
     pub file_reader_options: Option<FileReaderOptions>,
+    /// Query-local counters also act as the opt-in token for the session's bare
+    /// data-file reader cache.  This remains crate-private so ordinary scans do
+    /// not accidentally opt in.
+    pub(crate) reader_cache_query_stats: Option<Arc<ReaderCacheQueryStats>>,
 }
 
 impl FragReadConfig {
@@ -740,6 +760,14 @@ impl FragReadConfig {
 
     pub fn with_file_reader_options(mut self, value: FileReaderOptions) -> Self {
         self.file_reader_options = Some(value);
+        self
+    }
+
+    pub(crate) fn with_reader_cache_query_stats(
+        mut self,
+        value: Arc<ReaderCacheQueryStats>,
+    ) -> Self {
+        self.reader_cache_query_stats = Some(value);
         self
     }
 }
@@ -953,6 +981,51 @@ impl FileFragment {
         })
     }
 
+    pub(crate) fn grouped_reader_cache_eligibility(
+        &self,
+        projection: &Schema,
+    ) -> Result<FragmentReaderCacheEligibility> {
+        if self.dataset.object_store.scheme() != "file" {
+            return Ok(FragmentReaderCacheEligibility::NonLocalStore);
+        }
+        let block_size = self.dataset.object_store.block_size();
+        let mut eligible_files = 0_usize;
+        for data_file in &self.metadata.files {
+            let data_file_schema = data_file.schema(self.dataset.schema());
+            let projected = projection.intersection_ignore_types(&data_file_schema)?;
+            if projected.fields.is_empty() {
+                continue;
+            }
+            if data_file.base_id.is_some() {
+                return Ok(FragmentReaderCacheEligibility::NonPrimaryBase);
+            }
+            let file_version = LanceFileVersion::try_from_major_minor(
+                data_file.file_major_version,
+                data_file.file_minor_version,
+            )?;
+            if file_version == LanceFileVersion::Legacy {
+                return Ok(FragmentReaderCacheEligibility::Legacy);
+            }
+            let Some(known_size) = data_file.file_size_bytes.get() else {
+                return Ok(FragmentReaderCacheEligibility::UnknownSize);
+            };
+            let Ok(known_size) = usize::try_from(known_size.get()) else {
+                return Ok(FragmentReaderCacheEligibility::Unsupported);
+            };
+            if known_size <= block_size {
+                return Ok(FragmentReaderCacheEligibility::SmallFile);
+            }
+            eligible_files += 1;
+        }
+        Ok(if eligible_files == 0 {
+            FragmentReaderCacheEligibility::Unsupported
+        } else {
+            FragmentReaderCacheEligibility::Eligible {
+                files: eligible_files,
+            }
+        })
+    }
+
     /// Gets the data file for a given field
     pub fn data_file_for_field(&self, field_id: u32) -> Option<&DataFile> {
         self.metadata
@@ -1133,6 +1206,10 @@ impl FileFragment {
                     .dataset
                     .data_file_dir(data_file)?
                     .join(data_file.path.as_str());
+                let file_version = LanceFileVersion::try_from_major_minor(
+                    data_file.file_major_version,
+                    data_file.file_minor_version,
+                )?;
                 let (store_scheduler, reader_priority) = if let Some(base_id) = data_file.base_id {
                     // TODO: make object stores for non-default bases reuse the same scan scheduler
                     //  currently we always create a new one
@@ -1156,13 +1233,63 @@ impl FileFragment {
                         0,
                     )
                 };
-                let file_scheduler = store_scheduler
-                    .open_file_with_priority(
-                        &path,
-                        reader_priority as u64,
-                        &data_file.file_size_bytes,
-                    )
-                    .await?;
+                let cache_stats = read_config.reader_cache_query_stats.as_ref();
+                let cached_file_scheduler = if let Some(cache_stats) = cache_stats {
+                    let known_size = data_file
+                        .file_size_bytes
+                        .get()
+                        .and_then(|size| usize::try_from(size.get()).ok());
+                    if data_file.base_id.is_none()
+                        && self.dataset.object_store.scheme() == "file"
+                        && file_version != LanceFileVersion::Legacy
+                        && known_size
+                            .is_some_and(|size| size > self.dataset.object_store.block_size())
+                    {
+                        let key = DataFileReaderCacheKey::new(
+                            self.dataset.object_store.clone(),
+                            path.clone(),
+                            known_size.expect("checked above"),
+                            data_file.file_major_version,
+                            data_file.file_minor_version,
+                        );
+                        match self
+                            .dataset
+                            .session
+                            .data_file_reader_cache
+                            .get_or_open(key, cache_stats)
+                            .await
+                        {
+                            Ok(reader) => {
+                                let bind_started = Instant::now();
+                                let scheduler = store_scheduler
+                                    .open_reader(reader)
+                                    .with_priority(reader_priority as u64);
+                                cache_stats.add_bind_duration(bind_started.elapsed());
+                                Some(scheduler)
+                            }
+                            Err(_) => {
+                                cache_stats.record_fallback_open();
+                                None
+                            }
+                        }
+                    } else {
+                        cache_stats.record_bypass();
+                        None
+                    }
+                } else {
+                    None
+                };
+                let file_scheduler = if let Some(file_scheduler) = cached_file_scheduler {
+                    file_scheduler
+                } else {
+                    store_scheduler
+                        .open_file_with_priority(
+                            &path,
+                            reader_priority as u64,
+                            &data_file.file_size_bytes,
+                        )
+                        .await?
+                };
                 let path = file_scheduler.reader().path().clone();
                 let metadata_cache = self.dataset.metadata_cache.file_metadata_cache(&path);
                 let field_id_to_column_idx = Arc::new(BTreeMap::from_iter(
@@ -1179,10 +1306,6 @@ impl FileFragment {
                             }
                         }),
                 ));
-                let file_version = LanceFileVersion::try_from_major_minor(
-                    data_file.file_major_version,
-                    data_file.file_minor_version,
-                )?;
                 let reader_projection = ReaderProjection::from_field_ids(
                     file_version,
                     schema_per_file.as_ref(),
