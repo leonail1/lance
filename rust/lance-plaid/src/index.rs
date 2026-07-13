@@ -14,6 +14,13 @@ fn next_plaid_instance_id() -> u64 {
     NEXT_PLAID_INSTANCE_ID.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Exact values stored in document-ordinal order for database-native refinement.
+#[derive(Clone, Debug)]
+pub struct ExactStore {
+    pub public_row_ids: Vec<u64>,
+    pub raw_token_values: Vec<f32>,
+}
+
 /// Immutable PLAID data owned by one database index segment.
 #[derive(Debug)]
 pub struct PlaidIndex {
@@ -27,6 +34,7 @@ pub struct PlaidIndex {
     pub(crate) packed_residuals: Vec<u8>,
     pub(crate) posting_offsets: Vec<u64>,
     pub(crate) postings: Vec<u32>,
+    pub(crate) exact_store: Option<ExactStore>,
 }
 
 impl Clone for PlaidIndex {
@@ -42,6 +50,7 @@ impl Clone for PlaidIndex {
             packed_residuals: self.packed_residuals.clone(),
             posting_offsets: self.posting_offsets.clone(),
             postings: self.postings.clone(),
+            exact_store: self.exact_store.clone(),
         }
     }
 }
@@ -74,6 +83,41 @@ impl PlaidIndex {
         )
     }
 
+    /// Builds an immutable PLAID segment with an index-resident exact store.
+    ///
+    /// `public_row_ids` and raw token rows are both aligned with the same dense
+    /// document ordinals as `row_addresses` and `document_offsets`. The raw
+    /// values are flattened row-major with exactly `num_tokens * dimension`
+    /// finite `f32` values.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new_with_exact_store(
+        centroids: Array2<f32>,
+        quantizer: ResidualQuantizer,
+        row_addresses: Vec<u64>,
+        document_offsets: Vec<u64>,
+        token_codes: Vec<u32>,
+        packed_residuals: Vec<u8>,
+        public_row_ids: Vec<u64>,
+        raw_token_values: Vec<f32>,
+    ) -> Result<Self> {
+        let (posting_offsets, postings) =
+            Self::build_postings(centroids.nrows(), &document_offsets, &token_codes)?;
+        Self::try_from_parts_with_exact_store(
+            centroids,
+            quantizer,
+            row_addresses,
+            document_offsets,
+            token_codes,
+            packed_residuals,
+            posting_offsets,
+            postings,
+            Some(ExactStore {
+                public_row_ids,
+                raw_token_values,
+            }),
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_from_parts(
         centroids: Array2<f32>,
@@ -84,6 +128,31 @@ impl PlaidIndex {
         packed_residuals: Vec<u8>,
         posting_offsets: Vec<u64>,
         postings: Vec<u32>,
+    ) -> Result<Self> {
+        Self::try_from_parts_with_exact_store(
+            centroids,
+            quantizer,
+            row_addresses,
+            document_offsets,
+            token_codes,
+            packed_residuals,
+            posting_offsets,
+            postings,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_from_parts_with_exact_store(
+        centroids: Array2<f32>,
+        quantizer: ResidualQuantizer,
+        row_addresses: Vec<u64>,
+        document_offsets: Vec<u64>,
+        token_codes: Vec<u32>,
+        packed_residuals: Vec<u8>,
+        posting_offsets: Vec<u64>,
+        postings: Vec<u32>,
+        exact_store: Option<ExactStore>,
     ) -> Result<Self> {
         let dimension = centroids.ncols();
         let index = Self {
@@ -97,6 +166,7 @@ impl PlaidIndex {
             packed_residuals,
             posting_offsets,
             postings,
+            exact_store,
         };
         index.validate()?;
         Ok(index)
@@ -141,6 +211,66 @@ impl PlaidIndex {
         &self.row_addresses
     }
 
+    /// Whether this segment contains index-resident exact vectors.
+    pub fn has_exact_store(&self) -> bool {
+        self.exact_store.is_some()
+    }
+
+    /// Public row IDs in dense document-ordinal order, when present.
+    pub fn exact_store_row_ids(&self) -> Option<&[u64]> {
+        self.exact_store
+            .as_ref()
+            .map(|store| store.public_row_ids.as_slice())
+    }
+
+    /// Resolves a document ordinal to its exact-store public row ID.
+    pub fn exact_public_row_id(&self, document_ordinal: u32) -> Option<u64> {
+        self.exact_store
+            .as_ref()?
+            .public_row_ids
+            .get(document_ordinal as usize)
+            .copied()
+    }
+
+    /// Borrows one document's raw token matrix without copying.
+    ///
+    /// Returns `Ok(None)` for a V1 index without an exact store. An ordinal
+    /// outside this segment is rejected even when no exact store is present.
+    pub fn exact_document(&self, document_ordinal: u32) -> Result<Option<ArrayView2<'_, f32>>> {
+        let token_range = self.document_token_range(document_ordinal)?;
+        let Some(store) = &self.exact_store else {
+            return Ok(None);
+        };
+        let value_start = token_range
+            .start
+            .checked_mul(self.dimension)
+            .ok_or_else(|| {
+                Error::InvalidInput("exact document value offset overflow".to_string())
+            })?;
+        let value_end = token_range.end.checked_mul(self.dimension).ok_or_else(|| {
+            Error::InvalidInput("exact document value offset overflow".to_string())
+        })?;
+        let values = store
+            .raw_token_values
+            .get(value_start..value_end)
+            .ok_or_else(|| {
+                Error::InvalidInput("exact document value range is out of bounds".to_string())
+            })?;
+        Ok(Some(ArrayView2::from_shape(
+            (token_range.len(), self.dimension),
+            values,
+        )?))
+    }
+
+    pub(crate) fn exact_store_parts(&self) -> Option<(&[u64], &[f32])> {
+        self.exact_store.as_ref().map(|store| {
+            (
+                store.public_row_ids.as_slice(),
+                store.raw_token_values.as_slice(),
+            )
+        })
+    }
+
     /// Estimated in-memory bytes owned by the index's dense arrays.
     pub fn estimated_size_bytes(&self) -> usize {
         self.centroids.len() * std::mem::size_of::<f32>()
@@ -152,6 +282,14 @@ impl PlaidIndex {
             + self.packed_residuals.len()
             + self.posting_offsets.len() * std::mem::size_of::<u64>()
             + self.postings.len() * std::mem::size_of::<u32>()
+            + self
+                .exact_store
+                .as_ref()
+                .map(|store| {
+                    store.public_row_ids.len() * std::mem::size_of::<u64>()
+                        + store.raw_token_values.len() * std::mem::size_of::<f32>()
+                })
+                .unwrap_or(0)
     }
 
     /// Resolves a dense document ordinal to its database row address.
@@ -384,6 +522,38 @@ impl PlaidIndex {
             return Err(Error::InvalidInput(
                 "posting document ordinal exceeds document count".to_string(),
             ));
+        }
+        if let Some(store) = &self.exact_store {
+            if store.public_row_ids.len() != self.num_documents() {
+                return Err(Error::InvalidInput(format!(
+                    "exact-store public row ID length must be {}, got {}",
+                    self.num_documents(),
+                    store.public_row_ids.len()
+                )));
+            }
+            let expected_raw_len =
+                self.num_tokens()
+                    .checked_mul(self.dimension)
+                    .ok_or_else(|| {
+                        Error::InvalidInput(
+                            "exact-store raw token value length overflow".to_string(),
+                        )
+                    })?;
+            if store.raw_token_values.len() != expected_raw_len {
+                return Err(Error::InvalidInput(format!(
+                    "exact-store raw token value length must be {expected_raw_len}, got {}",
+                    store.raw_token_values.len()
+                )));
+            }
+            if store
+                .raw_token_values
+                .iter()
+                .any(|value| !value.is_finite())
+            {
+                return Err(Error::InvalidInput(
+                    "exact-store raw token values must be finite".to_string(),
+                ));
+            }
         }
         Ok(())
     }

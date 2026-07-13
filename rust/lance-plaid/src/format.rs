@@ -8,11 +8,13 @@ use std::path::Path;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use ndarray::Array2;
 
+use crate::index::ExactStore;
 use crate::{Error, PlaidIndex, ResidualQuantizer, Result};
 
 const MAGIC: [u8; 8] = *b"LPLDIDX\0";
 const ENDIAN_MARKER: u32 = 0x0102_0304;
 const HEADER_LEN: usize = 48;
+const EXACT_STORE_FLAG: u8 = 0x01;
 
 /// Version discriminator for the stable local PLAID file format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -20,6 +22,8 @@ const HEADER_LEN: usize = 48;
 pub enum PlaidFormatVersion {
     /// Initial format with fixed little-endian dense sections.
     V1 = 1,
+    /// Adds public row IDs and raw token values for exact refinement.
+    V2 = 2,
 }
 
 impl TryFrom<u16> for PlaidFormatVersion {
@@ -28,6 +32,7 @@ impl TryFrom<u16> for PlaidFormatVersion {
     fn try_from(value: u16) -> Result<Self> {
         match value {
             1 => Ok(Self::V1),
+            2 => Ok(Self::V2),
             _ => Err(Error::CorruptFile(format!(
                 "unsupported format version {value}"
             ))),
@@ -53,10 +58,15 @@ impl PlaidIndex {
     }
 
     fn write_to(&self, writer: &mut impl Write) -> Result<()> {
+        let (version, flags) = if self.has_exact_store() {
+            (PlaidFormatVersion::V2, EXACT_STORE_FLAG)
+        } else {
+            (PlaidFormatVersion::V1, 0)
+        };
         writer.write_all(&MAGIC)?;
-        writer.write_u16::<LittleEndian>(PlaidFormatVersion::V1 as u16)?;
+        writer.write_u16::<LittleEndian>(version as u16)?;
         writer.write_u8(self.quantizer.nbits())?;
-        writer.write_u8(0)?;
+        writer.write_u8(flags)?;
         writer.write_u32::<LittleEndian>(ENDIAN_MARKER)?;
         writer.write_u32::<LittleEndian>(u32_len(self.dimension, "dimension")?)?;
         writer.write_u32::<LittleEndian>(u32_len(self.num_centroids(), "centroid count")?)?;
@@ -78,6 +88,10 @@ impl PlaidIndex {
         writer.write_all(&self.packed_residuals)?;
         write_u64s(writer, &self.posting_offsets)?;
         write_u32s(writer, &self.postings)?;
+        if let Some((public_row_ids, raw_token_values)) = self.exact_store_parts() {
+            write_u64s(writer, public_row_ids)?;
+            write_f32s(writer, raw_token_values)?;
+        }
         Ok(())
     }
 
@@ -99,19 +113,15 @@ impl PlaidIndex {
         if magic != MAGIC {
             return Err(Error::CorruptFile(format!("invalid magic bytes {magic:?}")));
         }
-        let _version = PlaidFormatVersion::try_from(reader.read_u16::<LittleEndian>()?)?;
+        let version = PlaidFormatVersion::try_from(reader.read_u16::<LittleEndian>()?)?;
         let nbits = reader.read_u8()?;
         if !matches!(nbits, 2 | 4) {
             return Err(Error::CorruptFile(format!(
                 "nbits must be 2 or 4, got {nbits}"
             )));
         }
-        let reserved = reader.read_u8()?;
-        if reserved != 0 {
-            return Err(Error::CorruptFile(format!(
-                "reserved header byte must be zero, got {reserved}"
-            )));
-        }
+        let flags = reader.read_u8()?;
+        let has_exact_store = validate_flags(version, flags)?;
         let marker = reader.read_u32::<LittleEndian>()?;
         if marker != ENDIAN_MARKER {
             return Err(Error::CorruptFile(format!(
@@ -168,16 +178,29 @@ impl PlaidIndex {
                 .ok_or_else(|| Error::CorruptFile("posting offset count overflow".to_string()))?,
         )?;
         let postings = read_u32s(reader, num_postings)?;
+        let exact_store = if has_exact_store {
+            let public_row_ids = read_u64s(reader, num_documents)?;
+            let raw_value_count = num_tokens.checked_mul(dimension).ok_or_else(|| {
+                Error::CorruptFile("exact-store value count overflow".to_string())
+            })?;
+            let raw_token_values = read_f32s(reader, raw_value_count)?;
+            Some(ExactStore {
+                public_row_ids,
+                raw_token_values,
+            })
+        } else {
+            None
+        };
         let mut trailing = [0_u8; 1];
         if reader.read(&mut trailing)? != 0 {
             return Err(Error::CorruptFile(
-                "unexpected trailing bytes after posting section".to_string(),
+                "unexpected trailing bytes after final PLAID section".to_string(),
             ));
         }
 
         let centroids = Array2::from_shape_vec((num_centroids, dimension), centroid_values)
             .map_err(|error| Error::CorruptFile(error.to_string()))?;
-        Self::try_from_parts(
+        Self::try_from_parts_with_exact_store(
             centroids,
             quantizer,
             row_addresses,
@@ -186,6 +209,7 @@ impl PlaidIndex {
             packed_residuals,
             posting_offsets,
             postings,
+            exact_store,
         )
         .map_err(|error| Error::CorruptFile(error.to_string()))
     }
@@ -204,19 +228,15 @@ fn validate_encoded_len(bytes: &[u8]) -> Result<()> {
     if magic != MAGIC {
         return Err(Error::CorruptFile(format!("invalid magic bytes {magic:?}")));
     }
-    let _version = PlaidFormatVersion::try_from(reader.read_u16::<LittleEndian>()?)?;
+    let version = PlaidFormatVersion::try_from(reader.read_u16::<LittleEndian>()?)?;
     let nbits = reader.read_u8()?;
     if !matches!(nbits, 2 | 4) {
         return Err(Error::CorruptFile(format!(
             "nbits must be 2 or 4, got {nbits}"
         )));
     }
-    let reserved = reader.read_u8()?;
-    if reserved != 0 {
-        return Err(Error::CorruptFile(format!(
-            "reserved header byte must be zero, got {reserved}"
-        )));
-    }
+    let flags = reader.read_u8()?;
+    let has_exact_store = validate_flags(version, flags)?;
     let marker = reader.read_u32::<LittleEndian>()?;
     if marker != ENDIAN_MARKER {
         return Err(Error::CorruptFile(format!(
@@ -313,6 +333,23 @@ fn validate_encoded_len(bytes: &[u8]) -> Result<()> {
         std::mem::size_of::<u32>(),
         "postings",
     )?;
+    if has_exact_store {
+        expected = checked_section_len(
+            expected,
+            num_documents,
+            std::mem::size_of::<u64>(),
+            "exact-store public row IDs",
+        )?;
+        let raw_value_count = num_tokens
+            .checked_mul(dimension)
+            .ok_or_else(|| Error::CorruptFile("exact-store value count overflow".to_string()))?;
+        expected = checked_section_len(
+            expected,
+            raw_value_count,
+            std::mem::size_of::<f32>(),
+            "exact-store raw token values",
+        )?;
+    }
     if expected != bytes.len() {
         return Err(Error::CorruptFile(format!(
             "encoded length mismatch: header requires {expected} bytes, file has {}",
@@ -320,6 +357,22 @@ fn validate_encoded_len(bytes: &[u8]) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn validate_flags(version: PlaidFormatVersion, flags: u8) -> Result<bool> {
+    match version {
+        PlaidFormatVersion::V1 if flags == 0 => Ok(false),
+        PlaidFormatVersion::V1 => Err(Error::CorruptFile(format!(
+            "PLAID V1 flags must be zero, got {flags:#04x}"
+        ))),
+        PlaidFormatVersion::V2 if flags == EXACT_STORE_FLAG => Ok(true),
+        PlaidFormatVersion::V2 if flags & !EXACT_STORE_FLAG != 0 => Err(Error::CorruptFile(
+            format!("PLAID V2 contains unknown flags {flags:#04x}"),
+        )),
+        PlaidFormatVersion::V2 => Err(Error::CorruptFile(
+            "PLAID V2 requires the exact-store flag".to_string(),
+        )),
+    }
 }
 
 fn checked_section_len(current: usize, count: usize, width: usize, name: &str) -> Result<usize> {

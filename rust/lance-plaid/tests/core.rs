@@ -33,6 +33,73 @@ fn test_index(nbits: u8) -> PlaidIndex {
     .unwrap()
 }
 
+fn exact_test_index(nbits: u8) -> PlaidIndex {
+    let quantizer = match nbits {
+        2 => ResidualQuantizer::try_new(2, vec![-0.1, 0.0, 0.1], vec![0.0; 4]).unwrap(),
+        4 => ResidualQuantizer::try_new(
+            4,
+            (-7..8).map(|value| value as f32 / 100.0).collect(),
+            vec![0.0; 16],
+        )
+        .unwrap(),
+        _ => unreachable!(),
+    };
+    let centroids = array![[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]];
+    let residuals = Array2::<f32>::zeros((3, 4));
+    let packed_residuals = quantizer.quantize(residuals.view()).unwrap();
+    PlaidIndex::try_new_with_exact_store(
+        centroids,
+        quantizer,
+        vec![7, 42, 1001],
+        vec![0, 2, 2, 3],
+        vec![0, 1, 0],
+        packed_residuals,
+        vec![9001, 7007, 8008],
+        (1..=12).map(|value| value as f32).collect(),
+    )
+    .unwrap()
+}
+
+fn legacy_v1_fixture_bytes() -> Vec<u8> {
+    fn push_f32s(bytes: &mut Vec<u8>, values: &[f32]) {
+        for value in values {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    fn push_u32s(bytes: &mut Vec<u8>, values: &[u32]) {
+        for value in values {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    fn push_u64s(bytes: &mut Vec<u8>, values: &[u64]) {
+        for value in values {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"LPLDIDX\0");
+    bytes.extend_from_slice(&1_u16.to_le_bytes());
+    bytes.push(2);
+    bytes.push(0);
+    bytes.extend_from_slice(&0x0102_0304_u32.to_le_bytes());
+    bytes.extend_from_slice(&4_u32.to_le_bytes());
+    bytes.extend_from_slice(&2_u32.to_le_bytes());
+    bytes.extend_from_slice(&3_u64.to_le_bytes());
+    bytes.extend_from_slice(&3_u64.to_le_bytes());
+    bytes.extend_from_slice(&3_u64.to_le_bytes());
+    push_f32s(&mut bytes, &[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+    push_f32s(&mut bytes, &[-0.1, 0.0, 0.1]);
+    push_f32s(&mut bytes, &[0.0; 4]);
+    push_u64s(&mut bytes, &[7, 42, 1001]);
+    push_u64s(&mut bytes, &[0, 1, 2, 3]);
+    push_u32s(&mut bytes, &[0, 1, 0]);
+    bytes.extend_from_slice(&[0xaa; 3]);
+    push_u64s(&mut bytes, &[0, 2, 3]);
+    push_u32s(&mut bytes, &[0, 2, 1]);
+    bytes
+}
+
 fn exhaustive_params(top_k: usize) -> PlaidSearchParams {
     PlaidSearchParams {
         n_ivf_probe: 2,
@@ -499,6 +566,9 @@ fn versioned_file_round_trips_both_quantizers() {
         assert_eq!(restored.num_documents(), original.num_documents());
         assert_eq!(restored.num_tokens(), original.num_tokens());
         assert_eq!(restored.quantizer(), original.quantizer());
+        assert!(!restored.has_exact_store());
+        assert!(restored.exact_store_row_ids().is_none());
+        assert!(restored.exact_document(0).unwrap().is_none());
 
         let query = array![[1.0, 0.0, 0.0, 0.0]];
         let (expected, _) = original
@@ -512,12 +582,196 @@ fn versioned_file_round_trips_both_quantizers() {
 }
 
 #[test]
+fn v1_encoding_matches_the_frozen_legacy_fixture() {
+    let bytes = test_index(2).to_bytes().unwrap();
+    assert_eq!(bytes, legacy_v1_fixture_bytes());
+    assert_eq!(&bytes[8..10], &1_u16.to_le_bytes());
+    assert_eq!(bytes[11], 0);
+
+    let restored = PlaidIndex::read_from_bytes(&bytes).unwrap();
+    assert!(!restored.has_exact_store());
+    assert_eq!(restored.to_bytes().unwrap(), bytes);
+}
+
+#[test]
+fn v2_exact_store_round_trips_and_borrows_ordinal_aligned_documents() {
+    for nbits in [2, 4] {
+        let original = exact_test_index(nbits);
+        let base_size = test_index(nbits).estimated_size_bytes();
+        assert!(original.has_exact_store());
+        assert_eq!(
+            original.exact_store_row_ids(),
+            Some(&[9001, 7007, 8008][..])
+        );
+        assert_eq!(original.exact_public_row_id(0), Some(9001));
+        assert_eq!(original.exact_public_row_id(2), Some(8008));
+        assert_eq!(original.exact_public_row_id(3), None);
+        assert_eq!(
+            original.estimated_size_bytes() - base_size,
+            3 * std::mem::size_of::<u64>() + 12 * std::mem::size_of::<f32>()
+        );
+
+        let first = original.exact_document(0).unwrap().unwrap();
+        let empty = original.exact_document(1).unwrap().unwrap();
+        let third = original.exact_document(2).unwrap().unwrap();
+        assert_eq!(first.shape(), &[2, 4]);
+        assert_eq!(
+            first.as_slice().unwrap(),
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+        );
+        assert_eq!(empty.shape(), &[0, 4]);
+        assert!(empty.as_slice().unwrap().is_empty());
+        assert_eq!(third.as_slice().unwrap(), &[9.0, 10.0, 11.0, 12.0]);
+        assert_eq!(
+            third.as_ptr(),
+            first.as_ptr().wrapping_add(first.len()),
+            "adjacent views must borrow the contiguous exact-store allocation"
+        );
+        assert!(original.exact_document(3).is_err());
+
+        let cloned = original.clone();
+        assert!(cloned.has_exact_store());
+        assert_eq!(
+            cloned
+                .exact_document(2)
+                .unwrap()
+                .unwrap()
+                .as_slice()
+                .unwrap(),
+            &[9.0, 10.0, 11.0, 12.0]
+        );
+
+        let bytes = original.to_bytes().unwrap();
+        assert_eq!(&bytes[8..10], &2_u16.to_le_bytes());
+        assert_eq!(bytes[11], 1);
+        let restored = PlaidIndex::read_from_bytes(&bytes).unwrap();
+        assert!(restored.has_exact_store());
+        assert_eq!(
+            restored.exact_store_row_ids(),
+            original.exact_store_row_ids()
+        );
+        for ordinal in 0..original.num_documents() as u32 {
+            assert_eq!(
+                restored
+                    .exact_document(ordinal)
+                    .unwrap()
+                    .unwrap()
+                    .as_slice(),
+                original
+                    .exact_document(ordinal)
+                    .unwrap()
+                    .unwrap()
+                    .as_slice()
+            );
+        }
+        assert_eq!(restored.to_bytes().unwrap(), bytes);
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(format!("plaid-v2-{nbits}.bin"));
+        original.write_to_path(&path).unwrap();
+        assert!(PlaidIndex::read_from_path(path).unwrap().has_exact_store());
+    }
+}
+
+#[test]
+fn exact_store_constructor_rejects_invalid_lengths_and_non_finite_values() {
+    let make = |row_ids: Vec<u64>, raw: Vec<f32>| {
+        let quantizer = ResidualQuantizer::try_new(2, vec![-0.1, 0.0, 0.1], vec![0.0; 4]).unwrap();
+        let packed_residuals = quantizer
+            .quantize(Array2::<f32>::zeros((3, 4)).view())
+            .unwrap();
+        PlaidIndex::try_new_with_exact_store(
+            array![[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]],
+            quantizer,
+            vec![7, 42, 1001],
+            vec![0, 1, 2, 3],
+            vec![0, 1, 0],
+            packed_residuals,
+            row_ids,
+            raw,
+        )
+    };
+
+    let error = make(vec![1, 2], vec![0.0; 12]).unwrap_err();
+    assert!(error.to_string().contains("public row ID length"));
+    let error = make(vec![1, 2, 3], vec![0.0; 11]).unwrap_err();
+    assert!(error.to_string().contains("raw token value length"));
+    let mut non_finite = vec![0.0; 12];
+    non_finite[7] = f32::INFINITY;
+    let error = make(vec![1, 2, 3], non_finite).unwrap_err();
+    assert!(error.to_string().contains("must be finite"));
+}
+
+#[test]
 fn versioned_bytes_reject_unknown_version() {
     let index = test_index(2);
     let mut bytes = index.to_bytes().unwrap();
-    bytes[8..10].copy_from_slice(&2_u16.to_le_bytes());
+    bytes[8..10].copy_from_slice(&3_u16.to_le_bytes());
     let error = PlaidIndex::read_from_bytes(&bytes).unwrap_err();
-    assert!(error.to_string().contains("unsupported format version 2"));
+    assert!(error.to_string().contains("unsupported format version 3"));
+}
+
+#[test]
+fn versioned_bytes_reject_invalid_flags_truncation_trailing_and_non_finite_exact_values() {
+    let mut v1_flags = test_index(2).to_bytes().unwrap();
+    v1_flags[11] = 1;
+    assert!(
+        PlaidIndex::read_from_bytes(&v1_flags)
+            .unwrap_err()
+            .to_string()
+            .contains("V1 flags must be zero")
+    );
+
+    let valid_v2 = exact_test_index(2).to_bytes().unwrap();
+    for flags in [0, 2, 3] {
+        let mut invalid = valid_v2.clone();
+        invalid[11] = flags;
+        let message = PlaidIndex::read_from_bytes(&invalid)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("exact-store flag") || message.contains("unknown flags"));
+    }
+
+    let mut truncated = valid_v2.clone();
+    truncated.pop();
+    assert!(
+        PlaidIndex::read_from_bytes(&truncated)
+            .unwrap_err()
+            .to_string()
+            .contains("encoded length mismatch")
+    );
+    let mut trailing = valid_v2.clone();
+    trailing.push(0);
+    assert!(
+        PlaidIndex::read_from_bytes(&trailing)
+            .unwrap_err()
+            .to_string()
+            .contains("encoded length mismatch")
+    );
+
+    let mut non_finite = valid_v2;
+    let raw_start = non_finite.len() - 12 * std::mem::size_of::<f32>();
+    non_finite[raw_start..raw_start + 4].copy_from_slice(&f32::NAN.to_le_bytes());
+    assert!(
+        PlaidIndex::read_from_bytes(&non_finite)
+            .unwrap_err()
+            .to_string()
+            .contains("must be finite")
+    );
+}
+
+#[test]
+fn v2_header_rejects_exact_value_length_overflow_before_allocation() {
+    let mut bytes = exact_test_index(2).to_bytes().unwrap();
+    bytes[16..20].copy_from_slice(&8_u32.to_le_bytes());
+    let overflowing_tokens = (usize::MAX / 8 + 1) as u64;
+    bytes[32..40].copy_from_slice(&overflowing_tokens.to_le_bytes());
+    let error = PlaidIndex::read_from_bytes(&bytes).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("exact-store value count overflow")
+    );
 }
 
 #[test]
