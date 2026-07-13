@@ -127,6 +127,12 @@ const DIRECT_RESIDUAL_BUDGET_MISMATCH_COUNT: &str =
 const DIRECT_RESIDUAL_EMPTY_TOKENS_COUNT: &str =
     "plaid_direct_residual_skipped_empty_tokens_segments";
 const FUSED_FINAL_TAKE_TIME: &str = "plaid_fused_final_take_time";
+const FUSED_FINAL_TAKE_SELECT_TIME: &str = "plaid_fused_final_take_select_sub_time";
+const FUSED_FINAL_TAKE_LOGICAL_PROJECTION_TIME: &str =
+    "plaid_fused_final_take_logical_projection_sub_time";
+const FUSED_FINAL_TAKE_JSON_CONVERSION_TIME: &str =
+    "plaid_fused_final_take_json_conversion_sub_time";
+const FUSED_FINAL_TAKE_ASSEMBLY_TIME: &str = "plaid_fused_final_take_assembly_sub_time";
 const FUSED_FINAL_TAKE_QUERY_COUNT: &str = "plaid_fused_final_take_queries";
 const FUSED_FINAL_TAKE_CANDIDATE_ROWS_COUNT: &str = "plaid_fused_final_take_candidate_rows";
 const FUSED_FINAL_TAKE_OUTPUT_ROWS_COUNT: &str = "plaid_fused_final_take_output_rows";
@@ -816,6 +822,10 @@ struct PlaidExecMetrics {
     sorted_raw_take: Time,
     grouped_refinement: Time,
     fused_final_take: Time,
+    fused_final_take_select: Time,
+    fused_final_take_logical_projection: Time,
+    fused_final_take_json_conversion: Time,
+    fused_final_take_assembly: Time,
     sort: Time,
     total: Time,
     postings_count: Count,
@@ -903,6 +913,12 @@ impl PlaidExecMetrics {
             sorted_raw_take: metrics.new_time(SORTED_RAW_TAKE_TIME, partition),
             grouped_refinement: metrics.new_time(GROUPED_REFINEMENT_TIME, partition),
             fused_final_take: metrics.new_time(FUSED_FINAL_TAKE_TIME, partition),
+            fused_final_take_select: metrics.new_time(FUSED_FINAL_TAKE_SELECT_TIME, partition),
+            fused_final_take_logical_projection: metrics
+                .new_time(FUSED_FINAL_TAKE_LOGICAL_PROJECTION_TIME, partition),
+            fused_final_take_json_conversion: metrics
+                .new_time(FUSED_FINAL_TAKE_JSON_CONVERSION_TIME, partition),
+            fused_final_take_assembly: metrics.new_time(FUSED_FINAL_TAKE_ASSEMBLY_TIME, partition),
             sort: metrics.new_time(SORT_TIME, partition),
             total: metrics.new_time(TOTAL_TIME, partition),
             postings_count: metrics.new_count(POSTINGS_COUNT, partition),
@@ -1684,18 +1700,36 @@ async fn execute_search(
         let output_batch = if hits.is_empty() {
             RecordBatch::new_empty(output_schema.clone())
         } else {
+            let select_started = Instant::now();
             let selected = select_fused_candidate_rows(&hits, &batches)?;
+            metrics
+                .fused_final_take_select
+                .add_duration(select_started.elapsed());
             // Grouped take returns physical batches. Apply the consolidated
             // logical projection and JSON conversion only to selected top-k
             // rows. The fallback batch already has ordinary TakeBuilder
             // projection semantics and must not be projected twice.
             let selected = if grouped_physical_batches {
+                let projection_started = Instant::now();
                 let selected = projection.project_batch(selected).await?;
-                convert_lance_json_to_arrow(&selected)?
+                metrics
+                    .fused_final_take_logical_projection
+                    .add_duration(projection_started.elapsed());
+                let conversion_started = Instant::now();
+                let selected = convert_lance_json_to_arrow(&selected)?;
+                metrics
+                    .fused_final_take_json_conversion
+                    .add_duration(conversion_started.elapsed());
+                selected
             } else {
                 selected
             };
-            fused_selected_hits_to_batch(&hits, &selected, output_schema)?
+            let assembly_started = Instant::now();
+            let output = fused_selected_hits_to_batch(&hits, &selected, output_schema)?;
+            metrics
+                .fused_final_take_assembly
+                .add_duration(assembly_started.elapsed());
+            output
         };
         metrics
             .fused_final_take

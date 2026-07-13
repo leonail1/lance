@@ -1753,6 +1753,10 @@ mod tests {
             assert!(fused_analyzed.contains("plaid_grouped_refinement_rows=6"));
             assert!(!fused_analyzed.contains("plaid_grouped_refinement_fallbacks=1"));
             assert!(fused_analyzed.contains("plaid_fused_final_take_candidate_rows=6"));
+            assert!(fused_analyzed.contains("plaid_fused_final_take_select_sub_time="));
+            assert!(fused_analyzed.contains("plaid_fused_final_take_logical_projection_sub_time="));
+            assert!(fused_analyzed.contains("plaid_fused_final_take_json_conversion_sub_time="));
+            assert!(fused_analyzed.contains("plaid_fused_final_take_assembly_sub_time="));
             assert_eq!(
                 fused_grouped
                     .schema()
