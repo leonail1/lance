@@ -83,7 +83,7 @@ impl Hash for DataFileReaderCacheKey {
 #[derive(Debug)]
 pub(crate) struct ReaderCacheQueryStats {
     eligible_files: u64,
-    resident_entries_start: u64,
+    resident_entries_start_approx: u64,
     capacity: u64,
     fd_soft_limit: u64,
     lookup_files: AtomicU64,
@@ -102,13 +102,13 @@ pub(crate) struct ReaderCacheQueryStats {
 impl ReaderCacheQueryStats {
     fn new(
         eligible_files: usize,
-        resident_entries_start: u64,
+        resident_entries_start_approx: u64,
         capacity: u64,
         fd_soft_limit: u64,
     ) -> Self {
         Self {
             eligible_files: u64::try_from(eligible_files).unwrap_or(u64::MAX),
-            resident_entries_start,
+            resident_entries_start_approx,
             capacity,
             fd_soft_limit,
             lookup_files: AtomicU64::new(0),
@@ -138,11 +138,11 @@ impl ReaderCacheQueryStats {
         self.fallback_open_files.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn snapshot(&self, resident_entries_end: u64) -> ReaderCacheQueryStatsSnapshot {
+    fn snapshot(&self, resident_entries_end_approx: u64) -> ReaderCacheQueryStatsSnapshot {
         ReaderCacheQueryStatsSnapshot {
             eligible_files: self.eligible_files,
-            resident_entries_start: self.resident_entries_start,
-            resident_entries_end,
+            resident_entries_start_approx: self.resident_entries_start_approx,
+            resident_entries_end_approx,
             capacity: self.capacity,
             fd_soft_limit: self.fd_soft_limit,
             lookup_files: self.lookup_files.load(Ordering::Relaxed),
@@ -163,8 +163,10 @@ impl ReaderCacheQueryStats {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ReaderCacheQueryStatsSnapshot {
     pub eligible_files: u64,
-    pub resident_entries_start: u64,
-    pub resident_entries_end: u64,
+    /// Moka's eventually-maintained diagnostic entry count at query start.
+    pub resident_entries_start_approx: u64,
+    /// Moka's eventually-maintained diagnostic entry count at query finish.
+    pub resident_entries_end_approx: u64,
     pub capacity: u64,
     pub fd_soft_limit: u64,
     pub lookup_files: u64,
@@ -180,7 +182,7 @@ pub(crate) struct ReaderCacheQueryStatsSnapshot {
     pub bind_nanos: u64,
 }
 
-/// Bounded, process-local cache of bare data-file readers.
+/// Bounded, session-local cache of bare data-file readers.
 #[derive(Clone)]
 pub(crate) struct DataFileReaderCache {
     inner: Cache<DataFileReaderCacheKey, Arc<dyn Reader>>,
@@ -227,26 +229,19 @@ impl DataFileReaderCache {
         }
     }
 
-    pub(crate) fn resident_entries(&self) -> u64 {
+    pub(crate) fn resident_entries_approx(&self) -> u64 {
         self.inner.entry_count()
     }
 
-    pub(crate) fn capacity(&self) -> u64 {
-        self.capacity
-    }
-
-    pub(crate) fn fd_soft_limit(&self) -> u64 {
-        self.fd_soft_limit
-    }
-
-    pub(crate) fn max_files_per_query(&self) -> usize {
+    /// Conservative whole-query admission threshold, not a concurrency limit.
+    pub(crate) fn max_eligible_files_per_query(&self) -> usize {
         DEFAULT_MAX_IN_FLIGHT_OPENS.min(self.capacity as usize)
     }
 
     pub(crate) fn begin_query(&self, eligible_files: usize) -> Arc<ReaderCacheQueryStats> {
         Arc::new(ReaderCacheQueryStats::new(
             eligible_files,
-            self.resident_entries(),
+            self.resident_entries_approx(),
             self.capacity,
             self.fd_soft_limit,
         ))
@@ -256,10 +251,14 @@ impl DataFileReaderCache {
         &self,
         stats: &ReaderCacheQueryStats,
     ) -> ReaderCacheQueryStatsSnapshot {
-        stats.snapshot(self.resident_entries())
+        stats.snapshot(self.resident_entries_approx())
     }
 
     /// Return a cached reader or single-flight one physical local-file open.
+    ///
+    /// Callers deliberately fall back to the ordinary database open path on
+    /// error, so the cloned Moka loader error is diagnostic rather than the
+    /// final user-visible failure.
     pub(crate) async fn get_or_open(
         &self,
         key: DataFileReaderCacheKey,

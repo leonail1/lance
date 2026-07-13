@@ -231,7 +231,8 @@ impl Session {
         self.index_cache.0.approx_size()
             + self.metadata_cache.0.approx_size()
             + self.index_extensions.len()
-            + usize::try_from(self.data_file_reader_cache.resident_entries()).unwrap_or(usize::MAX)
+            + usize::try_from(self.data_file_reader_cache.resident_entries_approx())
+                .unwrap_or(usize::MAX)
     }
 
     /// Get the object store registry.

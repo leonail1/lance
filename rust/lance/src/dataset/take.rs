@@ -507,8 +507,8 @@ pub(crate) struct GroupedPhysicalReadStats {
     pub reader_cache_bypass_files: u64,
     pub reader_cache_fallback_open_files: u64,
     pub reader_cache_open_failures: u64,
-    pub reader_cache_resident_entries_start: u64,
-    pub reader_cache_resident_entries_end: u64,
+    pub reader_cache_resident_entries_start_approx: u64,
+    pub reader_cache_resident_entries_end_approx: u64,
     pub reader_cache_capacity: u64,
     pub reader_cache_fd_soft_limit: u64,
     pub reader_cache_lookup_nanos: u64,
@@ -876,7 +876,7 @@ impl TakeBuilder {
                 .dataset
                 .session
                 .data_file_reader_cache
-                .max_files_per_query();
+                .max_eligible_files_per_query();
         let use_reader_cache = reader_cache_enabled
             && all_fragments_reader_cache_eligible
             && reader_cache_eligible_files > 0
@@ -1062,11 +1062,11 @@ impl TakeBuilder {
             reader_cache_open_failures: reader_cache_snapshot
                 .map(|snapshot| snapshot.open_failures)
                 .unwrap_or(0),
-            reader_cache_resident_entries_start: reader_cache_snapshot
-                .map(|snapshot| snapshot.resident_entries_start)
+            reader_cache_resident_entries_start_approx: reader_cache_snapshot
+                .map(|snapshot| snapshot.resident_entries_start_approx)
                 .unwrap_or(0),
-            reader_cache_resident_entries_end: reader_cache_snapshot
-                .map(|snapshot| snapshot.resident_entries_end)
+            reader_cache_resident_entries_end_approx: reader_cache_snapshot
+                .map(|snapshot| snapshot.resident_entries_end_approx)
                 .unwrap_or(0),
             reader_cache_capacity: reader_cache_snapshot
                 .map(|snapshot| snapshot.capacity)
@@ -1173,6 +1173,7 @@ mod test {
     use arrow_schema::{DataType, Fields, Schema as ArrowSchema};
     use lance_arrow::ARROW_EXT_NAME_KEY;
     use lance_arrow::json::{ARROW_JSON_EXT_NAME, is_arrow_json_field};
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD, ROW_OFFSET};
     use lance_file::version::LanceFileVersion;
     use pretty_assertions::assert_eq;
@@ -1758,6 +1759,204 @@ mod test {
         assert_eq!(treatment.stats.scheduler_scoped_iops, 0);
         assert_eq!(treatment.stats.scheduler_scoped_requests, 0);
         assert_eq!(treatment.stats.scheduler_scoped_bytes_read, 0);
+    }
+
+    #[tokio::test]
+    async fn grouped_data_file_reader_cache_cold_warm_and_fresh_deletions() {
+        let test_dir = TempStrDir::default();
+        let data = test_batch(0..2_000);
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(data.clone())], data.schema()),
+            &test_dir,
+            Some(WriteParams {
+                max_rows_per_file: 1_000,
+                max_rows_per_group: 128,
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+        let addresses = vec![
+            u64::from(RowAddress::new_from_parts(0, 0)),
+            u64::from(RowAddress::new_from_parts(1, 0)),
+        ];
+        let dataset = Arc::new(dataset);
+        let projection = Arc::new(
+            ProjectionRequest::from_columns(["i", "s", ROW_ID], dataset.schema())
+                .into_projection_plan(dataset.clone())
+                .unwrap(),
+        );
+        let physical_projection = projection.physical_projection.to_bare_schema();
+        for fragment in dataset.get_fragments() {
+            assert_eq!(
+                fragment
+                    .grouped_reader_cache_eligibility(&physical_projection)
+                    .unwrap(),
+                FragmentReaderCacheEligibility::Eligible { files: 1 }
+            );
+        }
+
+        let control = TakeBuilder::try_new_from_addresses(
+            dataset.clone(),
+            addresses.clone(),
+            projection.clone(),
+        )
+        .unwrap()
+        .read_sorted_physical_by_fragment()
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(control.stats.reader_cache_queries, 0);
+
+        let cold = TakeBuilder::try_new_from_addresses(
+            dataset.clone(),
+            addresses.clone(),
+            projection.clone(),
+        )
+        .unwrap()
+        .read_sorted_physical_by_fragment_with_options(false, true)
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(cold.batches, control.batches);
+        assert_eq!(cold.stats.reader_cache_queries, 1);
+        assert_eq!(cold.stats.reader_cache_eligible_files, 2);
+        assert_eq!(cold.stats.reader_cache_lookup_files, 2);
+        assert_eq!(cold.stats.reader_cache_hit_files, 0);
+        assert_eq!(cold.stats.reader_cache_miss_open_files, 2);
+        assert_eq!(cold.stats.reader_cache_coalesced_files, 0);
+        assert_eq!(cold.stats.reader_cache_bypass_files, 0);
+        assert_eq!(cold.stats.reader_cache_fallback_open_files, 0);
+        assert_eq!(cold.stats.reader_cache_open_failures, 0);
+        assert_eq!(cold.stats.reader_cache_fallback_queries, 0);
+        assert!(cold.stats.reader_cache_physical_open_nanos > 0);
+
+        let warm = TakeBuilder::try_new_from_addresses(
+            dataset.clone(),
+            addresses.clone(),
+            projection.clone(),
+        )
+        .unwrap()
+        .read_sorted_physical_by_fragment_with_options(false, true)
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(warm.batches, control.batches);
+        assert_eq!(warm.stats.reader_cache_queries, 1);
+        assert_eq!(warm.stats.reader_cache_lookup_files, 2);
+        assert_eq!(warm.stats.reader_cache_hit_files, 2);
+        assert_eq!(warm.stats.reader_cache_miss_open_files, 0);
+        assert_eq!(warm.stats.reader_cache_physical_open_nanos, 0);
+
+        // Mutating the manifest must not make snapshot-scoped deletion state
+        // stale even though the underlying immutable data-file reader is hot.
+        let mut deleted_dataset = dataset.as_ref().clone();
+        deleted_dataset.delete("i = 0").await.unwrap();
+        let deleted_dataset = Arc::new(deleted_dataset);
+        let deleted_projection = Arc::new(
+            ProjectionRequest::from_columns(["i", "s", ROW_ID], deleted_dataset.schema())
+                .into_projection_plan(deleted_dataset.clone())
+                .unwrap(),
+        );
+        let deleted_control = TakeBuilder::try_new_from_addresses(
+            deleted_dataset.clone(),
+            addresses.clone(),
+            deleted_projection.clone(),
+        )
+        .unwrap()
+        .read_sorted_physical_by_fragment()
+        .await
+        .unwrap()
+        .unwrap();
+        let deleted_cached = TakeBuilder::try_new_from_addresses(
+            deleted_dataset.clone(),
+            addresses,
+            deleted_projection,
+        )
+        .unwrap()
+        .read_sorted_physical_by_fragment_with_options(false, true)
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(deleted_cached.batches, deleted_control.batches);
+        assert_eq!(
+            deleted_cached
+                .batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            1
+        );
+        assert_eq!(deleted_cached.stats.reader_cache_hit_files, 2);
+
+        let first_fragment = deleted_dataset.get_fragment(0).unwrap();
+        let mut unknown_size_metadata = first_fragment.metadata().clone();
+        unknown_size_metadata.files[0].file_size_bytes = lance_io::utils::CachedFileSize::unknown();
+        assert_eq!(
+            FileFragment::new(deleted_dataset.clone(), unknown_size_metadata)
+                .grouped_reader_cache_eligibility(&physical_projection)
+                .unwrap(),
+            FragmentReaderCacheEligibility::UnknownSize
+        );
+        let mut small_file_metadata = first_fragment.metadata().clone();
+        small_file_metadata.files[0].file_size_bytes = lance_io::utils::CachedFileSize::new(1);
+        assert_eq!(
+            FileFragment::new(deleted_dataset, small_file_metadata)
+                .grouped_reader_cache_eligibility(&physical_projection)
+                .unwrap(),
+            FragmentReaderCacheEligibility::SmallFile
+        );
+    }
+
+    #[tokio::test]
+    async fn grouped_data_file_reader_cache_falls_back_for_memory_store() {
+        let data = test_batch(0..4);
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new([Ok(data.clone())], data.schema()),
+                "memory://",
+                Some(WriteParams {
+                    max_rows_per_file: 2,
+                    max_rows_per_group: 2,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+        let addresses = vec![
+            u64::from(RowAddress::new_from_parts(0, 0)),
+            u64::from(RowAddress::new_from_parts(1, 0)),
+        ];
+        let projection = Arc::new(
+            ProjectionRequest::from_columns(["i", ROW_ID], dataset.schema())
+                .into_projection_plan(dataset.clone())
+                .unwrap(),
+        );
+        let control = TakeBuilder::try_new_from_addresses(
+            dataset.clone(),
+            addresses.clone(),
+            projection.clone(),
+        )
+        .unwrap()
+        .read_sorted_physical_by_fragment()
+        .await
+        .unwrap()
+        .unwrap();
+        let fallback = TakeBuilder::try_new_from_addresses(dataset, addresses, projection)
+            .unwrap()
+            .read_sorted_physical_by_fragment_with_options(false, true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fallback.batches, control.batches);
+        assert_eq!(fallback.stats.reader_cache_queries, 0);
+        assert_eq!(fallback.stats.reader_cache_fallback_queries, 1);
+        assert_eq!(fallback.stats.reader_cache_fallback_nonlocal_fragments, 2);
+        assert_eq!(fallback.stats.reader_cache_lookup_files, 0);
     }
 
     #[tokio::test]

@@ -240,9 +240,9 @@ const DATA_FILE_READER_CACHE_FALLBACK_OPEN_FILE_COUNT: &str =
 const DATA_FILE_READER_CACHE_OPEN_FAILURE_COUNT: &str =
     "plaid_data_file_reader_cache_open_failures";
 const DATA_FILE_READER_CACHE_RESIDENT_START_COUNT: &str =
-    "plaid_data_file_reader_cache_resident_entries_start";
+    "plaid_data_file_reader_cache_resident_entries_start_approx";
 const DATA_FILE_READER_CACHE_RESIDENT_END_COUNT: &str =
-    "plaid_data_file_reader_cache_resident_entries_end";
+    "plaid_data_file_reader_cache_resident_entries_end_approx";
 const DATA_FILE_READER_CACHE_CAPACITY_COUNT: &str = "plaid_data_file_reader_cache_capacity";
 const DATA_FILE_READER_CACHE_FD_SOFT_LIMIT_COUNT: &str =
     "plaid_data_file_reader_cache_fd_soft_limit";
@@ -2132,12 +2132,22 @@ async fn execute_search(
             row_addresses.clone(),
             projection.clone(),
         )?;
-        builder
-            .read_sorted_physical_by_fragment_with_options(
-                grouped_shared_scheduler_config.enabled,
-                data_file_reader_cache_config.enabled,
-            )
-            .await?
+        match (
+            grouped_shared_scheduler_config.enabled,
+            data_file_reader_cache_config.enabled,
+        ) {
+            (false, false) => builder.read_sorted_physical_by_fragment().await?,
+            (true, false) => {
+                builder
+                    .read_sorted_physical_by_fragment_with_shared_scheduler(true)
+                    .await?
+            }
+            (shared_scheduler_enabled, true) => {
+                builder
+                    .read_sorted_physical_by_fragment_with_options(shared_scheduler_enabled, true)
+                    .await?
+            }
+        }
     } else {
         None
     };
@@ -2299,11 +2309,12 @@ async fn execute_search(
             .data_file_reader_cache_open_failure_count
             .add(usize::try_from(grouped_stats.reader_cache_open_failures).unwrap_or(usize::MAX));
         metrics.data_file_reader_cache_resident_start_count.add(
-            usize::try_from(grouped_stats.reader_cache_resident_entries_start)
+            usize::try_from(grouped_stats.reader_cache_resident_entries_start_approx)
                 .unwrap_or(usize::MAX),
         );
         metrics.data_file_reader_cache_resident_end_count.add(
-            usize::try_from(grouped_stats.reader_cache_resident_entries_end).unwrap_or(usize::MAX),
+            usize::try_from(grouped_stats.reader_cache_resident_entries_end_approx)
+                .unwrap_or(usize::MAX),
         );
         metrics
             .data_file_reader_cache_capacity_count
